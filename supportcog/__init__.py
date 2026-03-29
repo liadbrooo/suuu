@@ -1302,6 +1302,76 @@ class SupportCog(commands.Cog):
             await self.config.guild(ctx.guild).whitelist_auto_remove_duty.set(True)
             await self.config.guild(ctx.guild).whitelist_duty_timeout.set(hours)
             await ctx.send(f"✅ Whitelist-Duty wird automatisch nach {hours} Stunden beendet.")
+
+    @commands.command(name="whitelistinfo", aliases=["wlinfo", "wlinfo"])
+    async def whitelistinfo(self, ctx: commands.Context):
+        """
+        Zeigt Informationen zur aktuellen Whitelist-Konfiguration und Status an.
+        
+        Dieser Befehl zeigt:
+        - Konfigurierte Channels (Whitelist-Channel, Voice-Warteraum, Panel-Channel, Log-Channel)
+        - Konfigurierte Rollen (Handler-Rolle, Approved-Rolle, Duty-Rolle)
+        - Aktive Duty-Handler
+        - Auto-Duty-Einstellungen
+        """
+        guild = ctx.guild
+        guild_data = await self.config.guild(guild).all()
+
+        channel_id = guild_data.get("whitelist_channel")
+        room_id = guild_data.get("whitelist_room")
+        role_id = guild_data.get("whitelist_role")
+        approved_role_id = guild_data.get("whitelist_approved_role")
+        duty_role_id = guild_data.get("whitelist_duty_role")
+        panel_channel_id = guild_data.get("whitelist_panel_channel")
+        log_channel_id = guild_data.get("whitelist_log_channel")
+        auto_duty = guild_data.get("whitelist_auto_remove_duty", True)
+        duty_timeout = guild_data.get("whitelist_duty_timeout", 4)
+
+        channel_mention = f"<#{channel_id}>" if channel_id else "❌ Nicht gesetzt"
+        room_mention = f"<#{room_id}>" if room_id else "❌ Nicht gesetzt"
+        role_mention = f"<@&{role_id}>" if role_id else "❌ Nicht gesetzt"
+        approved_role_mention = f"<@&{approved_role_id}>" if approved_role_id else "❌ Nicht gesetzt"
+        duty_role_mention = f"<@&{duty_role_id}>" if duty_role_id else "❌ Noch nicht erstellt"
+        panel_channel_mention = f"<#{panel_channel_id}>" if panel_channel_id else "Gleicher wie Whitelist-Channel"
+        log_channel_mention = f"<#{log_channel_id}>" if log_channel_id else "Gleicher wie Whitelist-Channel"
+        auto_duty_status = f"✅ Aktiv ({duty_timeout}h)" if auto_duty else "❌ Deaktiviert"
+
+        # Zähle aktive Duty-User
+        duty_count = 0
+        duty_members_list = []
+        duty_role = guild.get_role(duty_role_id) if duty_role_id else None
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and duty_role:
+                for m in base_role.members:
+                    if duty_role in m.roles:
+                        is_on_duty = await self.config.member(m).whitelist_on_duty()
+                        if is_on_duty:
+                            duty_count += 1
+                            duty_members_list.append(m.display_name)
+
+        active_duty_display = "\n".join([f"• {name}" for name in duty_members_list[:10]]) if duty_members_list else "Niemand im Duty"
+        if len(duty_members_list) > 10:
+            active_duty_display += f"\n...und {len(duty_members_list) - 10} weitere"
+
+        embed = discord.Embed(
+            title="📋 Whitelist Information",
+            description="Aktuelle Konfiguration und Status des Whitelist-Systems",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="🔵 Aktive Duty-Handler", value=f"{duty_count} Handler\n{active_duty_display}", inline=False)
+        embed.add_field(name="⏰ Auto-Duty-Ende", value=auto_duty_status, inline=True)
+        embed.add_field(name="📝 Whitelist-Channel", value=channel_mention, inline=True)
+        embed.add_field(name="🎤 Voice-Warteraum", value=room_mention, inline=True)
+        embed.add_field(name="👥 Handler-Rolle", value=role_mention, inline=True)
+        embed.add_field(name="✅ Approved-Rolle", value=approved_role_mention, inline=True)
+        embed.add_field(name="🔵 Duty-Rolle", value=duty_role_mention, inline=True)
+        embed.add_field(name="📋 Panel-Channel", value=panel_channel_mention, inline=True)
+        embed.add_field(name="📜 Log-Channel", value=log_channel_mention, inline=True)
+        embed.set_footer(text=f"Whitelist-Info • {guild.name}")
+
+        await ctx.send(embed=embed)
     
     @commands.command(name="whitelistuser", aliases=["wluser", "addwhitelist", "wl"])
     async def whitelistuser(self, ctx: commands.Context, user: discord.Member):
@@ -1383,7 +1453,7 @@ class SupportCog(commands.Cog):
                     timestamp=datetime.utcnow()
                 )
                 dm_embed.add_field(name="✅ Rolle erhalten", value=f"{approved_role.mention}", inline=False)
-                dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt die freigeschalteten Features nutzen!", inline=False)
+                dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt die freigeschalteten Features nutzen! Das man jetzt auf unserem Server spielen kann.", inline=False)
                 dm_embed.set_footer(text=f"{guild.name} Whitelist System")
                 await user.send(embed=dm_embed)
             except discord.Forbidden:
