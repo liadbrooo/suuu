@@ -1661,8 +1661,15 @@ class WhitelistButtonView(discord.ui.View):
             await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
             return
         
-        # Öffne das WhitelistSearchModal (das jetzt direkt die Verarbeitung übernimmt)
-        await interaction.response.send_modal(WhitelistSearchModal(self.cog, guild))
+        try:
+            # Öffne das WhitelistSearchModal (das jetzt direkt die Verarbeitung übernimmt)
+            modal = WhitelistSearchModal(self.cog, guild)
+            await interaction.response.send_modal(modal)
+        except discord.errors.InteractionResponded:
+            # Interaktion wurde bereits beantwortet, ignoriere
+            pass
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Fehler beim Öffnen des Modals: `{str(e)}`", ephemeral=True)
     
     async def update_panel_display(self, guild: discord.Guild):
         """Updates the whitelist panel message to show current duty members"""
@@ -2059,8 +2066,7 @@ class WhitelistSearchModal(discord.ui.Modal):
     
     async def callback(self, interaction: discord.Interaction):
         """Wird ausgelöst wenn das Modal abgesendet wird - Verarbeitet die Whitelist direkt"""
-        # Sofort bestätigen um Timeout zu vermeiden
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         
         try:
             # Hole die eingegebene ID oder den Namen
