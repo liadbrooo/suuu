@@ -1303,7 +1303,7 @@ class SupportCog(commands.Cog):
             await self.config.guild(ctx.guild).whitelist_duty_timeout.set(hours)
             await ctx.send(f"✅ Whitelist-Duty wird automatisch nach {hours} Stunden beendet.")
 
-    @commands.command(name="whitelistinfo", aliases=["wlinfo", "wlinfo"])
+    @commands.command(name="whitelistinfo", aliases=["wlinfo"])
     async def whitelistinfo(self, ctx: commands.Context):
         """
         Zeigt Informationen zur aktuellen Whitelist-Konfiguration und Status an.
