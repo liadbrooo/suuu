@@ -228,7 +228,7 @@ class SupportCog(commands.Cog):
         )
         embed.set_footer(text="Die 📋 Whitelist Duty Rolle wird automatisch zugewiesen/entfernt")
         
-        view = WhitelistButtonView(self)
+        view = WhitelistButtonView(self, guild)
         message = await channel.send(embed=embed, view=view)
         
         await self.config.guild(guild).whitelist_panel_message_id.set(message.id)
@@ -352,6 +352,7 @@ class SupportCog(commands.Cog):
         # Hole Konfiguration
         room_id = await self.config.guild(guild).room()
         role_id = await self.config.guild(guild).role()
+        channel_id = await self.config.guild(guild).channel()  # Explizit den Support-Channel holen
         use_embed = await self.config.guild(guild).use_embed()
 
         # Prüfen ob alle erforderlichen Einstellungen gesetzt sind
@@ -368,12 +369,28 @@ class SupportCog(commands.Cog):
 
         # User hat den Warteraum soeben betreten
         try:
-            support_channel = await self.get_support_channel(guild)
+            # Hole explizit den Support-Channel (nicht Log-Channel!)
+            support_channel = None
+            if channel_id:
+                support_channel = guild.get_channel(channel_id)
+                if not support_channel or not isinstance(support_channel, discord.TextChannel):
+                    # Fallback: Versuche Log-Channel wenn Support-Channel ungültig
+                    log_channel_id = await self.config.guild(guild).log_channel()
+                    if log_channel_id:
+                        support_channel = guild.get_channel(log_channel_id)
+            
             if not support_channel:
+                print(f"[SupportCog] Kein gültiger Support-Channel für Guild {guild.id} gefunden!")
+                return
+
+            # Teste Berechtigungen
+            if not support_channel.permissions_for(guild.me).send_messages:
+                print(f"[SupportCog] Keine Sendeberechtigung in Channel {support_channel.id}!")
                 return
 
             base_role = guild.get_role(role_id)
             if not base_role:
+                print(f"[SupportCog] Basis-Rolle {role_id} nicht gefunden!")
                 return
 
             # Hole alle On-Duty User MIT DER DUTY ROLLE
@@ -419,7 +436,7 @@ class SupportCog(commands.Cog):
                 else:
                     embed.add_field(
                         name="🔴 Keine Supporter verfügbar",
-                        value=f"Niemand ist gerade im Dienst!",
+                        value=f"Niemand ist gerade im Dienst!\n*Benutze `/supportset panelchannel` und klicke auf 'Duty Starten'*",
                         inline=True
                     )
 
@@ -451,12 +468,14 @@ class SupportCog(commands.Cog):
                 else:
                     await support_channel.send(f"🎧 {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})")
 
-        except discord.Forbidden:
+        except discord.Forbidden as e:
             # Bot hat keine Berechtigung zum Senden
-            pass
+            print(f"[SupportCog] Forbidden Fehler beim Senden in Channel: {e}")
         except Exception as e:
-            # Logge Fehler
-            print(f"Fehler in SupportCog (Support): {e}")
+            # Logge Fehler mit mehr Details
+            import traceback
+            print(f"[SupportCog] Fehler in Support Warteraum: {type(e).__name__}: {e}")
+            print(traceback.format_exc())
 
     @commands.Cog.listener()
     async def on_voice_state_update_whitelist(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -1508,11 +1527,13 @@ class DutyButtonView(discord.ui.View):
 class WhitelistButtonView(discord.ui.View):
     """Button-View für Whitelist Duty An-/Abmeldung mit Dropdown für Spieler-Verwaltung"""
     
-    def __init__(self, cog: SupportCog):
+    def __init__(self, cog: SupportCog, guild: discord.Guild = None):
         super().__init__(timeout=None)
         self.cog = cog
-        # Füge das Dropdown-Menü hinzu
-        self.add_item(WhitelistPlayerSelect(cog))
+        self.guild = guild
+        # Füge das Dropdown-Menü hinzu (benötigt Guild für Member-Liste)
+        if guild:
+            self.add_item(WhitelistPlayerSelect(cog, guild))
     
     @discord.ui.button(label="Duty Starten", style=discord.ButtonStyle.green, emoji="🔵", custom_id="whitelist_duty_start")
     async def start_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1711,22 +1732,85 @@ class WhitelistButtonView(discord.ui.View):
 
 
 class WhitelistPlayerSelect(discord.ui.Select):
-    """Dropdown-Menü zum Auswählen von Spielern für Whitelist"""
+    """Dropdown-Menü zum Auswählen von Spielern für Whitelist - Mit Suchfunktion"""
     
-    def __init__(self, cog: SupportCog):
+    def __init__(self, cog: SupportCog, guild: discord.Guild, search_query: str = ""):
         self.cog = cog
-        options = [
-            discord.SelectOption(label="Spieler suchen...", description="Wähle einen Spieler für die Whitelist", emoji="🔍"),
-        ]
-        super().__init__(placeholder="Spieler für Whitelist auswählen...", min_values=1, max_values=1, options=options, custom_id="whitelist_player_select")
+        self.guild = guild
+        self.search_query = search_query.lower().strip() if search_query else ""
+        
+        # Sammle alle Mitglieder für die Dropdown-Optionen
+        options = []
+        for member in guild.members:
+            # Überspringe Bots
+            if member.bot:
+                continue
+            
+            # Filtere nach Suchbegriff falls vorhanden
+            if self.search_query:
+                if (self.search_query not in member.name.lower() and 
+                    self.search_query not in member.display_name.lower() and 
+                    self.search_query not in str(member.id)):
+                    continue
+            
+            # Kürze den Namen falls zu lang (max 100 Zeichen für Label)
+            display_name = member.display_name[:90] + "..." if len(member.display_name) > 93 else member.display_name
+            
+            # Füge Avatar-Emoji hinzu wenn möglich
+            emoji = "👤"
+            if member.avatar:
+                emoji = "✅" if any(role.name.lower() in ["whitelist", "approved", "verified"] for role in member.roles) else "👤"
+            
+            options.append(
+                discord.SelectOption(
+                    label=display_name,
+                    description=f"{member.name} | ID: {member.id}",
+                    value=f"user_{member.id}",
+                    emoji=emoji
+                )
+            )
+        
+        # Begrenze auf max 25 Optionen (Discord Limit) - zeige die ersten 25 Treffer
+        if len(options) > 25:
+            options = options[:25]
+        
+        # Falls keine Spieler verfügbar sind oder keine Treffer bei Suche
+        if not options:
+            if self.search_query:
+                options.append(
+                    discord.SelectOption(
+                        label=f"Keine Treffer für '{search_query}'",
+                        description="Versuche einen anderen Suchbegriff",
+                        value="no_results",
+                        emoji="❌"
+                    )
+                )
+            else:
+                options.append(
+                    discord.SelectOption(
+                        label="Keine Spieler verfügbar",
+                        description="Keine Mitglieder gefunden",
+                        value="none",
+                        emoji="ℹ️"
+                    )
+                )
+        
+        placeholder = "Spieler suchen & auswählen..." if not self.search_query else f"Treffer für '{search_query}'..."
+        
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="whitelist_player_select"
+        )
     
     async def callback(self, interaction: discord.Interaction):
         """Wird ausgelöst wenn ein Spieler ausgewählt wird"""
-        # Diese Methode wird dynamisch mit Spielern gefüllt
-        await interaction.response.send_message("✅ Spieler wurde ausgewählt. Die Whitelist-Rolle wird zugewiesen...", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
         
         guild = interaction.guild
-        member = interaction.user
+        member = interaction.user  # Der Handler der die Aktion durchführt
         
         # Prüfe ob User Whitelist-Duty hat
         is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
@@ -1742,34 +1826,150 @@ class WhitelistPlayerSelect(discord.ui.Select):
         
         # Hole den ausgewählten User (gespeichert in der value als User-ID)
         selected_value = self.values[0]
+        
+        if selected_value in ["none", "no_results"]:
+            await interaction.followup.send("ℹ️ Kein Spieler ausgewählt oder keine Treffer!", ephemeral=True)
+            return
+        
         if selected_value.startswith("user_"):
             user_id = int(selected_value.split("_")[1])
             try:
                 target_user = await guild.fetch_member(user_id)
                 
-                # Füge die Approved-Rolle hinzu
+                # Prüfe ob der Spieler bereits die Approved-Rolle hat
                 if approved_role not in target_user.roles:
                     await target_user.add_roles(approved_role, reason=f"Whitelist genehmigt von {member.display_name}")
                     
-                    # Sende Bestätigung
-                    embed = discord.Embed(
+                    # Sende Bestätigung dem Handler
+                    embed_success = discord.Embed(
                         title="✅ Whitelist genehmigt",
-                        description=f"{target_user.mention} wurde zur Whitelist hinzugefügt!",
+                        description=f"{target_user.mention} wurde erfolgreich zur Whitelist hinzugefügt!",
                         color=discord.Color.green(),
                         timestamp=datetime.utcnow()
                     )
-                    embed.add_field(name="👤 Genehmigt von", value=f"{member.mention}", inline=True)
+                    embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention} ({member.display_name})", inline=True)
+                    embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
                     
+                    # Logge die Aktion im Log-Channel
                     log_channel = await self.cog.get_whitelist_log_channel(guild)
                     if log_channel:
-                        await log_channel.send(embed=embed)
+                        # Detailliertes Log für den Log-Channel
+                        log_embed = discord.Embed(
+                            title="📋 Whitelist Eintrag erstellt",
+                            description=f"**{target_user.mention}** wurde zur Whitelist hinzugefügt.",
+                            color=discord.Color.blue(),
+                            timestamp=datetime.utcnow()
+                        )
+                        log_embed.set_thumbnail(url=target_user.display_avatar.url)
+                        log_embed.add_field(name="🔹 Genehmigt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
+                        log_embed.add_field(name="🔹 Spieler", value=f"{target_user.mention}\n*{target_user.display_name}* (ID: `{target_user.id}`)", inline=True)
+                        log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
+                        log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
+                        log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {member.display_name}")
+                        
+                        await log_channel.send(embed=log_embed)
                     
-                    await interaction.followup.send(f"✅ {target_user.mention} hat die Whitelist-Rolle erhalten!", ephemeral=True)
+                    # Benachrichtige den Spieler privat falls möglich
+                    try:
+                        dm_embed = discord.Embed(
+                            title="🎉 Herzlichen Glückwunsch!",
+                            description=f"Du wurdest von **{member.display_name}** zur Whitelist hinzugefügt!",
+                            color=discord.Color.green(),
+                            timestamp=datetime.utcnow()
+                        )
+                        dm_embed.add_field(name="✅ Rolle erhalten", value=f"{approved_role.mention}", inline=False)
+                        dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt die freigeschalteten Features nutzen!", inline=False)
+                        dm_embed.set_footer(text=f"{guild.name} Whitelist System")
+                        await target_user.send(embed=dm_embed)
+                    except discord.Forbidden:
+                        pass  # DMs deaktiviert
+                    
+                    await interaction.followup.send(f"✅ {target_user.mention} hat die Whitelist-Rolle erhalten!\n📝 Die Aktion wurde im Log-Channel protokolliert.", ephemeral=True)
                 else:
                     await interaction.followup.send(f"ℹ️ {target_user.mention} hat bereits die Whitelist-Rolle!", ephemeral=True)
                     
+            except discord.NotFound:
+                await interaction.followup.send("❌ Der ausgewählte Spieler wurde nicht gefunden!", ephemeral=True)
             except Exception as e:
                 await interaction.followup.send(f"❌ Fehler beim Hinzufügen: {e}", ephemeral=True)
+
+
+class WhitelistSearchModal(discord.ui.Modal):
+    """Modal zum Suchen von Spielern für die Whitelist"""
+    
+    def __init__(self, cog: SupportCog, guild: discord.Guild):
+        self.cog = cog
+        self.guild = guild
+        
+        super().__init__(title="🔍 Spieler suchen")
+        
+        self.search_input = discord.ui.TextInput(
+            label="Spielername oder ID",
+            style=discord.TextStyle.short,
+            placeholder="Gib den Namen oder die ID des Spielers ein...",
+            min_length=1,
+            max_length=50,
+            required=True
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        """Wird ausgelöst wenn das Modal abgesendet wird"""
+        await interaction.response.defer(ephemeral=True)
+        
+        search_query = self.search_input.value.strip()
+        
+        # Erstelle eine neue View mit dem gefilterten Dropdown
+        view = WhitelistDutyView(self.cog, self.guild, search_query=search_query)
+        
+        await interaction.followup.send(
+            f"🔍 Suchergebnisse für '**{search_query}**':\nWähle einen Spieler aus der Liste:",
+            view=view,
+            ephemeral=True
+        )
+
+
+class WhitelistDutyView(discord.ui.View):
+    """Button-View für Whitelist-Duty mit erweiterter Spieler-Suche"""
+    
+    def __init__(self, cog: SupportCog, guild: discord.Guild = None, search_query: str = ""):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.guild = guild
+        self.search_query = search_query
+        
+        # Füge das Dropdown-Menü dynamisch hinzu
+        if guild:
+            self.add_item(WhitelistPlayerSelect(cog, guild, search_query))
+    
+    @discord.ui.button(label="🔍 Spieler suchen", style=discord.ButtonStyle.secondary, emoji="🔎", custom_id="whitelist_search_player", row=1)
+    async def search_player(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Öffnet ein Modal zur Spielersuche"""
+        # Prüfe ob User Whitelist-Duty hat
+        is_on_duty = await self.cog.config.member(interaction.user).whitelist_on_duty()
+        if not is_on_duty:
+            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler zu suchen!", ephemeral=True)
+            return
+        
+        modal = WhitelistSearchModal(self.cog, interaction.guild)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Alle Spieler anzeigen", style=discord.ButtonStyle.primary, emoji="📋", custom_id="whitelist_show_all", row=1)
+    async def show_all_players(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Zeigt alle Spieler ohne Filter an"""
+        # Prüfe ob User Whitelist-Duty hat
+        is_on_duty = await self.cog.config.member(interaction.user).whitelist_on_duty()
+        if not is_on_duty:
+            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein!", ephemeral=True)
+            return
+        
+        # Erstelle eine neue View ohne Suchfilter
+        new_view = WhitelistDutyView(self.cog, interaction.guild, search_query="")
+        
+        await interaction.response.edit_message(
+            content="📋 **Alle verfügbaren Spieler** (ohne Filter):\nWähle einen Spieler aus der Liste:",
+            view=new_view,
+            ephemeral=True
+        )
 
 
 class FeedbackPanelView(discord.ui.View):
