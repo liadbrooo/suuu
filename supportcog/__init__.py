@@ -1553,7 +1553,7 @@ class SupportCog(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Ein Fehler ist beim Entfernen der Rolle aufgetreten: `{str(e)}`")
     
-    @commands.command(name="checkwhitelist", aliases=["wlcheck", "whoadded", "wlinfo"])
+    @commands.command(name="checkwhitelist", aliases=["wlcheck", "whoadded", "wlcheckinfo"])
     async def checkwhitelist(self, ctx: commands.Context, user: discord.Member):
         """
         Überprüft wer einem Spieler die Whitelist gegeben hat.
