@@ -279,8 +279,8 @@ class SupportCog(commands.Cog):
             if channel and isinstance(channel, discord.TextChannel):
                 return channel
         
-        # Fallback auf log_channel
-        return await self.get_log_channel(guild)
+        # Fallback auf panel_channel
+        return await self.get_panel_channel(guild)
 
     async def get_support_call_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """Holt den Channel für Support-Aufrufe"""
@@ -1901,15 +1901,15 @@ class DutyButtonView(discord.ui.View):
     
     async def update_panel_display(self, guild: discord.Guild):
         """Updates the panel message to show current duty members"""
-        panel_message_id = await self.cog.config.guild(guild).panel_message_id()
-        if not panel_message_id:
-            return
-        
-        panel_channel = await self.cog.get_panel_channel(guild)
-        if not panel_channel:
-            return
-        
         try:
+            panel_message_id = await self.cog.config.guild(guild).panel_message_id()
+            if not panel_message_id:
+                return
+            
+            panel_channel = await self.cog.get_panel_channel(guild)
+            if not panel_channel:
+                return
+            
             panel_message = await panel_channel.fetch_message(panel_message_id)
             
             # Get current duty members
@@ -1954,7 +1954,7 @@ class DutyButtonView(discord.ui.View):
             new_embed.set_footer(text=f"Aktive Supporter: {duty_count} • Die 🟢 On Duty Rolle wird automatisch zugewiesen/entfernt")
             
             await panel_message.edit(embed=new_embed)
-        except:
+        except Exception as e:
             pass  # Ignore errors if panel message was deleted
 
 
@@ -2037,7 +2037,7 @@ class WhitelistButtonView(discord.ui.View):
             await log_channel.send(embed=embed)
         
         # Update the panel message to show current duty count
-        await self.update_panel_display(guild)
+        await self.update_whitelist_panel_display(guild)
         
         await interaction.response.send_message("✅ Du bist jetzt im Whitelist-Duty-Modus! Du wirst bei neuen Anfragen gepingt.", ephemeral=True)
     
@@ -2097,7 +2097,68 @@ class WhitelistButtonView(discord.ui.View):
         if log_channel:
             await log_channel.send(embed=embed)
         
+        # Update the panel message to show current duty count
+        await self.update_whitelist_panel_display(guild)
+        
         await interaction.response.send_message("✅ Du hast den Whitelist-Duty-Modus verlassen.", ephemeral=True)
+    
+    async def update_whitelist_panel_display(self, guild: discord.Guild):
+        """Updates the whitelist panel message to show current duty members"""
+        try:
+            panel_message_id = await self.cog.config.guild(guild).whitelist_panel_message_id()
+            if not panel_message_id:
+                return
+            
+            panel_channel = await self.cog.get_whitelist_panel_channel(guild)
+            if not panel_channel:
+                return
+            
+            panel_message = await panel_channel.fetch_message(panel_message_id)
+            
+            # Get current duty members
+            duty_count = 0
+            duty_list = []
+            duty_role = await self.cog.get_or_create_duty_role(guild, whitelist=True)
+            role_id = await self.cog.config.guild(guild).whitelist_role()
+            
+            if role_id and duty_role:
+                base_role = guild.get_role(role_id)
+                if base_role:
+                    for m in base_role.members:
+                        if duty_role in m.roles:
+                            is_duty = await self.cog.config.member(m).whitelist_on_duty()
+                            if is_duty:
+                                duty_count += 1
+                                duty_list.append(f"• {m.display_name}")
+            
+            # Create new embed with updated info
+            if duty_count > 0:
+                duty_text = "\n".join(duty_list[:10])
+                if len(duty_list) > 10:
+                    duty_text += f"\n• ...und {duty_count - 10} weitere"
+            else:
+                duty_text = "Niemand"
+            
+            new_embed = discord.Embed(
+                title="📋 Whitelist Duty Panel",
+                description=(
+                    "**Willkommen zum Whitelist-Duty System!**\n\n"
+                    "Klicke auf die Buttons unten um dich für den Whitelist-Dienst an- oder abzumelden.\n\n"
+                    "🔵 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
+                    "🔴 **Duty Beenden** - Du erhältst keine Pings mehr"
+                ),
+                color=discord.Color.blue()
+            )
+            new_embed.add_field(
+                name="🔵 Aktuell im Dienst",
+                value=duty_text,
+                inline=False
+            )
+            new_embed.set_footer(text=f"Aktive Handler: {duty_count} • Die 🔵 On Duty Rolle wird automatisch zugewiesen/entfernt")
+            
+            await panel_message.edit(embed=new_embed)
+        except Exception as e:
+            pass  # Ignore errors if panel message was deleted
 
 
 class WhitelistPlayerSelect(discord.ui.Select):
@@ -2599,28 +2660,53 @@ class WhitelistDutyView(discord.ui.View):
 
 
 class FeedbackPanelView(discord.ui.View):
-    """Button-View für Feedback"""
+    """Button-View für Feedback - Persistent"""
     
-    def __init__(self, cog: SupportCog):
+    def __init__(self, cog: SupportCog = None):
         super().__init__(timeout=None)
         self.cog = cog
+    
+    async def get_cog(self, interaction: discord.Interaction) -> Optional[SupportCog]:
+        """Holt den Cog aus der Interaktion wenn nicht gesetzt"""
+        if self.cog:
+            return self.cog
+        # Versuche den Cog aus dem Bot zu holen
+        try:
+            cog = interaction.client.get_cog("SupportCog")
+            if cog and isinstance(cog, SupportCog):
+                return cog
+        except Exception:
+            pass
+        return None
     
     @discord.ui.button(label="Positives Feedback geben", style=discord.ButtonStyle.green, emoji="😊", custom_id="feedback_positive")
     async def positive_feedback(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Öffnet ein Modal für positives Feedback"""
-        modal = FeedbackModal(self.cog, "positive")
+        cog = await self.get_cog(interaction)
+        if not cog:
+            await interaction.response.send_message("❌ Cog nicht gefunden. Bitte wende dich an einen Admin.", ephemeral=True)
+            return
+        modal = FeedbackModal(cog, "positive")
         await interaction.response.send_modal(modal)
     
     @discord.ui.button(label="Negatives Feedback geben", style=discord.ButtonStyle.red, emoji="😞", custom_id="feedback_negative")
     async def negative_feedback(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Öffnet ein Modal für negatives Feedback"""
-        modal = FeedbackModal(self.cog, "negative")
+        cog = await self.get_cog(interaction)
+        if not cog:
+            await interaction.response.send_message("❌ Cog nicht gefunden. Bitte wende dich an einen Admin.", ephemeral=True)
+            return
+        modal = FeedbackModal(cog, "negative")
         await interaction.response.send_modal(modal)
     
     @discord.ui.button(label="Vorschlag machen", style=discord.ButtonStyle.blurple, emoji="💡", custom_id="feedback_suggestion")
     async def suggestion_feedback(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Öffnet ein Modal für Vorschläge"""
-        modal = FeedbackModal(self.cog, "suggestion")
+        cog = await self.get_cog(interaction)
+        if not cog:
+            await interaction.response.send_message("❌ Cog nicht gefunden. Bitte wende dich an einen Admin.", ephemeral=True)
+            return
+        modal = FeedbackModal(cog, "suggestion")
         await interaction.response.send_modal(modal)
 
 
@@ -2789,10 +2875,10 @@ class SupportCallView(discord.ui.View):
 async def setup(bot: Red):
     """Lädt den Cog"""
     cog = SupportCog(bot)
-    # Registere die persistent Views für Buttons
+    # Registere die persistent Views für Buttons OHNE cog Referenz für FeedbackPanelView
     bot.add_view(DutyButtonView(cog))
     bot.add_view(WhitelistButtonView(cog))
-    bot.add_view(FeedbackPanelView(cog))
+    bot.add_view(FeedbackPanelView())  # Keine cog Referenz für persistente View
     bot.add_view(SupportCallView(cog))
     await bot.add_cog(cog)
 
