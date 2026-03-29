@@ -74,6 +74,7 @@ class SupportCog(commands.Cog):
             "duty_timeout": 4,  # Stunden nach denen Duty automatisch entfernt wird
             "panel_message_id": None,  # Message ID der permanenten Panel-Nachricht
             "team_panel_message_id": None,  # Message ID des Team-Panels
+            "support_always_allowed_role": None,  # Rolle die immer User holen darf (ohne Duty-Pflicht)
             
             # FEEDBACK SYSTEM
             "feedback_channel": None,  # Channel für Feedback-Logs
@@ -95,6 +96,7 @@ class SupportCog(commands.Cog):
             "whitelist_auto_remove_duty": True,
             "whitelist_duty_timeout": 4,
             "whitelist_panel_message_id": None,
+            "whitelist_always_allowed_role": None,  # Rolle die immer User holen darf (ohne Duty-Pflicht)
         }
 
         # Speichert On-Duty Status pro User (für beide Systeme)
@@ -674,7 +676,14 @@ class SupportCog(commands.Cog):
                 role_id = await self.config.guild(guild).whitelist_role()
                 base_role = guild.get_role(role_id) if role_id else None
                 
-                if base_role and base_role in teamler.roles:
+                # Prüfen ob die "immer erlaubt" Rolle vorhanden ist und der User diese hat
+                always_allowed_role_id = await self.config.guild(guild).whitelist_always_allowed_role()
+                always_allowed_role = guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
+                
+                if always_allowed_role and always_allowed_role in teamler.roles:
+                    # Diese Rolle darf immer, auch ohne Duty
+                    is_authorized = True
+                elif base_role and base_role in teamler.roles:
                     # Prüfen ob im Whitelist-Duty
                     duty_role = await self.get_or_create_duty_role(guild, whitelist=True)
                     if duty_role and duty_role in teamler.roles:
@@ -686,7 +695,14 @@ class SupportCog(commands.Cog):
                 role_id = await self.config.guild(guild).role()
                 base_role = guild.get_role(role_id) if role_id else None
                 
-                if base_role and base_role in teamler.roles:
+                # Prüfen ob die "immer erlaubt" Rolle vorhanden ist und der User diese hat
+                always_allowed_role_id = await self.config.guild(guild).support_always_allowed_role()
+                always_allowed_role = guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
+                
+                if always_allowed_role and always_allowed_role in teamler.roles:
+                    # Diese Rolle darf immer, auch ohne Duty
+                    is_authorized = True
+                elif base_role and base_role in teamler.roles:
                     # Prüfen ob im Support-Duty
                     duty_role = await self.get_or_create_duty_role(guild, whitelist=False)
                     if duty_role and duty_role in teamler.roles:
@@ -696,7 +712,7 @@ class SupportCog(commands.Cog):
             
             if not is_authorized:
                 system_name = "Whitelist" if whitelist else "Support"
-                await interaction.response.send_message(f"❌ Nur {system_name}-Duty-Mitglieder können User holen!", ephemeral=True)
+                await interaction.response.send_message(f"❌ Nur {system_name}-Duty-Mitglieder (oder Inhaber der entsprechenden 'immer erlaubt' Rolle) können User holen!", ephemeral=True)
                 return
             
             # Prüfen ob der User noch im Warteraum ist
@@ -793,6 +809,30 @@ class SupportCog(commands.Cog):
             
         await self.config.guild(ctx.guild).role.set(role_id)
         await ctx.send(f"✅ Support-Basisrolle auf {r.mention} gesetzt.\nℹ️ Die automatische Duty-Rolle wird beim ersten Duty-Start erstellt.")
+
+    @supportset.command(name="alwaysallowedrole")
+    async def supportset_alwaysallowedrole(self, ctx: commands.Context, role: str = None):
+        """
+        Setze die Rolle die IMMER User holen darf (ohne Duty-Pflicht).
+        Ohne Rollen-Angabe wird die Einstellung zurückgesetzt.
+        Unterstützt ID oder Mention.
+        """
+        if role is None or role.lower() == "reset":
+            await self.config.guild(ctx.guild).support_always_allowed_role.set(None)
+            await ctx.send("✅ 'Immer erlaubt' Rolle zurückgesetzt. Nur noch Duty-Mitglieder können User holen.")
+        else:
+            role_id = self._parse_role_id(role)
+            if role_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein!")
+                return
+            
+            r = ctx.guild.get_role(role_id)
+            if not r:
+                await ctx.send("❌ Rolle nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).support_always_allowed_role.set(role_id)
+            await ctx.send(f"✅ {r.mention} kann jetzt IMMER User holen (auch ohne Duty).")
 
     @supportset.command(name="panelchannel")
     async def supportset_panelchannel(self, ctx: commands.Context, channel: str = None):
@@ -1327,6 +1367,30 @@ class SupportCog(commands.Cog):
             
         await self.config.guild(ctx.guild).whitelist_role.set(role_id)
         await ctx.send(f"✅ Whitelist-Handler-Rolle auf {r.mention} gesetzt.\nℹ️ Die automatische Duty-Rolle wird beim ersten Duty-Start erstellt.")
+
+    @whitelistset.command(name="alwaysallowedrole")
+    async def whitelistset_alwaysallowedrole(self, ctx: commands.Context, role: str = None):
+        """
+        Setze die Rolle die IMMER User holen darf (ohne Duty-Pflicht).
+        Ohne Rollen-Angabe wird die Einstellung zurückgesetzt.
+        Unterstützt ID oder Mention.
+        """
+        if role is None or role.lower() == "reset":
+            await self.config.guild(ctx.guild).whitelist_always_allowed_role.set(None)
+            await ctx.send("✅ 'Immer erlaubt' Rolle zurückgesetzt. Nur noch Duty-Mitglieder können User holen.")
+        else:
+            role_id = self._parse_role_id(role)
+            if role_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein!")
+                return
+            
+            r = ctx.guild.get_role(role_id)
+            if not r:
+                await ctx.send("❌ Rolle nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).whitelist_always_allowed_role.set(role_id)
+            await ctx.send(f"✅ {r.mention} kann jetzt IMMER User holen (auch ohne Duty).")
 
     @whitelistset.command(name="approvedrole")
     async def whitelistset_approvedrole(self, ctx: commands.Context, role: str):
