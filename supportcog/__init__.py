@@ -222,7 +222,6 @@ class SupportCog(commands.Cog):
                 "Klicke auf die Buttons unten um dich für den Whitelist-Dienst an- oder abzumelden.\n\n"
                 "🔵 **Duty Starten** - Du wirst bei neuen Whitelist-Anfragen gepingt\n"
                 "🔴 **Duty Beenden** - Du erhältst keine Pings mehr\n\n"
-                "🎮 **Spieler whitelisten** - Öffnet ein Eingabefeld für Spieler-ID oder Name\n\n"
                 "**Aktuell im Dienst:** Niemand"
             ),
             color=discord.Color.blue()
@@ -2026,102 +2025,7 @@ class WhitelistButtonView(discord.ui.View):
         if log_channel:
             await log_channel.send(embed=embed)
         
-        # Update the panel message to show current duty count
-        await self.update_panel_display(guild)
-        
         await interaction.response.send_message("✅ Du hast den Whitelist-Duty-Modus verlassen.", ephemeral=True)
-    
-    @discord.ui.button(label="Spieler whitelisten", style=discord.ButtonStyle.primary, emoji="🎮", custom_id="whitelist_player_modal")
-    async def open_whitelist_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Öffnet ein Modal zum Eingeben der Spieler-ID oder des Benutzernamens"""
-        guild = interaction.guild
-        member = interaction.user
-        
-        # Prüfe Berechtigung: Whitelist-Handler-Rolle ODER im Duty
-        role_id = await self.cog.config.guild(guild).whitelist_role()
-        has_base_role = False
-        if role_id:
-            base_role = guild.get_role(role_id)
-            if base_role and base_role in member.roles:
-                has_base_role = True
-        
-        is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
-        
-        if not has_base_role and not is_on_duty:
-            await interaction.response.send_message("❌ Du benötigst die Whitelist-Handler-Rolle oder musst im Whitelist-Duty sein!", ephemeral=True)
-            return
-        
-        try:
-            # Öffne das WhitelistSearchModal (das jetzt direkt die Verarbeitung übernimmt)
-            modal = WhitelistSearchModal(self.cog, guild)
-            await interaction.response.send_modal(modal)
-        except discord.errors.HTTPException as e:
-            # Spezifische HTTP-Fehler behandeln
-            await interaction.followup.send(f"❌ HTTP-Fehler beim Öffnen des Modals: `{str(e)}`", ephemeral=True)
-        except discord.errors.InteractionResponded:
-            # Interaktion wurde bereits beantwortet, ignoriere
-            pass
-        except Exception as e:
-            await interaction.followup.send(f"❌ Fehler beim Öffnen des Modals: `{type(e).__name__}: {str(e)}`", ephemeral=True)
-    
-    async def update_panel_display(self, guild: discord.Guild):
-        """Updates the whitelist panel message to show current duty members"""
-        panel_message_id = await self.cog.config.guild(guild).whitelist_panel_message_id()
-        if not panel_message_id:
-            return
-        
-        panel_channel = await self.cog.get_whitelist_panel_channel(guild)
-        if not panel_channel:
-            return
-        
-        try:
-            panel_message = await panel_channel.fetch_message(panel_message_id)
-            
-            # Get current duty members
-            duty_count = 0
-            duty_list = []
-            duty_role = await self.cog.get_or_create_duty_role(guild, whitelist=True)
-            role_id = await self.cog.config.guild(guild).whitelist_role()
-            
-            if role_id and duty_role:
-                base_role = guild.get_role(role_id)
-                if base_role:
-                    for m in base_role.members:
-                        if duty_role in m.roles:
-                            is_duty = await self.cog.config.member(m).whitelist_on_duty()
-                            if is_duty:
-                                duty_count += 1
-                                duty_list.append(f"• {m.display_name}")
-            
-            # Create new embed with updated info
-            if duty_count > 0:
-                duty_text = "\n".join(duty_list[:10])
-                if len(duty_list) > 10:
-                    duty_text += f"\n• ...und {duty_count - 10} weitere"
-            else:
-                duty_text = "Niemand"
-            
-            new_embed = discord.Embed(
-                title="📋 Whitelist Duty Panel",
-                description=(
-                    "**Willkommen zum Whitelist-Duty System!**\n\n"
-                    "Klicke auf die Buttons unten um dich für den Whitelist-Dienst an- oder abzumelden.\n\n"
-                    "🔵 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
-                    "🔴 **Duty Beenden** - Du erhältst keine Pings mehr\n\n"
-                    "Klicke auf \"🎮 Spieler whitelisten\" um einen Spieler zur Whitelist hinzuzufügen."
-                ),
-                color=discord.Color.blue()
-            )
-            new_embed.add_field(
-                name="🔵 Aktuell im Dienst",
-                value=duty_text,
-                inline=False
-            )
-            new_embed.set_footer(text=f"Aktive Handler: {duty_count} • Die 📋 Whitelist Duty Rolle wird automatisch zugewiesen/entfernt")
-            
-            await panel_message.edit(embed=new_embed)
-        except:
-            pass  # Ignore errors if panel message was deleted
 
 
 class WhitelistPlayerSelect(discord.ui.Select):
