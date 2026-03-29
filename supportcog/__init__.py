@@ -2599,28 +2599,53 @@ class WhitelistDutyView(discord.ui.View):
 
 
 class FeedbackPanelView(discord.ui.View):
-    """Button-View für Feedback"""
+    """Button-View für Feedback - Persistent"""
     
-    def __init__(self, cog: SupportCog):
+    def __init__(self, cog: SupportCog = None):
         super().__init__(timeout=None)
         self.cog = cog
+    
+    async def get_cog(self, interaction: discord.Interaction) -> Optional[SupportCog]:
+        """Holt den Cog aus der Interaktion wenn nicht gesetzt"""
+        if self.cog:
+            return self.cog
+        # Versuche den Cog aus dem Bot zu holen
+        try:
+            cog = interaction.client.get_cog("SupportCog")
+            if cog and isinstance(cog, SupportCog):
+                return cog
+        except Exception:
+            pass
+        return None
     
     @discord.ui.button(label="Positives Feedback geben", style=discord.ButtonStyle.green, emoji="😊", custom_id="feedback_positive")
     async def positive_feedback(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Öffnet ein Modal für positives Feedback"""
-        modal = FeedbackModal(self.cog, "positive")
+        cog = await self.get_cog(interaction)
+        if not cog:
+            await interaction.response.send_message("❌ Cog nicht gefunden. Bitte wende dich an einen Admin.", ephemeral=True)
+            return
+        modal = FeedbackModal(cog, "positive")
         await interaction.response.send_modal(modal)
     
     @discord.ui.button(label="Negatives Feedback geben", style=discord.ButtonStyle.red, emoji="😞", custom_id="feedback_negative")
     async def negative_feedback(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Öffnet ein Modal für negatives Feedback"""
-        modal = FeedbackModal(self.cog, "negative")
+        cog = await self.get_cog(interaction)
+        if not cog:
+            await interaction.response.send_message("❌ Cog nicht gefunden. Bitte wende dich an einen Admin.", ephemeral=True)
+            return
+        modal = FeedbackModal(cog, "negative")
         await interaction.response.send_modal(modal)
     
     @discord.ui.button(label="Vorschlag machen", style=discord.ButtonStyle.blurple, emoji="💡", custom_id="feedback_suggestion")
     async def suggestion_feedback(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Öffnet ein Modal für Vorschläge"""
-        modal = FeedbackModal(self.cog, "suggestion")
+        cog = await self.get_cog(interaction)
+        if not cog:
+            await interaction.response.send_message("❌ Cog nicht gefunden. Bitte wende dich an einen Admin.", ephemeral=True)
+            return
+        modal = FeedbackModal(cog, "suggestion")
         await interaction.response.send_modal(modal)
 
 
@@ -2789,10 +2814,10 @@ class SupportCallView(discord.ui.View):
 async def setup(bot: Red):
     """Lädt den Cog"""
     cog = SupportCog(bot)
-    # Registere die persistent Views für Buttons
+    # Registere die persistent Views für Buttons OHNE cog Referenz für FeedbackPanelView
     bot.add_view(DutyButtonView(cog))
     bot.add_view(WhitelistButtonView(cog))
-    bot.add_view(FeedbackPanelView(cog))
+    bot.add_view(FeedbackPanelView())  # Keine cog Referenz für persistente View
     bot.add_view(SupportCallView(cog))
     await bot.add_cog(cog)
 

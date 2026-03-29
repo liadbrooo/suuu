@@ -1,1 +1,1 @@
-Nothing needs to be added to the .gitignore file based on the provided changes. The modification of 'supportcog/__init__.py' is a standard Python source file change and does not require any new ignore rules.
+Nothing should be ignored based on the provided file changes. The only modified file is a Python source file (`supportcog/__init__.py`), which should not be added to .gitignore.
