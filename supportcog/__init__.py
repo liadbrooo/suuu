@@ -2058,11 +2058,11 @@ class DutyButtonView(discord.ui.View):
     async def update_team_panel(self, channel: discord.TextChannel, guild: discord.Guild):
         """Erstellt oder aktualisiert das Team-Übersichts-Panel"""
         try:
-            team_panel_message_id = await self.cog.config.guild(guild).team_panel_message_id()
+            team_panel_message_id = await self.config.guild(guild).team_panel_message_id()
             
             # Hole alle Teammitglieder (Basisrolle)
-            role_id = await self.cog.config.guild(guild).role()
-            duty_role = await self.cog.get_or_create_duty_role(guild)
+            role_id = await self.config.guild(guild).role()
+            duty_role = await self.get_or_create_duty_role(guild)
             
             team_members = []
             on_duty_count = 0
@@ -2072,7 +2072,7 @@ class DutyButtonView(discord.ui.View):
                 base_role = guild.get_role(role_id)
                 if base_role:
                     for m in sorted(base_role.members, key=lambda x: x.display_name.lower()):
-                        is_duty = await self.cog.config.member(m).on_duty()
+                        is_duty = await self.config.member(m).on_duty()
                         status_emoji = "🟢" if is_duty else "🔴"
                         if is_duty:
                             on_duty_count += 1
@@ -2106,11 +2106,11 @@ class DutyButtonView(discord.ui.View):
                 except discord.NotFound:
                     # Nachricht nicht gefunden, neue erstellen
                     message = await channel.send(embed=embed, view=view)
-                    await self.cog.config.guild(guild).team_panel_message_id.set(message.id)
+                    await self.config.guild(guild).team_panel_message_id.set(message.id)
             else:
                 # Neue Nachricht erstellen
                 message = await channel.send(embed=embed, view=view)
-                await self.cog.config.guild(guild).team_panel_message_id.set(message.id)
+                await self.config.guild(guild).team_panel_message_id.set(message.id)
                 
         except Exception as e:
             print(f"Fehler beim Aktualisieren des Team-Panels: {e}")
