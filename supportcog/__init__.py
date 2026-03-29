@@ -67,11 +67,13 @@ class SupportCog(commands.Cog):
             "duty_role": None,  # Automatisch erstellte Duty-Rolle
             "use_embed": True,  # Ob Embeds verwendet werden sollen
             "enabled": True,   # Ob der Cog aktiv ist
-            "panel_channel": None,  # Channel für das Duty-Panel mit Buttons
+            "panel_channel": None,  # Channel für das Duty-Panel mit Buttons UND Feedback/Call Panels
             "log_channel": None,    # Channel NUR für Duty-Logs: An-/Abmeldungen
+            "team_channel": None,   # Channel für das Team-Übersichts-Panel
             "auto_remove_duty": True,  # Automatisch Duty entfernen nach X Stunden
             "duty_timeout": 4,  # Stunden nach denen Duty automatisch entfernt wird
             "panel_message_id": None,  # Message ID der permanenten Panel-Nachricht
+            "team_panel_message_id": None,  # Message ID des Team-Panels
             
             # FEEDBACK SYSTEM
             "feedback_channel": None,  # Channel für Feedback-Logs
@@ -89,6 +91,7 @@ class SupportCog(commands.Cog):
             "whitelist_approved_role": None,  # Rolle die Spieler nach Whitelist erhalten
             "whitelist_panel_channel": None,  # Channel für Whitelist-Duty-Panel
             "whitelist_log_channel": None,  # Channel für Whitelist-Duty-Logs
+            "whitelist_entries_channel": None,  # Channel für Whitelist-Einträge (Hinzufügungen/Entfernungen)
             "whitelist_auto_remove_duty": True,
             "whitelist_duty_timeout": 4,
             "whitelist_panel_message_id": None,
@@ -174,7 +177,7 @@ class SupportCog(commands.Cog):
         return await self.get_whitelist_log_channel(guild)
 
     async def get_whitelist_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        """Holt den Log-Channel für Whitelist-Duty-Logs"""
+        """Holt den Log-Channel für Whitelist-Duty-Logs (An-/Abmeldungen)"""
         log_channel_id = await self.config.guild(guild).whitelist_log_channel()
         
         if log_channel_id:
@@ -184,6 +187,18 @@ class SupportCog(commands.Cog):
         
         # Kein separater Log-Channel gesetzt - Logs landen im Whitelist-Channel
         return await self.get_whitelist_channel(guild)
+
+    async def get_whitelist_entries_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Channel für Whitelist-Einträge (Hinzufügungen/Entfernungen von Spielern)"""
+        entries_channel_id = await self.config.guild(guild).whitelist_entries_channel()
+        
+        if entries_channel_id:
+            channel = guild.get_channel(entries_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+        
+        # Fallback auf log_channel wenn kein spezieller entries_channel gesetzt
+        return await self.get_whitelist_log_channel(guild)
 
     async def get_whitelist_panel_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """Holt den Panel-Channel für das Whitelist-Duty-Interface"""
@@ -259,7 +274,7 @@ class SupportCog(commands.Cog):
         return await self.get_support_channel(guild)
 
     async def get_panel_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        """Holt den Panel-Channel für das Duty-Interface"""
+        """Holt den Panel-Channel für das Duty-Interface (Feedback/Call Panels)"""
         panel_channel_id = await self.config.guild(guild).panel_channel()
         
         if panel_channel_id:
@@ -269,6 +284,18 @@ class SupportCog(commands.Cog):
         
         # Fallback auf Log-Channel
         return await self.get_log_channel(guild)
+
+    async def get_team_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Channel für das Team-Übersichts-Panel"""
+        team_channel_id = await self.config.guild(guild).team_channel()
+        
+        if team_channel_id:
+            channel = guild.get_channel(team_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+        
+        # Fallback auf panel_channel
+        return await self.get_panel_channel(guild)
 
     async def get_feedback_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """Holt den Feedback-Channel für Feedback-Logs"""
@@ -711,6 +738,31 @@ class SupportCog(commands.Cog):
             await self.config.guild(ctx.guild).log_channel.set(channel_id)
             await ctx.send(f"✅ Logs werden jetzt in {ch.mention} angezeigt.")
 
+    @supportset.command(name="teamchannel")
+    async def supportset_teamchannel(self, ctx: commands.Context, channel: str = None):
+        """
+        Setze den Channel für das Team-Übersichts-Panel.
+        Ohne Channel-Angabe wird der Panel-Channel verwendet.
+        Verwende 'reset' um zurückzusetzen.
+        Unterstützt ID oder Mention.
+        """
+        if channel is None or channel.lower() == "reset":
+            await self.config.guild(ctx.guild).team_channel.set(None)
+            await ctx.send("✅ Team-Panel wird im Panel-Channel angezeigt.")
+        else:
+            channel_id = self._parse_channel_id(channel)
+            if channel_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein!")
+                return
+            
+            ch = ctx.guild.get_channel(channel_id)
+            if not ch or not isinstance(ch, discord.TextChannel):
+                await ctx.send("❌ Channel nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).team_channel.set(channel_id)
+            await ctx.send(f"✅ Team-Panel wird jetzt in {ch.mention} angezeigt.")
+
     @supportset.command(name="embed")
     async def supportset_embed(self, ctx: commands.Context, enabled: bool = None):
         """
@@ -750,6 +802,7 @@ class SupportCog(commands.Cog):
         enabled = guild_data.get("enabled")
         panel_channel_id = guild_data.get("panel_channel")
         log_channel_id = guild_data.get("log_channel")
+        team_channel_id = guild_data.get("team_channel")
         auto_duty = guild_data.get("auto_remove_duty", True)
         duty_timeout = guild_data.get("duty_timeout", 4)
         feedback_channel_id = guild_data.get("feedback_channel")
@@ -762,7 +815,8 @@ class SupportCog(commands.Cog):
         duty_role_mention = f"<@&{duty_role_id}>" if duty_role_id else "❌ Noch nicht erstellt"
         panel_channel_mention = f"<#{panel_channel_id}>" if panel_channel_id else "Gleicher wie Support-Channel"
         log_channel_mention = f"<#{log_channel_id}>" if log_channel_id else "Gleicher wie Support-Channel"
-        feedback_channel_mention = f"<#{feedback_channel_id}>" if feedback_channel_id else "Gleicher wie Log-Channel"
+        team_channel_mention = f"<#{team_channel_id}>" if team_channel_id else "Gleicher wie Panel-Channel"
+        feedback_channel_mention = f"<#{feedback_channel_id}>" if feedback_channel_id else "Gleicher wie Panel-Channel"
         call_channel_mention = f"<#{support_call_channel_id}>" if support_call_channel_id else "Gleicher wie Support-Channel"
         call_room_mention = f"<#{call_room_id}>" if call_room_id else "❌ Nicht gesetzt"
         embed_status = "✅ Aktiv" if use_embed else "❌ Deaktiviert"
@@ -793,8 +847,9 @@ class SupportCog(commands.Cog):
         embed.add_field(name="🎤 Voice-Warteraum", value=room_mention, inline=True)
         embed.add_field(name="👥 Support-Basisrolle", value=role_mention, inline=True)
         embed.add_field(name="🟢 Duty-Rolle", value=duty_role_mention, inline=True)
-        embed.add_field(name="📋 Panel-Channel", value=panel_channel_mention, inline=True)
+        embed.add_field(name="📋 Panel-Channel (Feedback/Call)", value=panel_channel_mention, inline=True)
         embed.add_field(name="📜 Log-Channel", value=log_channel_mention, inline=True)
+        embed.add_field(name="👥 Team-Channel", value=team_channel_mention, inline=True)
         embed.add_field(name="💬 Feedback-Channel", value=feedback_channel_mention, inline=True)
         embed.add_field(name="📞 Call-Channel", value=call_channel_mention, inline=True)
         embed.add_field(name="🎤 Call-Room", value=call_room_mention, inline=True)
@@ -1092,6 +1147,22 @@ class SupportCog(commands.Cog):
         
         await ctx.send("✅ Support-Aufruf-Panel wurde erstellt!")
 
+    @supportset.command(name="createteampanel")
+    async def supportset_createteampanel(self, ctx: commands.Context):
+        """
+        Erstellt ein permanentes Team-Übersichts-Panel.
+        Zeigt alle Teammitglieder und deren Status an.
+        """
+        guild = ctx.guild
+        channel = await self.get_team_channel(guild)
+        
+        if not channel:
+            channel = ctx.channel
+        
+        # Erstelle das Team-Panel
+        await self.update_team_panel(channel, guild)
+        await ctx.send("✅ Team-Panel wurde erstellt/aktualisiert!")
+
     # WHITELIST SYSTEM COMMANDS
     @commands.group(name="whitelistset", aliases=["whitelistconfig"])
     @commands.guild_only()
@@ -1196,14 +1267,14 @@ class SupportCog(commands.Cog):
     @whitelistset.command(name="logchannel")
     async def whitelistset_logchannel(self, ctx: commands.Context, channel: str = None):
         """
-        Setze den Channel für Whitelist-Duty-Logs.
+        Setze den Channel für Whitelist-Duty-Logs (An-/Abmeldungen).
         Ohne Channel-Angabe wird der normale Whitelist-Channel verwendet.
         Verwende 'reset' um zurückzusetzen.
         Unterstützt ID oder Mention.
         """
         if channel is None or channel.lower() == "reset":
             await self.config.guild(ctx.guild).whitelist_log_channel.set(None)
-            await ctx.send("✅ Whitelist-Logs werden im Whitelist-Channel angezeigt.")
+            await ctx.send("✅ Whitelist-Duty-Logs werden im Whitelist-Channel angezeigt.")
         else:
             channel_id = self._parse_channel_id(channel)
             if channel_id is None:
@@ -1216,7 +1287,32 @@ class SupportCog(commands.Cog):
                 return
                 
             await self.config.guild(ctx.guild).whitelist_log_channel.set(channel_id)
-            await ctx.send(f"✅ Whitelist-Logs werden jetzt in {ch.mention} angezeigt.")
+            await ctx.send(f"✅ Whitelist-Duty-Logs werden jetzt in {ch.mention} angezeigt.")
+
+    @whitelistset.command(name="entrieschannel")
+    async def whitelistset_entrieschannel(self, ctx: commands.Context, channel: str = None):
+        """
+        Setze den Channel für Whitelist-Einträge (Hinzufügungen/Entfernungen von Spielern).
+        Ohne Channel-Angabe wird der Duty-Log-Channel verwendet.
+        Verwende 'reset' um zurückzusetzen.
+        Unterstützt ID oder Mention.
+        """
+        if channel is None or channel.lower() == "reset":
+            await self.config.guild(ctx.guild).whitelist_entries_channel.set(None)
+            await ctx.send("✅ Whitelist-Einträge werden im Duty-Log-Channel angezeigt.")
+        else:
+            channel_id = self._parse_channel_id(channel)
+            if channel_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein!")
+                return
+            
+            ch = ctx.guild.get_channel(channel_id)
+            if not ch or not isinstance(ch, discord.TextChannel):
+                await ctx.send("❌ Channel nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).whitelist_entries_channel.set(channel_id)
+            await ctx.send(f"✅ Whitelist-Einträge werden jetzt in {ch.mention} angezeigt.")
 
     @whitelistset.command(name="show")
     async def whitelistset_show(self, ctx: commands.Context):
@@ -1230,6 +1326,7 @@ class SupportCog(commands.Cog):
         duty_role_id = guild_data.get("whitelist_duty_role")
         panel_channel_id = guild_data.get("whitelist_panel_channel")
         log_channel_id = guild_data.get("whitelist_log_channel")
+        entries_channel_id = guild_data.get("whitelist_entries_channel")
         auto_duty = guild_data.get("whitelist_auto_remove_duty", True)
         duty_timeout = guild_data.get("whitelist_duty_timeout", 4)
 
@@ -1240,6 +1337,7 @@ class SupportCog(commands.Cog):
         duty_role_mention = f"<@&{duty_role_id}>" if duty_role_id else "❌ Noch nicht erstellt"
         panel_channel_mention = f"<#{panel_channel_id}>" if panel_channel_id else "Gleicher wie Whitelist-Channel"
         log_channel_mention = f"<#{log_channel_id}>" if log_channel_id else "Gleicher wie Whitelist-Channel"
+        entries_channel_mention = f"<#{entries_channel_id}>" if entries_channel_id else "Gleicher wie Duty-Log-Channel"
         auto_duty_status = f"✅ Aktiv ({duty_timeout}h)" if auto_duty else "❌ Deaktiviert"
 
         # Zähle aktive Duty-User
@@ -1266,7 +1364,8 @@ class SupportCog(commands.Cog):
         embed.add_field(name="✅ Approved-Rolle", value=approved_role_mention, inline=True)
         embed.add_field(name="🔵 Duty-Rolle", value=duty_role_mention, inline=True)
         embed.add_field(name="📋 Panel-Channel", value=panel_channel_mention, inline=True)
-        embed.add_field(name="📜 Log-Channel", value=log_channel_mention, inline=True)
+        embed.add_field(name="📜 Duty-Log-Channel", value=log_channel_mention, inline=True)
+        embed.add_field(name="📄 Einträge-Channel", value=entries_channel_mention, inline=True)
 
         await ctx.send(embed=embed)
 
@@ -1309,7 +1408,7 @@ class SupportCog(commands.Cog):
         Zeigt Informationen zur aktuellen Whitelist-Konfiguration und Status an.
         
         Dieser Befehl zeigt:
-        - Konfigurierte Channels (Whitelist-Channel, Voice-Warteraum, Panel-Channel, Log-Channel)
+        - Konfigurierte Channels (Whitelist-Channel, Voice-Warteraum, Panel-Channel, Log-Channel, Entries-Channel)
         - Konfigurierte Rollen (Handler-Rolle, Approved-Rolle, Duty-Rolle)
         - Aktive Duty-Handler
         - Auto-Duty-Einstellungen
@@ -1324,6 +1423,7 @@ class SupportCog(commands.Cog):
         duty_role_id = guild_data.get("whitelist_duty_role")
         panel_channel_id = guild_data.get("whitelist_panel_channel")
         log_channel_id = guild_data.get("whitelist_log_channel")
+        entries_channel_id = guild_data.get("whitelist_entries_channel")
         auto_duty = guild_data.get("whitelist_auto_remove_duty", True)
         duty_timeout = guild_data.get("whitelist_duty_timeout", 4)
 
@@ -1334,6 +1434,7 @@ class SupportCog(commands.Cog):
         duty_role_mention = f"<@&{duty_role_id}>" if duty_role_id else "❌ Noch nicht erstellt"
         panel_channel_mention = f"<#{panel_channel_id}>" if panel_channel_id else "Gleicher wie Whitelist-Channel"
         log_channel_mention = f"<#{log_channel_id}>" if log_channel_id else "Gleicher wie Whitelist-Channel"
+        entries_channel_mention = f"<#{entries_channel_id}>" if entries_channel_id else "Gleicher wie Duty-Log-Channel"
         auto_duty_status = f"✅ Aktiv ({duty_timeout}h)" if auto_duty else "❌ Deaktiviert"
 
         # Zähle aktive Duty-User
@@ -1368,7 +1469,8 @@ class SupportCog(commands.Cog):
         embed.add_field(name="✅ Approved-Rolle", value=approved_role_mention, inline=True)
         embed.add_field(name="🔵 Duty-Rolle", value=duty_role_mention, inline=True)
         embed.add_field(name="📋 Panel-Channel", value=panel_channel_mention, inline=True)
-        embed.add_field(name="📜 Log-Channel", value=log_channel_mention, inline=True)
+        embed.add_field(name="📜 Duty-Log-Channel", value=log_channel_mention, inline=True)
+        embed.add_field(name="📄 Einträge-Channel", value=entries_channel_mention, inline=True)
         embed.set_footer(text=f"Whitelist-Info • {guild.name}")
 
         await ctx.send(embed=embed)
@@ -1426,9 +1528,9 @@ class SupportCog(commands.Cog):
             
             await ctx.send(embed=embed_success)
             
-            # Logge die Aktion im Whitelist-Log-Channel (getrennt von Duty-Logs!)
-            log_channel = await self.get_whitelist_log_channel(guild)
-            if log_channel:
+            # Logge die Aktion im Whitelist-Einträge-Channel (getrennt von Duty-Logs!)
+            entries_channel = await self.get_whitelist_entries_channel(guild)
+            if entries_channel:
                 log_embed = discord.Embed(
                     title="📋 Whitelist Eintrag erstellt",
                     description=f"**{user.mention}** wurde zur Whitelist hinzugefügt.",
@@ -1442,7 +1544,7 @@ class SupportCog(commands.Cog):
                 log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
                 log_embed.set_footer(text="Whitelist-Eintrag • Genehmigt von " + member.display_name)
                 
-                await log_channel.send(embed=log_embed)
+                await entries_channel.send(embed=log_embed)
             
             # Benachrichtige den Spieler
             try:
@@ -1516,9 +1618,9 @@ class SupportCog(commands.Cog):
             
             await ctx.send(embed=embed_success)
             
-            # Logge die Aktion im Whitelist-Log-Channel
-            log_channel = await self.get_whitelist_log_channel(guild)
-            if log_channel:
+            # Logge die Aktion im Whitelist-Einträge-Channel (getrennt von Duty-Logs!)
+            entries_channel = await self.get_whitelist_entries_channel(guild)
+            if entries_channel:
                 log_embed = discord.Embed(
                     title="🗑️ Whitelist Eintrag entfernt",
                     description=f"**{user.mention}** wurde die Whitelist entzogen.",
@@ -1532,7 +1634,7 @@ class SupportCog(commands.Cog):
                 log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
                 log_embed.set_footer(text="Whitelist-Entfernung • Durchgeführt von " + member.display_name)
                 
-                await log_channel.send(embed=log_embed)
+                await entries_channel.send(embed=log_embed)
             
             # Benachrichtige den Spieler
             try:
@@ -1946,16 +2048,72 @@ class DutyButtonView(discord.ui.View):
                 ),
                 color=discord.Color.blue()
             )
-            new_embed.add_field(
-                name="🟢 Aktuell im Dienst",
-                value=duty_text,
-                inline=False
-            )
-            new_embed.set_footer(text=f"Aktive Supporter: {duty_count} • Die 🟢 On Duty Rolle wird automatisch zugewiesen/entfernt")
+            new_embed.add_field(name=f"🟢 Aktuell im Dienst ({duty_count})", value=duty_text, inline=False)
+            new_embed.set_footer(text="Die 🟢 On Duty Rolle wird automatisch zugewiesen/entfernt")
             
             await panel_message.edit(embed=new_embed)
         except Exception as e:
-            pass  # Ignore errors if panel message was deleted
+            print(f"Fehler beim Aktualisieren des Duty-Panels: {e}")
+
+    async def update_team_panel(self, channel: discord.TextChannel, guild: discord.Guild):
+        """Erstellt oder aktualisiert das Team-Übersichts-Panel"""
+        try:
+            team_panel_message_id = await self.cog.config.guild(guild).team_panel_message_id()
+            
+            # Hole alle Teammitglieder (Basisrolle)
+            role_id = await self.cog.config.guild(guild).role()
+            duty_role = await self.cog.get_or_create_duty_role(guild)
+            
+            team_members = []
+            on_duty_count = 0
+            off_duty_count = 0
+            
+            if role_id:
+                base_role = guild.get_role(role_id)
+                if base_role:
+                    for m in sorted(base_role.members, key=lambda x: x.display_name.lower()):
+                        is_duty = await self.cog.config.member(m).on_duty()
+                        status_emoji = "🟢" if is_duty else "🔴"
+                        if is_duty:
+                            on_duty_count += 1
+                        else:
+                            off_duty_count += 1
+                        team_members.append(f"{status_emoji} {m.display_name}")
+            
+            # Erstelle Embed
+            embed = discord.Embed(
+                title="👥 Team Übersicht",
+                description="**Unser Support-Team**\n\nHier siehst du alle Teammitglieder und deren aktuellen Status.",
+                color=discord.Color.blue()
+            )
+            
+            if team_members:
+                embed.add_field(name=f"🟢 Im Dienst ({on_duty_count})", value=f"Insgesamt {len(team_members)} Teammitglieder", inline=False)
+                embed.add_field(name="📋 Teammitglieder", value="\n".join(team_members[:20]) + (f"\n...und {len(team_members) - 20} weitere" if len(team_members) > 20 else ""), inline=False)
+            else:
+                embed.add_field(name="Keine Teammitglieder", value="Es wurden noch keine Teammitglieder mit der Support-Basisrolle ausgestattet.", inline=False)
+            
+            embed.set_footer(text=f"On Duty: {on_duty_count} | Off Duty: {off_duty_count}")
+            
+            view = discord.ui.View()
+            # Button kann hier hinzugefügt werden falls gewünscht
+            
+            if team_panel_message_id:
+                # Existierende Nachricht aktualisieren
+                try:
+                    message = await channel.fetch_message(team_panel_message_id)
+                    await message.edit(embed=embed, view=view)
+                except discord.NotFound:
+                    # Nachricht nicht gefunden, neue erstellen
+                    message = await channel.send(embed=embed, view=view)
+                    await self.cog.config.guild(guild).team_panel_message_id.set(message.id)
+            else:
+                # Neue Nachricht erstellen
+                message = await channel.send(embed=embed, view=view)
+                await self.cog.config.guild(guild).team_panel_message_id.set(message.id)
+                
+        except Exception as e:
+            print(f"Fehler beim Aktualisieren des Team-Panels: {e}")
 
 
 class WhitelistButtonView(discord.ui.View):
