@@ -596,7 +596,7 @@ class SupportCog(commands.Cog):
                     # Button nur anzeigen wenn Duty-Mitglieder verfügbar sind
                     # Button ruft den User zum Teamler (nicht umgekehrt!)
                     button = discord.ui.Button(label="User zu mir holen", style=discord.ButtonStyle.green, emoji="📋", custom_id=f"fetch_whitelist_user_{member.id}")
-                    callback = self.create_fetch_user_callback(member, after.channel)
+                    callback = self.create_fetch_user_callback(member, after.channel, whitelist=True)
                     button.callback = callback
                     view.add_item(button)
 
@@ -657,28 +657,50 @@ class SupportCog(commands.Cog):
         except ValueError:
             return None
 
-    def create_fetch_user_callback(self, user_to_fetch: discord.Member, target_channel: discord.VoiceChannel):
-        """Erstellt eine Callback-Funktion für den 'User zu mir holen' Button"""
+    def create_fetch_user_callback(self, user_to_fetch: discord.Member, target_channel: discord.VoiceChannel, whitelist: bool = False):
+        """Erstellt eine Callback-Funktion für den 'User zu mir holen' Button
+        
+        Args:
+            user_to_fetch: Der User der geholt werden soll
+            target_channel: Der Voice-Channel in dem sich der User befindet
+            whitelist: True wenn es sich um einen Whitelist-Fall handelt, False für Support
+        """
         async def callback(interaction: discord.Interaction):
             """Callback wenn ein Teamler auf den Button klickt"""
             teamler = interaction.user
             
-            # Prüfen ob der Teamler berechtigt ist (Duty-Mitglied oder Support-Rolle)
+            # Prüfen ob der Teamler berechtigt ist (Duty-Mitglied oder entsprechende Rolle)
             guild = interaction.guild
-            role_id = await self.config.guild(guild).role()
-            base_role = guild.get_role(role_id) if role_id else None
             
             is_authorized = False
-            if base_role and base_role in teamler.roles:
-                # Prüfen ob im Duty
-                duty_role = await self.get_or_create_duty_role(guild, whitelist=False)
-                if duty_role and duty_role in teamler.roles:
-                    is_on_duty = await self.config.member(teamler).on_duty()
-                    if is_on_duty:
-                        is_authorized = True
+            if whitelist:
+                # WHITELIST SYSTEM
+                role_id = await self.config.guild(guild).whitelist_role()
+                base_role = guild.get_role(role_id) if role_id else None
+                
+                if base_role and base_role in teamler.roles:
+                    # Prüfen ob im Whitelist-Duty
+                    duty_role = await self.get_or_create_duty_role(guild, whitelist=True)
+                    if duty_role and duty_role in teamler.roles:
+                        is_on_duty = await self.config.member(teamler).whitelist_on_duty()
+                        if is_on_duty:
+                            is_authorized = True
+            else:
+                # SUPPORT SYSTEM
+                role_id = await self.config.guild(guild).role()
+                base_role = guild.get_role(role_id) if role_id else None
+                
+                if base_role and base_role in teamler.roles:
+                    # Prüfen ob im Support-Duty
+                    duty_role = await self.get_or_create_duty_role(guild, whitelist=False)
+                    if duty_role and duty_role in teamler.roles:
+                        is_on_duty = await self.config.member(teamler).on_duty()
+                        if is_on_duty:
+                            is_authorized = True
             
             if not is_authorized:
-                await interaction.response.send_message("❌ Nur Duty-Supporter können User holen!", ephemeral=True)
+                system_name = "Whitelist" if whitelist else "Support"
+                await interaction.response.send_message(f"❌ Nur {system_name}-Duty-Mitglieder können User holen!", ephemeral=True)
                 return
             
             # Prüfen ob der User noch im Warteraum ist
@@ -696,13 +718,14 @@ class SupportCog(commands.Cog):
             # Versuche den User zum Teamler zu bewegen
             try:
                 await user_to_fetch.move_to(target_vc)
+                system_name = "Whitelist" if whitelist else "Support"
                 await interaction.response.send_message(f"✅ {user_to_fetch.display_name} wurde zu dir in {target_vc.mention} geholt!", ephemeral=True)
                 
                 # Logge die Aktion
-                log_channel = await self.get_log_channel(guild)
+                log_channel = await self.get_log_channel(guild) if not whitelist else await self.get_whitelist_log_channel(guild)
                 if log_channel:
                     embed = discord.Embed(
-                        title="🎧 User geholt",
+                        title=f"🎧 User geholt ({system_name})",
                         description=f"{teamler.mention} hat {user_to_fetch.mention} aus dem Warteraum geholt.",
                         color=discord.Color.green(),
                         timestamp=datetime.utcnow()
