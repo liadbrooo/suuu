@@ -11,19 +11,20 @@ Installation:
    (normalerweise ~/.local/share/Red-DiscordBot/data/[DEIN_BOT_NAME]/cogs/)
 2. Lade den Cog mit: [p]load supportcog
 3. Konfiguriere mit:
-   - [p]supportset channel #textchannel  (Setzt den Text-Channel für Support-Benachrichtigungen)
+   - [p]supportset channel #textchannel  (Setzt den Channel für Team-Pings bei neuen Anfragen)
    - [p]supportset room @VoiceChannel    (Setzt den Voice-Warteraum)
-   - [p]supportset role @Rolle           (Setzt die Rolle, die gepingt wird)
+   - [p]supportset role @Rolle           (Setzt die Basis-Supportrolle)
    - [p]supportset panelchannel #channel (Channel für das Duty-Panel mit Buttons)
-   - [p]supportset logchannel #channel   (Channel für Duty-Log-Nachrichten)
+   - [p]supportset logchannel #channel   (Channel NUR für Duty-Logs: An-/Abmeldungen)
    - ODER verwende [p]supportset setup für einen interaktiven Einrichtungsassistenten
 
 Nutzung:
 - Wenn jemand den konfigurierten Voice-Channel betritt, wird automatisch
-  eine schöne Nachricht im Log-Channel gesendet.
+  eine schöne Nachricht im SUPPORT-CHANNEL gesendet mit Ping aller Duty-Mitglieder
+- Duty-Logs (An-/Abmeldungen) landen separat im LOG-CHANNEL
 - Support-Teamler können sich per Button am Duty-Panel an- und abmelden
 - Eine automatische "🟢 On Duty" Rolle wird erstellt und verwaltet
-- Nur Teamler mit der Duty-Rolle werden gepingt!
+- ALLE Duty-Mitglieder werden INDIVIDUELL gepingt für garantierte Benachrichtigung!
 """
 
 import discord
@@ -105,8 +106,20 @@ class SupportCog(commands.Cog):
         except discord.Forbidden:
             pass
 
+    async def get_support_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Support-Benachrichtigungs-Channel (für Team-Pings bei neuen Anfragen)"""
+        channel_id = await self.config.guild(guild).channel()
+        
+        if channel_id:
+            channel = guild.get_channel(channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+        
+        # Fallback auf log_channel wenn kein spezieller support channel gesetzt
+        return await self.get_log_channel(guild)
+
     async def get_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        """Holt den Log-Channel für Support-Anfragen und Duty-Logs"""
+        """Holt den Log-Channel NUR für Duty-Logs (An/Abmeldungen)"""
         log_channel_id = await self.config.guild(guild).log_channel()
         
         if log_channel_id:
@@ -114,14 +127,8 @@ class SupportCog(commands.Cog):
             if channel and isinstance(channel, discord.TextChannel):
                 return channel
         
-        # Fallback auf normalen Support-Channel
-        channel_id = await self.config.guild(guild).channel()
-        if channel_id:
-            channel = guild.get_channel(channel_id)
-            if channel and isinstance(channel, discord.TextChannel):
-                return channel
-        
-        return None
+        # Kein separater Log-Channel gesetzt - Logs landen im Support-Channel
+        return await self.get_support_channel(guild)
 
     async def get_panel_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """Holt den Panel-Channel für das Duty-Interface"""
@@ -198,8 +205,8 @@ class SupportCog(commands.Cog):
 
         # User hat den Warteraum soeben betreten
         try:
-            log_channel = await self.get_log_channel(guild)
-            if not log_channel:
+            support_channel = await self.get_support_channel(guild)
+            if not support_channel:
                 return
 
             base_role = guild.get_role(role_id)
@@ -246,16 +253,12 @@ class SupportCog(commands.Cog):
                         value=duty_list,
                         inline=True
                     )
-                    # Pinge alle On-Duty User über die Duty-Rolle
-                    ping_content = f"{duty_role.mention}" if duty_role else " ".join([m.mention for m in duty_members])
                 else:
                     embed.add_field(
                         name="🔴 Keine Supporter verfügbar",
-                        value=f"Niemand ist gerade im Dienst! {base_role.mention}",
+                        value=f"Niemand ist gerade im Dienst!",
                         inline=True
                     )
-                    # Fallback: Pinge die Basis-Rolle wenn niemand Duty hat
-                    ping_content = f"{base_role.mention}"
 
                 embed.add_field(
                     name="📍 Channel",
@@ -264,16 +267,26 @@ class SupportCog(commands.Cog):
                 )
                 embed.set_footer(text="Support Warteraum System • On-Duty aktiv")
 
-                # Sende das Embed mit Role-Ping im Content IM LOG-CHANNEL
-                await log_channel.send(content=ping_content, embed=embed)
+                # Sende das Embed mit Role-Ping IM SUPPORT-CHANNEL (nicht Log!)
+                # WICHTIG: allowed_mentions erzwingt den Ping der Rolle
+                if duty_role and duty_members:
+                    # Ping die Duty-Rolle direkt - das pingt ALLE Mitglieder reliably
+                    await support_channel.send(content=duty_role.mention, embed=embed, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
+                elif base_role:
+                    # Fallback zur Basis-Rolle wenn niemand Duty hat
+                    await support_channel.send(content=base_role.mention, embed=embed, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
+                else:
+                    await support_channel.send(embed=embed)
             else:
                 # Einfache Textnachricht (Fallback)
-                if duty_members:
-                    ping_content = f"{duty_role.mention}" if duty_role else " ".join([m.mention for m in duty_members])
-                    message = f"🎧 {ping_content} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})"
-                else:
+                if duty_role and duty_members:
+                    message = f"🎧 {duty_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})"
+                    await support_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
+                elif base_role:
                     message = f"🎧 {base_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention}) - Niemand im Duty!"
-                await log_channel.send(message)
+                    await support_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
+                else:
+                    await support_channel.send(f"🎧 {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})")
 
         except discord.Forbidden:
             # Bot hat keine Berechtigung zum Senden
@@ -699,14 +712,14 @@ class DutyButtonView(discord.ui.View):
         start_time = datetime.utcnow()
         await self.cog.config.member(member).duty_start.set(start_time.timestamp())
         
-        # Duty-Rolle hinzufügen
+        # Duty-Rolle hinzufügen (wichtig: erst Rolle, dann Log)
         await self.cog.update_duty_role(member, True)
         
         # Auto-Duty Timer starten falls aktiviert
         auto_duty = await self.cog.config.guild(guild).auto_remove_duty()
         duty_timeout = await self.cog.config.guild(guild).duty_timeout()
         
-        # Nachricht im Log-Channel senden
+        # Nachricht im LOG-Channel senden (separat vom Support-Ping!)
         log_channel = await self.cog.get_log_channel(guild)
         
         embed = discord.Embed(
