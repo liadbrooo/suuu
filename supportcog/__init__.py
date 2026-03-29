@@ -574,30 +574,8 @@ class SupportCog(commands.Cog):
         except Exception as e:
             # Logge Fehler
             print(f"Fehler in SupportCog (Whitelist): {e}")
-    @commands.group(name="supportset", aliases=["supportconfig"])
-    @commands.guild_only()
-    @checks.admin_or_permissions(manage_guild=True)
-    async def supportset(self, ctx: commands.Context):
-        """Konfiguriere den Support Warteraum Cog"""
-        pass
 
-    @supportset.command(name="channel")
-    async def supportset_channel(self, ctx: commands.Context, channel: str):
-        """Setze den Text-Channel für Support-Benachrichtigungen (ID oder Mention)"""
-        channel_id = self._parse_channel_id(channel)
-        
-        if channel_id is None:
-            await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein (z.B. #channel oder 123456789)")
-            return
-        
-        ch = ctx.guild.get_channel(channel_id)
-        if not ch or not isinstance(ch, discord.TextChannel):
-            await ctx.send("❌ Channel nicht gefunden oder kein Text-Channel!")
-            return
-            
-        await self.config.guild(ctx.guild).channel.set(channel_id)
-        await ctx.send(f"✅ Text-Channel auf {ch.mention} gesetzt.")
-
+    # HELPER METHODS - MÜSSEN VOR DEN COMMANDS DEFINIERT WERDEN!
     def _parse_channel_id(self, channel: str) -> Optional[int]:
         """Parses a channel mention or ID to an integer ID"""
         if channel.startswith("<#") and channel.endswith(">"):
@@ -624,6 +602,30 @@ class SupportCog(commands.Cog):
             return int(role)
         except ValueError:
             return None
+
+    @commands.group(name="supportset", aliases=["supportconfig"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def supportset(self, ctx: commands.Context):
+        """Konfiguriere den Support Warteraum Cog"""
+        pass
+
+    @supportset.command(name="channel")
+    async def supportset_channel(self, ctx: commands.Context, channel: str):
+        """Setze den Text-Channel für Support-Benachrichtigungen (ID oder Mention)"""
+        channel_id = self._parse_channel_id(channel)
+        
+        if channel_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein (z.B. #channel oder 123456789)")
+            return
+        
+        ch = ctx.guild.get_channel(channel_id)
+        if not ch or not isinstance(ch, discord.TextChannel):
+            await ctx.send("❌ Channel nicht gefunden oder kein Text-Channel!")
+            return
+            
+        await self.config.guild(ctx.guild).channel.set(channel_id)
+        await ctx.send(f"✅ Text-Channel auf {ch.mention} gesetzt.")
 
     @supportset.command(name="room")
     async def supportset_room(self, ctx: commands.Context, room: str):
