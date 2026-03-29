@@ -334,7 +334,7 @@ class SupportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        """Hört auf Voice-Channel Änderungen und sendet Benachrichtigungen"""
+        """Hört auf Voice-Channel Änderungen und sendet Benachrichtigungen für Support UND Whitelist"""
 
         # Ignoriere Bots
         if member.bot:
@@ -349,53 +349,43 @@ class SupportCog(commands.Cog):
         if not enabled:
             return
 
-        # Hole Konfiguration
+        # SUPPORT SYSTEM
+        await self._handle_support_voice_update(member, before, after, guild)
+        
+        # WHITELIST SYSTEM
+        await self._handle_whitelist_voice_update(member, before, after, guild)
+
+    async def _handle_support_voice_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState, guild: discord.Guild):
+        """Verarbeitet Voice-Updates für das Support-System"""
+        
         room_id = await self.config.guild(guild).room()
         role_id = await self.config.guild(guild).role()
-        channel_id = await self.config.guild(guild).channel()  # Explizit den Support-Channel holen
         use_embed = await self.config.guild(guild).use_embed()
 
         # Prüfen ob alle erforderlichen Einstellungen gesetzt sind
         if not all([room_id, role_id]):
             return
 
-        # Prüfen ob es der konfigurierte Warteraum ist
-        # User muss DEN Warteraum BETRETEN (vorher woanders oder offline, jetzt im Warteraum)
+        # Prüfen ob es der konfigurierte Support-Warteraum ist
         if after.channel is None or after.channel.id != room_id:
             return
         if before.channel is not None and before.channel.id == room_id:
             # User war bereits im Warteraum - keine Aktion
             return
 
-        # User hat den Warteraum soeben betreten
+        # User hat den Support-Warteraum soeben betreten
         try:
-            # Hole explizit den Support-Channel (nicht Log-Channel!)
-            support_channel = None
-            if channel_id:
-                support_channel = guild.get_channel(channel_id)
-                if not support_channel or not isinstance(support_channel, discord.TextChannel):
-                    # Fallback: Versuche Log-Channel wenn Support-Channel ungültig
-                    log_channel_id = await self.config.guild(guild).log_channel()
-                    if log_channel_id:
-                        support_channel = guild.get_channel(log_channel_id)
-            
+            support_channel = await self.get_support_channel(guild)
             if not support_channel:
-                print(f"[SupportCog] Kein gültiger Support-Channel für Guild {guild.id} gefunden!")
-                return
-
-            # Teste Berechtigungen
-            if not support_channel.permissions_for(guild.me).send_messages:
-                print(f"[SupportCog] Keine Sendeberechtigung in Channel {support_channel.id}!")
                 return
 
             base_role = guild.get_role(role_id)
             if not base_role:
-                print(f"[SupportCog] Basis-Rolle {role_id} nicht gefunden!")
                 return
 
             # Hole alle On-Duty User MIT DER DUTY ROLLE
             duty_members = []
-            duty_role = await self.get_or_create_duty_role(guild)
+            duty_role = await self.get_or_create_duty_role(guild, whitelist=False)
             
             for m in base_role.members:
                 # Prüfe ob User die Duty-Rolle hat UND on_duty flag gesetzt ist
@@ -477,23 +467,9 @@ class SupportCog(commands.Cog):
             print(f"[SupportCog] Fehler in Support Warteraum: {type(e).__name__}: {e}")
             print(traceback.format_exc())
 
-    @commands.Cog.listener()
-    async def on_voice_state_update_whitelist(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        """Hört auf Voice-Channel Änderungen für Whitelist und sendet Benachrichtigungen"""
-
-        # Ignoriere Bots
-        if member.bot:
-            return
-
-        guild = member.guild
-        if not guild:
-            return
-
-        # Prüfen ob Cog für dieses Guild aktiviert ist
-        enabled = await self.config.guild(guild).enabled()
-        if not enabled:
-            return
-
+    async def _handle_whitelist_voice_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState, guild: discord.Guild):
+        """Verarbeitet Voice-Updates für das Whitelist-System"""
+        
         # Hole Whitelist-Konfiguration
         room_id = await self.config.guild(guild).whitelist_room()
         role_id = await self.config.guild(guild).whitelist_role()
@@ -598,7 +574,6 @@ class SupportCog(commands.Cog):
         except Exception as e:
             # Logge Fehler
             print(f"Fehler in SupportCog (Whitelist): {e}")
-
     @commands.group(name="supportset", aliases=["supportconfig"])
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
