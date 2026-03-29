@@ -1302,23 +1302,32 @@ class SupportCog(commands.Cog):
             await self.config.guild(ctx.guild).whitelist_duty_timeout.set(hours)
             await ctx.send(f"✅ Whitelist-Duty wird automatisch nach {hours} Stunden beendet.")
     
-    @commands.command(name="whitelistuser", aliases=["wluser", "addwhitelist"])
+    @commands.command(name="whitelistuser", aliases=["wluser", "addwhitelist", "wl"])
     async def whitelistuser(self, ctx: commands.Context, user: discord.Member):
         """
-        Fügt einen Spieler zur Whitelist hinzu (Alternative zum Modal).
+        Fügt einen Spieler zur Whitelist hinzu.
         
         Verwendung: [p]whitelistuser @User oder [p]whitelistuser USER_ID
         
-        - Nur für User im Whitelist-Duty verfügbar
-        - Loggt die Aktion automatisch
+        - Erfordert Whitelist-Handler-Rolle ODER im Whitelist-Duty
+        - Loggt die Aktion automatisch im Whitelist-Log-Channel
+        - Trennt Duty-Logs von Eintrag-Logs
         """
         guild = ctx.guild
         member = ctx.author
         
-        # Prüfe ob User Whitelist-Duty hat
+        # Prüfe Berechtigung: Whitelist-Handler-Rolle ODER im Duty
+        role_id = await self.config.guild(guild).whitelist_role()
+        has_base_role = False
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and base_role in member.roles:
+                has_base_role = True
+        
         is_on_duty = await self.config.member(member).whitelist_on_duty()
-        if not is_on_duty:
-            await ctx.send("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!")
+        
+        if not has_base_role and not is_on_duty:
+            await ctx.send("❌ Du benötigst die Whitelist-Handler-Rolle oder musst im Whitelist-Duty sein!")
             return
         
         approved_role = await self.get_whitelist_approved_role(guild)
@@ -1346,13 +1355,13 @@ class SupportCog(commands.Cog):
             
             await ctx.send(embed=embed_success)
             
-            # Logge die Aktion
+            # Logge die Aktion im Whitelist-Log-Channel (getrennt von Duty-Logs!)
             log_channel = await self.get_whitelist_log_channel(guild)
             if log_channel:
                 log_embed = discord.Embed(
                     title="📋 Whitelist Eintrag erstellt",
                     description=f"**{user.mention}** wurde zur Whitelist hinzugefügt.",
-                    color=discord.Color.blue(),
+                    color=discord.Color.gold(),
                     timestamp=datetime.utcnow()
                 )
                 log_embed.set_thumbnail(url=user.display_avatar.url)
@@ -1360,7 +1369,7 @@ class SupportCog(commands.Cog):
                 log_embed.add_field(name="🔹 Spieler", value=f"{user.mention}\n*{user.display_name}* (ID: `{user.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
                 log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
-                log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {member.display_name}")
+                log_embed.set_footer(text="Whitelist-Eintrag • Genehmigt von " + member.display_name)
                 
                 await log_channel.send(embed=log_embed)
             
@@ -1383,6 +1392,297 @@ class SupportCog(commands.Cog):
             await ctx.send("❌ Ich habe keine Berechtigung um diese Rolle zuzuweisen!")
         except Exception as e:
             await ctx.send(f"❌ Ein Fehler ist beim Hinzufügen der Rolle aufgetreten: `{str(e)}`")
+    
+    @commands.command(name="removewhitelist", aliases=["unwhitelist", "wlremove", "delwhitelist"])
+    async def removewhitelist(self, ctx: commands.Context, user: discord.Member):
+        """
+        Entfernt die Whitelist-Rolle von einem Spieler.
+        
+        Verwendung: [p]removewhitelist @User oder [p]removewhitelist USER_ID
+        
+        - Erfordert Whitelist-Handler-Rolle ODER im Whitelist-Duty
+        - Loggt die Aktion automatisch im Whitelist-Log-Channel
+        """
+        guild = ctx.guild
+        member = ctx.author
+        
+        # Prüfe Berechtigung: Whitelist-Handler-Rolle ODER im Duty
+        role_id = await self.config.guild(guild).whitelist_role()
+        has_base_role = False
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and base_role in member.roles:
+                has_base_role = True
+        
+        is_on_duty = await self.config.member(member).whitelist_on_duty()
+        
+        if not has_base_role and not is_on_duty:
+            await ctx.send("❌ Du benötigst die Whitelist-Handler-Rolle oder musst im Whitelist-Duty sein!")
+            return
+        
+        approved_role = await self.get_whitelist_approved_role(guild)
+        if not approved_role:
+            await ctx.send("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.")
+            return
+        
+        # Prüfe ob der User die Rolle hat
+        if approved_role not in user.roles:
+            await ctx.send(f"ℹ️ {user.mention} hat die Whitelist-Rolle nicht!")
+            return
+        
+        # Entferne die Approved-Rolle
+        try:
+            await user.remove_roles(approved_role, reason=f"Whitelist entfernt von {member.display_name}")
+            
+            embed_success = discord.Embed(
+                title="❌ Whitelist entfernt",
+                description=f"{user.mention} wurde die Whitelist-Rolle entzogen!",
+                color=discord.Color.red(),
+                timestamp=datetime.utcnow()
+            )
+            embed_success.add_field(name="👤 Entfernt von", value=f"{member.mention} ({member.display_name})", inline=True)
+            embed_success.add_field(name="🎮 Spieler", value=f"{user.display_name}", inline=True)
+            
+            await ctx.send(embed=embed_success)
+            
+            # Logge die Aktion im Whitelist-Log-Channel
+            log_channel = await self.get_whitelist_log_channel(guild)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="🗑️ Whitelist Eintrag entfernt",
+                    description=f"**{user.mention}** wurde die Whitelist entzogen.",
+                    color=discord.Color.dark_red(),
+                    timestamp=datetime.utcnow()
+                )
+                log_embed.set_thumbnail(url=user.display_avatar.url)
+                log_embed.add_field(name="🔹 Entfernt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
+                log_embed.add_field(name="🔹 Spieler", value=f"{user.mention}\n*{user.display_name}* (ID: `{user.id}`)", inline=True)
+                log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
+                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
+                log_embed.set_footer(text="Whitelist-Entfernung • Durchgeführt von " + member.display_name)
+                
+                await log_channel.send(embed=log_embed)
+            
+            # Benachrichtige den Spieler
+            try:
+                dm_embed = discord.Embed(
+                    title="⚠️ Whitelist entfernt",
+                    description=f"Deine Whitelist wurde von **{member.display_name}** entfernt.",
+                    color=discord.Color.orange(),
+                    timestamp=datetime.utcnow()
+                )
+                dm_embed.add_field(name="❌ Rolle entfernt", value=f"{approved_role.mention}", inline=False)
+                dm_embed.set_footer(text=f"{guild.name} Whitelist System")
+                await user.send(embed=dm_embed)
+            except discord.Forbidden:
+                pass
+            
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung um diese Rolle zu entfernen!")
+        except Exception as e:
+            await ctx.send(f"❌ Ein Fehler ist beim Entfernen der Rolle aufgetreten: `{str(e)}`")
+    
+    @commands.command(name="checkwhitelist", aliases=["wlcheck", "whoadded", "wlinfo"])
+    async def checkwhitelist(self, ctx: commands.Context, user: discord.Member):
+        """
+        Überprüft wer einem Spieler die Whitelist gegeben hat.
+        
+        Verwendung: [p]checkwhitelist @User oder [p]checkwhitelist USER_ID
+        
+        - Zeigt den Genehmiger und Zeitpunkt der Whitelist
+        - Durchsucht die Logs des Whitelist-Log-Channels
+        - Erfordert Whitelist-Handler-Rolle
+        """
+        guild = ctx.guild
+        member = ctx.author
+        
+        # Prüfe Berechtigung: Whitelist-Handler-Rolle
+        role_id = await self.config.guild(guild).whitelist_role()
+        has_base_role = False
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and base_role in member.roles:
+                has_base_role = True
+        
+        if not has_base_role:
+            await ctx.send("❌ Du benötigst die Whitelist-Handler-Rolle für diesen Befehl!")
+            return
+        
+        approved_role = await self.get_whitelist_approved_role(guild)
+        if not approved_role:
+            await ctx.send("❌ Keine Whitelist-Approved-Rolle konfiguriert!")
+            return
+        
+        # Prüfe ob der User die Rolle hat
+        if approved_role not in user.roles:
+            await ctx.send(f"ℹ️ {user.mention} hat die Whitelist-Rolle nicht!")
+            return
+        
+        # Suche in den Logs nach dem Eintrag
+        log_channel = await self.get_whitelist_log_channel(guild)
+        if not log_channel:
+            await ctx.send("❌ Kein Whitelist-Log-Channel konfiguriert!")
+            return
+        
+        await ctx.send("🔍 Durchsuche Whitelist-Logs...")
+        
+        found_entry = None
+        approver = None
+        grant_time = None
+        
+        try:
+            # Durchsuche die letzten 1000 Nachrichten im Log-Channel
+            async for message in log_channel.history(limit=1000):
+                if not message.embeds:
+                    continue
+                
+                embed = message.embeds[0]
+                
+                # Prüfe ob es ein Whitelist-Eintrag für diesen User ist
+                if embed.title and ("Eintrag erstellt" in embed.title or "hinzugefügt" in embed.description.lower()):
+                    # Prüfe ob der User im Embed erwähnt wird
+                    if user.mention in str(embed.description) or user.id == int(user.id):
+                        # Finde den Genehmiger im Embed
+                        for field in embed.fields:
+                            if "genehmigt von" in field.name.lower() or "von" in field.name.lower():
+                                # Extrahiere den Mention des Genehmigers
+                                mention_parts = field.value.split(">")
+                                if len(mention_parts) > 1:
+                                    approver_mention = mention_parts[0] + ">"
+                                    approver = approver_mention
+                                
+                                if "zeitpunkt" in field.name.lower() or "time" in field.name.lower():
+                                    grant_time = field.value
+                        
+                        found_entry = message
+                        break
+            
+            if found_entry and approver:
+                # Versuche den Genehmiger als Member zu finden
+                approver_member = None
+                if "<@" in approver:
+                    try:
+                        approver_id = int(approver.replace("<@", "").replace(">", ""))
+                        approver_member = await guild.fetch_member(approver_id)
+                    except:
+                        pass
+                
+                embed_result = discord.Embed(
+                    title="📋 Whitelist Information",
+                    description=f"Informationen zur Whitelist von {user.mention}",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.utcnow()
+                )
+                embed_result.add_field(
+                    name="✅ Genehmigt von",
+                    value=approver_member.mention if approver_member else approver,
+                    inline=True
+                )
+                embed_result.add_field(
+                    name="🎮 Spieler",
+                    value=f"{user.mention}\n*{user.display_name}*",
+                    inline=True
+                )
+                embed_result.add_field(
+                    name="⏰ Zeitpunkt",
+                    value=grant_time if grant_time else "Unbekannt",
+                    inline=False
+                )
+                embed_result.add_field(
+                    name="📝 Rolle",
+                    value=approved_role.mention,
+                    inline=True
+                )
+                embed_result.set_footer(text=f"Whitelist-Check • Durchgeführt von {member.display_name}")
+                
+                await ctx.send(embed=embed_result)
+            else:
+                await ctx.send(f"ℹ️ Kein Whitelist-Eintrag für {user.mention} in den Logs gefunden.\nDie Whitelist wurde möglicherweise vor der Log-Einrichtung oder manuell vergeben.")
+        
+        except Exception as e:
+            await ctx.send(f"❌ Fehler beim Durchsuchen der Logs: `{str(e)}`")
+    
+    @commands.command(name="whitelistlog", aliases=["wllog", "whitelistlogs"])
+    async def whitelistlog(self, ctx: commands.Context, limit: int = 10):
+        """
+        Zeigt die letzten Whitelist-Einträge an.
+        
+        Verwendung: [p]whitelistlog [Anzahl, Standard: 10]
+        
+        - Zeigt die letzten X Whitelist-Genehmigungen und Entfernungen
+        - Erfordert Whitelist-Handler-Rolle
+        """
+        guild = ctx.guild
+        member = ctx.author
+        
+        # Prüfe Berechtigung: Whitelist-Handler-Rolle
+        role_id = await self.config.guild(guild).whitelist_role()
+        has_base_role = False
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and base_role in member.roles:
+                has_base_role = True
+        
+        if not has_base_role:
+            await ctx.send("❌ Du benötigst die Whitelist-Handler-Rolle für diesen Befehl!")
+            return
+        
+        log_channel = await self.get_whitelist_log_channel(guild)
+        if not log_channel:
+            await ctx.send("❌ Kein Whitelist-Log-Channel konfiguriert!")
+            return
+        
+        # Begrenze auf max 50 Einträge
+        limit = min(limit, 50)
+        
+        entries = []
+        try:
+            async for message in log_channel.history(limit=100):
+                if not message.embeds:
+                    continue
+                
+                embed = message.embeds[0]
+                if embed.title and ("Eintrag erstellt" in embed.title or "Eintrag entfernt" in embed.title or "hinzugefügt" in embed.title.lower() or "entfernt" in embed.title.lower()):
+                    entries.append({
+                        "title": embed.title,
+                        "description": embed.description,
+                        "color": embed.color,
+                        "timestamp": embed.timestamp if embed.timestamp else message.created_at,
+                        "fields": embed.fields[:2] if embed.fields else []  # Nur erste 2 Felder für Übersicht
+                    })
+                
+                if len(entries) >= limit:
+                    break
+            
+            if not entries:
+                await ctx.send("ℹ️ Keine Whitelist-Einträge in den Logs gefunden.")
+                return
+            
+            # Erstelle eine übersichtliche Liste
+            embed_list = discord.Embed(
+                title="📋 Whitelist Verlauf",
+                description=f"Die letzten {len(entries)} Whitelist-Aktionen",
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
+            )
+            
+            for i, entry in enumerate(entries, 1):
+                action_type = "✅" if "erstellt" in entry["title"].lower() or "hinzugefügt" in entry["title"].lower() else "❌"
+                desc_short = entry["description"][:80] + "..." if len(entry["description"]) > 80 else entry["description"]
+                time_str = f"<t:{int(entry['timestamp'].timestamp())}:R>" if entry["timestamp"] else "Unbekannt"
+                
+                embed_list.add_field(
+                    name=f"{action_type} Eintrag #{i} • {time_str}",
+                    value=desc_short,
+                    inline=False
+                )
+            
+            embed_list.set_footer(text=f"Whitelist-Log • Angezeigt von {member.display_name}")
+            
+            await ctx.send(embed=embed_list)
+        
+        except Exception as e:
+            await ctx.send(f"❌ Fehler beim Abrufen der Logs: `{str(e)}`")
 
 
 class DutyButtonView(discord.ui.View):
@@ -1737,10 +2037,18 @@ class WhitelistButtonView(discord.ui.View):
         guild = interaction.guild
         member = interaction.user
         
-        # Prüfe ob User Whitelist-Duty hat
+        # Prüfe Berechtigung: Whitelist-Handler-Rolle ODER im Duty
+        role_id = await self.cog.config.guild(guild).whitelist_role()
+        has_base_role = False
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and base_role in member.roles:
+                has_base_role = True
+        
         is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
-        if not is_on_duty:
-            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
+        
+        if not has_base_role and not is_on_duty:
+            await interaction.response.send_message("❌ Du benötigst die Whitelist-Handler-Rolle oder musst im Whitelist-Duty sein!", ephemeral=True)
             return
         
         try:
@@ -2159,9 +2467,19 @@ class WhitelistSearchModal(discord.ui.Modal):
             search_query = self.search_input.value.strip()
             
             member = interaction.user
+            
+            # Prüfe Berechtigung: Whitelist-Handler-Rolle ODER im Duty
+            role_id = await self.cog.config.guild(self.guild).whitelist_role()
+            has_base_role = False
+            if role_id:
+                base_role = self.guild.get_role(role_id)
+                if base_role and base_role in member.roles:
+                    has_base_role = True
+            
             is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
-            if not is_on_duty:
-                await interaction.followup.send("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
+            
+            if not has_base_role and not is_on_duty:
+                await interaction.followup.send("❌ Du benötigst die Whitelist-Handler-Rolle oder musst im Whitelist-Duty sein!", ephemeral=True)
                 return
             
             approved_role = await self.cog.get_whitelist_approved_role(self.guild)
