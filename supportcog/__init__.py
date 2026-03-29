@@ -1,5 +1,6 @@
 """
 Support Warteraum Cog für RedBot mit On-Duty System & Button-Interface
+Verbesserte Version mit getrennten Panel/Log Channels und besserer UX
 
 Dieser Cog erkennt, wenn ein Nutzer einen Support-Warteraum betritt oder verlässt
 und sendet eine Nachricht in einem konfigurierten Text-Channel.
@@ -10,17 +11,18 @@ Installation:
    (normalerweise ~/.local/share/Red-DiscordBot/data/[DEIN_BOT_NAME]/cogs/)
 2. Lade den Cog mit: [p]load supportcog
 3. Konfiguriere mit:
-   - [p]supportset channel #textchannel  (Setzt den Text-Channel für Benachrichtigungen)
+   - [p]supportset channel #textchannel  (Setzt den Text-Channel für Support-Benachrichtigungen)
    - [p]supportset room @VoiceChannel    (Setzt den Voice-Warteraum)
    - [p]supportset role @Rolle           (Setzt die Rolle, die gepingt wird)
-   - [p]supportset dutychannel #channel  (Optional: Separater Channel für Duty-Nachrichten)
+   - [p]supportset panelchannel #channel (Channel für das Duty-Panel mit Buttons)
+   - [p]supportset logchannel #channel   (Channel für Duty-Log-Nachrichten)
    - ODER verwende [p]supportset setup für einen interaktiven Einrichtungsassistenten
 
 Nutzung:
 - Wenn jemand den konfigurierten Voice-Channel betritt, wird automatisch
-  eine schöne Nachricht im Text-Channel gesendet.
-- Support-Teamler können sich per Button an- und abmelden
-- Eine automatische "On Duty" Rolle wird erstellt und verwaltet
+  eine schöne Nachricht im Log-Channel gesendet.
+- Support-Teamler können sich per Button am Duty-Panel an- und abmelden
+- Eine automatische "🟢 On Duty" Rolle wird erstellt und verwaltet
 - Nur Teamler mit der Duty-Rolle werden gepingt!
 """
 
@@ -40,16 +42,17 @@ class SupportCog(commands.Cog):
         self.config = Config.get_conf(self, identifier=12345678901234567890)
 
         default_guild_settings = {
-            "channel": None,  # Text-Channel ID für Support-Benachrichtigungen
+            "channel": None,  # Text-Channel ID für Support-Benachrichtigungen (Fallback)
             "room": None,     # Voice-Channel ID des Warteraums
             "role": None,     # Rolle ID die gepingt wird (Basis-Supportrolle)
             "duty_role": None,  # Automatisch erstellte Duty-Rolle
             "use_embed": True,  # Ob Embeds verwendet werden sollen
             "enabled": True,   # Ob der Cog aktiv ist
-            "duty_channel": None,  # Channel für Duty-Nachrichten
+            "panel_channel": None,  # Channel für das Duty-Panel mit Buttons
+            "log_channel": None,    # Channel für Support-Anfragen und Duty-Logs
             "auto_remove_duty": True,  # Automatisch Duty entfernen nach X Stunden
             "duty_timeout": 4,  # Stunden nach denen Duty automatisch entfernt wird
-            "duty_message_id": None  # Message ID der permanenten Duty-Nachricht
+            "panel_message_id": None  # Message ID der permanenten Panel-Nachricht
         }
 
         # Speichert On-Duty Status pro User
@@ -102,31 +105,61 @@ class SupportCog(commands.Cog):
         except discord.Forbidden:
             pass
 
-    async def create_duty_message(self, ctx: commands.Context):
-        """Erstellt eine permanente Duty-Nachricht mit Buttons"""
+    async def get_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Log-Channel für Support-Anfragen und Duty-Logs"""
+        log_channel_id = await self.config.guild(guild).log_channel()
+        
+        if log_channel_id:
+            channel = guild.get_channel(log_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+        
+        # Fallback auf normalen Support-Channel
+        channel_id = await self.config.guild(guild).channel()
+        if channel_id:
+            channel = guild.get_channel(channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+        
+        return None
+
+    async def get_panel_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Panel-Channel für das Duty-Interface"""
+        panel_channel_id = await self.config.guild(guild).panel_channel()
+        
+        if panel_channel_id:
+            channel = guild.get_channel(panel_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+        
+        # Fallback auf Log-Channel
+        return await self.get_log_channel(guild)
+
+    async def create_panel_message(self, ctx: commands.Context):
+        """Erstellt eine permanente Panel-Nachricht mit Buttons"""
         guild = ctx.guild
-        duty_channel_id = await self.config.guild(guild).duty_channel()
+        channel = await self.get_panel_channel(guild)
         
-        if duty_channel_id:
-            channel = guild.get_channel(duty_channel_id)
-        else:
-            channel_id = await self.config.guild(guild).channel()
-            channel = guild.get_channel(channel_id) if channel_id else ctx.channel
-        
-        if not channel or not isinstance(channel, discord.TextChannel):
+        if not channel:
             channel = ctx.channel
         
         embed = discord.Embed(
-            title="🎧 Support Duty System",
-            description="Klicke auf die Buttons unten um dich für den Support-Dienst an- oder abzumelden.\n\n**Grüner Button** = Duty starten\n**Roter Button** = Duty beenden",
+            title="🎧 Support Duty Panel",
+            description=(
+                "**Willkommen zum Support-Duty System!**\n\n"
+                "Klicke auf die Buttons unten um dich für den Support-Dienst an- oder abzumelden.\n\n"
+                "🟢 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
+                "🔴 **Duty Beenden** - Du erhältst keine Pings mehr\n\n"
+                "**Aktuell im Dienst:** Niemand"
+            ),
             color=discord.Color.blue()
         )
-        embed.set_footer(text="Nur Mitglieder mit der Support-Rolle können sich auf Duty setzen")
+        embed.set_footer(text="Die 🟢 On Duty Rolle wird automatisch zugewiesen/entfernt")
         
         view = DutyButtonView(self)
         message = await channel.send(embed=embed, view=view)
         
-        await self.config.guild(guild).duty_message_id.set(message.id)
+        await self.config.guild(guild).panel_message_id.set(message.id)
         return message
 
     @commands.Cog.listener()
@@ -148,13 +181,11 @@ class SupportCog(commands.Cog):
 
         # Hole Konfiguration
         room_id = await self.config.guild(guild).room()
-        channel_id = await self.config.guild(guild).channel()
         role_id = await self.config.guild(guild).role()
         use_embed = await self.config.guild(guild).use_embed()
-        duty_channel_id = await self.config.guild(guild).duty_channel()
 
         # Prüfen ob alle erforderlichen Einstellungen gesetzt sind
-        if not all([room_id, channel_id, role_id]):
+        if not all([room_id, role_id]):
             return
 
         # Prüfen ob es der konfigurierte Warteraum ist
@@ -167,8 +198,8 @@ class SupportCog(commands.Cog):
 
         # User hat den Warteraum soeben betreten
         try:
-            channel = guild.get_channel(channel_id)
-            if not channel or not isinstance(channel, discord.TextChannel):
+            log_channel = await self.get_log_channel(guild)
+            if not log_channel:
                 return
 
             base_role = guild.get_role(role_id)
@@ -176,28 +207,18 @@ class SupportCog(commands.Cog):
                 return
 
             # Hole alle On-Duty User MIT DER DUTY ROLLE
-            duty_mentions = []
             duty_members = []
-
             duty_role = await self.get_or_create_duty_role(guild)
             
             for m in base_role.members:
-                # Prüfe ob User die Duty-Rolle hat
+                # Prüfe ob User die Duty-Rolle hat UND on_duty flag gesetzt ist
                 if duty_role and duty_role in m.roles:
                     is_on_duty = await self.config.member(m).on_duty()
                     if is_on_duty:
-                        duty_mentions.append(f"<@{m.id}>")
                         duty_members.append(m)
 
             user_mention = member.mention
             user_avatar = member.display_avatar.url
-
-            # Bestimme den Channel für die Support-Anfrage Nachricht
-            notify_channel = channel
-            if duty_channel_id:
-                duty_ch = guild.get_channel(duty_channel_id)
-                if duty_ch and isinstance(duty_ch, discord.TextChannel):
-                    notify_channel = duty_ch
 
             if use_embed:
                 # Erstelle ein schönes Embed
@@ -226,7 +247,7 @@ class SupportCog(commands.Cog):
                         inline=True
                     )
                     # Pinge alle On-Duty User über die Duty-Rolle
-                    ping_content = f"{duty_role.mention}" if duty_role else " ".join(duty_mentions)
+                    ping_content = f"{duty_role.mention}" if duty_role else " ".join([m.mention for m in duty_members])
                 else:
                     embed.add_field(
                         name="🔴 Keine Supporter verfügbar",
@@ -243,16 +264,16 @@ class SupportCog(commands.Cog):
                 )
                 embed.set_footer(text="Support Warteraum System • On-Duty aktiv")
 
-                # Sende das Embed mit Role-Ping im Content IM RICHTIGEN CHANNEL
-                await notify_channel.send(content=ping_content, embed=embed)
+                # Sende das Embed mit Role-Ping im Content IM LOG-CHANNEL
+                await log_channel.send(content=ping_content, embed=embed)
             else:
                 # Einfache Textnachricht (Fallback)
                 if duty_members:
-                    ping_content = f"{duty_role.mention}" if duty_role else " ".join(duty_mentions)
+                    ping_content = f"{duty_role.mention}" if duty_role else " ".join([m.mention for m in duty_members])
                     message = f"🎧 {ping_content} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})"
                 else:
                     message = f"🎧 {base_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention}) - Niemand im Duty!"
-                await notify_channel.send(message)
+                await log_channel.send(message)
 
         except discord.Forbidden:
             # Bot hat keine Berechtigung zum Senden
@@ -271,19 +292,11 @@ class SupportCog(commands.Cog):
     @supportset.command(name="channel")
     async def supportset_channel(self, ctx: commands.Context, channel: str):
         """Setze den Text-Channel für Support-Benachrichtigungen (ID oder Mention)"""
-        # Unterstützt sowohl Mentions als auch IDs
-        channel_id = None
+        channel_id = self._parse_channel_id(channel)
         
-        # Versuche Channel-Mention zu parsen
-        if channel.startswith("<#") and channel.endswith(">"):
-            channel_id = int(channel[2:-1])
-        else:
-            # Versuche als ID zu parsen
-            try:
-                channel_id = int(channel)
-            except ValueError:
-                await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein (z.B. #channel oder 123456789)")
-                return
+        if channel_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein (z.B. #channel oder 123456789)")
+            return
         
         ch = ctx.guild.get_channel(channel_id)
         if not ch or not isinstance(ch, discord.TextChannel):
@@ -293,21 +306,41 @@ class SupportCog(commands.Cog):
         await self.config.guild(ctx.guild).channel.set(channel_id)
         await ctx.send(f"✅ Text-Channel auf {ch.mention} gesetzt.")
 
+    def _parse_channel_id(self, channel: str) -> Optional[int]:
+        """Parses a channel mention or ID to an integer ID"""
+        if channel.startswith("<#") and channel.endswith(">"):
+            return int(channel[2:-1])
+        try:
+            return int(channel)
+        except ValueError:
+            return None
+
+    def _parse_voice_channel_id(self, channel: str) -> Optional[int]:
+        """Parses a voice channel mention or ID to an integer ID"""
+        if channel.startswith("<#") and channel.endswith(">"):
+            return int(channel[2:-1])
+        try:
+            return int(channel)
+        except ValueError:
+            return None
+
+    def _parse_role_id(self, role: str) -> Optional[int]:
+        """Parses a role mention or ID to an integer ID"""
+        if role.startswith("<@&") and role.endswith(">"):
+            return int(role[3:-1])
+        try:
+            return int(role)
+        except ValueError:
+            return None
+
     @supportset.command(name="room")
     async def supportset_room(self, ctx: commands.Context, room: str):
         """Setze den Voice-Channel als Support-Warteraum (ID oder Mention)"""
-        room_id = None
+        room_id = self._parse_voice_channel_id(room)
         
-        # Versuche Channel-Mention zu parsen
-        if room.startswith("<#") and room.endswith(">"):
-            room_id = int(room[2:-1])
-        else:
-            # Versuche als ID zu parsen
-            try:
-                room_id = int(room)
-            except ValueError:
-                await ctx.send("❌ Bitte gib eine gültige Voice-Channel-ID oder Mention ein!")
-                return
+        if room_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Voice-Channel-ID oder Mention ein!")
+            return
         
         ch = ctx.guild.get_channel(room_id)
         if not ch or not isinstance(ch, discord.VoiceChannel):
@@ -320,18 +353,11 @@ class SupportCog(commands.Cog):
     @supportset.command(name="role")
     async def supportset_role(self, ctx: commands.Context, role: str):
         """Setze die Basis-Supportrolle (ID oder Mention)"""
-        role_id = None
+        role_id = self._parse_role_id(role)
         
-        # Versuche Role-Mention zu parsen
-        if role.startswith("<@&") and role.endswith(">"):
-            role_id = int(role[3:-1])
-        else:
-            # Versuche als ID zu parsen
-            try:
-                role_id = int(role)
-            except ValueError:
-                await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein!")
-                return
+        if role_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein!")
+            return
         
         r = ctx.guild.get_role(role_id)
         if not r:
@@ -340,6 +366,56 @@ class SupportCog(commands.Cog):
             
         await self.config.guild(ctx.guild).role.set(role_id)
         await ctx.send(f"✅ Support-Basisrolle auf {r.mention} gesetzt.\nℹ️ Die automatische Duty-Rolle wird beim ersten Duty-Start erstellt.")
+
+    @supportset.command(name="panelchannel")
+    async def supportset_panelchannel(self, ctx: commands.Context, channel: str = None):
+        """
+        Setze den Channel für das Duty-Panel mit Buttons.
+        Ohne Channel-Angabe wird der normale Support-Channel verwendet.
+        Verwende 'reset' um zurückzusetzen.
+        Unterstützt ID oder Mention.
+        """
+        if channel is None or channel.lower() == "reset":
+            await self.config.guild(ctx.guild).panel_channel.set(None)
+            await ctx.send("✅ Duty-Panel wird im Support-Channel angezeigt.")
+        else:
+            channel_id = self._parse_channel_id(channel)
+            if channel_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein!")
+                return
+            
+            ch = ctx.guild.get_channel(channel_id)
+            if not ch or not isinstance(ch, discord.TextChannel):
+                await ctx.send("❌ Channel nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).panel_channel.set(channel_id)
+            await ctx.send(f"✅ Duty-Panel wird jetzt in {ch.mention} angezeigt.")
+
+    @supportset.command(name="logchannel")
+    async def supportset_logchannel(self, ctx: commands.Context, channel: str = None):
+        """
+        Setze den Channel für Support-Anfragen und Duty-Logs.
+        Ohne Channel-Angabe wird der normale Support-Channel verwendet.
+        Verwende 'reset' um zurückzusetzen.
+        Unterstützt ID oder Mention.
+        """
+        if channel is None or channel.lower() == "reset":
+            await self.config.guild(ctx.guild).log_channel.set(None)
+            await ctx.send("✅ Logs werden im Support-Channel angezeigt.")
+        else:
+            channel_id = self._parse_channel_id(channel)
+            if channel_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein!")
+                return
+            
+            ch = ctx.guild.get_channel(channel_id)
+            if not ch or not isinstance(ch, discord.TextChannel):
+                await ctx.send("❌ Channel nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).log_channel.set(channel_id)
+            await ctx.send(f"✅ Logs werden jetzt in {ch.mention} angezeigt.")
 
     @supportset.command(name="embed")
     async def supportset_embed(self, ctx: commands.Context, enabled: bool = None):
@@ -378,7 +454,8 @@ class SupportCog(commands.Cog):
         duty_role_id = guild_data.get("duty_role")
         use_embed = guild_data.get("use_embed", True)
         enabled = guild_data.get("enabled")
-        duty_channel_id = guild_data.get("duty_channel")
+        panel_channel_id = guild_data.get("panel_channel")
+        log_channel_id = guild_data.get("log_channel")
         auto_duty = guild_data.get("auto_remove_duty", True)
         duty_timeout = guild_data.get("duty_timeout", 4)
 
@@ -386,7 +463,8 @@ class SupportCog(commands.Cog):
         room_mention = f"<#{room_id}>" if room_id else "❌ Nicht gesetzt"
         role_mention = f"<@&{role_id}>" if role_id else "❌ Nicht gesetzt"
         duty_role_mention = f"<@&{duty_role_id}>" if duty_role_id else "❌ Noch nicht erstellt"
-        duty_channel_mention = f"<#{duty_channel_id}>" if duty_channel_id else "Gleicher wie Support-Channel"
+        panel_channel_mention = f"<#{panel_channel_id}>" if panel_channel_id else "Gleicher wie Support-Channel"
+        log_channel_mention = f"<#{log_channel_id}>" if log_channel_id else "Gleicher wie Support-Channel"
         embed_status = "✅ Aktiv" if use_embed else "❌ Deaktiviert"
         cog_status = "✅ Aktiv" if enabled else "❌ Deaktiviert"
         auto_duty_status = f"✅ Aktiv ({duty_timeout}h)" if auto_duty else "❌ Deaktiviert"
@@ -411,11 +489,12 @@ class SupportCog(commands.Cog):
         embed.add_field(name="Embeds", value=embed_status, inline=True)
         embed.add_field(name="Aktive Duty", value=f"🟢 {duty_count} Supporter", inline=True)
         embed.add_field(name="Auto-Duty-Ende", value=auto_duty_status, inline=True)
-        embed.add_field(name="Text-Channel", value=channel_mention, inline=True)
-        embed.add_field(name="Voice-Warteraum", value=room_mention, inline=True)
-        embed.add_field(name="Support-Basisrolle", value=role_mention, inline=True)
-        embed.add_field(name="Duty-Rolle", value=duty_role_mention, inline=True)
-        embed.add_field(name="Duty-Log-Channel", value=duty_channel_mention, inline=True)
+        embed.add_field(name="📝 Support-Channel", value=channel_mention, inline=True)
+        embed.add_field(name="🎤 Voice-Warteraum", value=room_mention, inline=True)
+        embed.add_field(name="👥 Support-Basisrolle", value=role_mention, inline=True)
+        embed.add_field(name="🟢 Duty-Rolle", value=duty_role_mention, inline=True)
+        embed.add_field(name="📋 Panel-Channel", value=panel_channel_mention, inline=True)
+        embed.add_field(name="📜 Log-Channel", value=log_channel_mention, inline=True)
 
         await ctx.send(embed=embed)
 
@@ -431,7 +510,8 @@ class SupportCog(commands.Cog):
             ("1️⃣ Welcher **Text-Channel** soll für Support-Benachrichtigungen genutzt werden?", "channel", "text"),
             ("2️⃣ Welcher **Voice-Channel** ist der Support-Warteraum?", "room", "voice"),
             ("3️⃣ Welche **Rolle** ist die Basis-Supportrolle?", "role", "role"),
-            ("4️⃣ (Optional) In welchem Channel sollen **Duty-Nachrichten** erscheinen? (Antworte mit 'skip' zum Überspringen)", "duty_channel", "text", True),
+            ("4️⃣ (Optional) In welchem Channel soll das **Duty-Panel** erscheinen? (Antworte mit 'skip' zum Überspringen)", "panel_channel", "text", True),
+            ("5️⃣ (Optional) In welchem Channel sollen **Support-Anfragen & Logs** erscheinen? (Antworte mit 'skip' zum Überspringen)", "log_channel", "text", True),
         ]
 
         answers = {}
@@ -441,7 +521,7 @@ class SupportCog(commands.Cog):
 
             embed = discord.Embed(
                 title=question_data[0],
-                description="Sende deine Antwort als Nachricht hier im Channel.\n• Erwähne den Channel/die Rolle einfach mit @ oder #\n• Oder kopiere die ID (Rechtsklick -> ID kopieren)\n• Bei Frage 4 kannst du 'skip' schreiben um zu überspringen",
+                description="Sende deine Antwort als Nachricht hier im Channel.\n• Erwähne den Channel/die Rolle einfach mit @ oder #\n• Oder kopiere die ID (Rechtsklick -> ID kopieren)\n• Bei optionalen Fragen kannst du 'skip' schreiben um zu überspringen",
                 color=discord.Color.orange()
             )
             await ctx.send(embed=embed)
@@ -501,58 +581,37 @@ class SupportCog(commands.Cog):
         await self.config.guild(ctx.guild).room.set(answers["room"].id)
         await self.config.guild(ctx.guild).role.set(answers["role"].id)
 
-        if answers.get("duty_channel"):
-            await self.config.guild(ctx.guild).duty_channel.set(answers["duty_channel"].id)
+        if answers.get("panel_channel"):
+            await self.config.guild(ctx.guild).panel_channel.set(answers["panel_channel"].id)
+        
+        if answers.get("log_channel"):
+            await self.config.guild(ctx.guild).log_channel.set(answers["log_channel"].id)
 
         embed = discord.Embed(
             title="✅ Einrichtung erfolgreich!",
             description="Der Support-Cog ist jetzt konfiguriert und bereit!\n\n**Zusammenfassung:**\n"
-                        f"• 📝 Text-Channel: {answers['channel'].mention}\n"
+                        f"• 📝 Support-Channel: {answers['channel'].mention}\n"
                         f"• 🎤 Voice-Warteraum: {answers['room'].mention}\n"
                         f"• 👥 Support-Rolle: {answers['role'].mention}",
             color=discord.Color.green()
         )
 
-        if answers.get("duty_channel"):
-            embed.description += f"\n• 📢 Duty-Channel: {answers['duty_channel'].mention}"
+        if answers.get("panel_channel"):
+            embed.description += f"\n• 📋 Panel-Channel: {answers['panel_channel'].mention}"
+        else:
+            embed.description += "\n• 📋 Panel-Channel: Gleicher wie Support-Channel"
+            
+        if answers.get("log_channel"):
+            embed.description += f"\n• 📜 Log-Channel: {answers['log_channel'].mention}"
+        else:
+            embed.description += "\n• 📜 Log-Channel: Gleicher wie Support-Channel"
 
         embed.description += "\n\n**Nächste Schritte:**\n"
-        embed.description += "• Erstelle die Duty-Nachricht mit `[p]supportset createdutymessage`\n"
+        embed.description += "• Erstelle das Duty-Panel mit `[p]supportset createpanel`\n"
         embed.description += "• Support-Teamler können sich dann per Button an-/abmelden\n"
         embed.description += "• Eine automatische 🟢 On Duty Rolle wird erstellt"
 
         await ctx.send(embed=embed)
-
-    @supportset.command(name="dutychannel")
-    async def supportset_dutychannel(self, ctx: commands.Context, channel: str = None):
-        """
-        Setze den Channel für Duty-Nachrichten.
-        Ohne Channel-Angabe wird der normale Support-Channel verwendet.
-        Verwende 'reset' um zurückzusetzen.
-        Unterstützt ID oder Mention.
-        """
-        if channel is None or channel.lower() == "reset":
-            await self.config.guild(ctx.guild).duty_channel.set(None)
-            await ctx.send("✅ Duty-Nachrichten werden jetzt im normalen Support-Channel angezeigt.")
-        else:
-            # Parse channel ID or mention
-            channel_id = None
-            if channel.startswith("<#") and channel.endswith(">"):
-                channel_id = int(channel[2:-1])
-            else:
-                try:
-                    channel_id = int(channel)
-                except ValueError:
-                    await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein!")
-                    return
-            
-            ch = ctx.guild.get_channel(channel_id)
-            if not ch or not isinstance(ch, discord.TextChannel):
-                await ctx.send("❌ Channel nicht gefunden!")
-                return
-                
-            await self.config.guild(ctx.guild).duty_channel.set(channel_id)
-            await ctx.send(f"✅ Duty-Nachrichten werden jetzt in {ch.mention} angezeigt.")
 
     @supportset.command(name="autoduty")
     async def supportset_autoduty(self, ctx: commands.Context, hours: int = None):
@@ -572,39 +631,33 @@ class SupportCog(commands.Cog):
             await self.config.guild(ctx.guild).duty_timeout.set(hours)
             await ctx.send(f"✅ Duty wird automatisch nach {hours} Stunden beendet.")
 
-    @supportset.command(name="createdutymessage")
-    async def supportset_createdutymessage(self, ctx: commands.Context):
+    @supportset.command(name="createpanel")
+    async def supportset_createpanel(self, ctx: commands.Context):
         """
-        Erstellt eine permanente Duty-Nachricht mit Buttons.
-        Diese Nachricht sollte im Duty-Channel gepinnt werden.
+        Erstellt ein permanentes Duty-Panel mit Buttons.
+        Diese Nachricht sollte im Panel-Channel gepinnt werden.
         """
-        await ctx.send("🔄 Erstelle Duty-Nachricht mit Buttons...")
-        await self.create_duty_message(ctx)
-        await ctx.send("✅ Duty-Nachricht wurde erstellt! Du kannst die Buttons jetzt verwenden um dich an-/abzumelden.")
+        await ctx.send("🔄 Erstelle Duty-Panel mit Buttons...")
+        await self.create_panel_message(ctx)
+        await ctx.send("✅ Duty-Panel wurde erstellt! Du kannst die Buttons jetzt verwenden um dich an-/abzumelden.")
 
-    @supportset.command(name="refreshdutymessage")
-    async def supportset_refreshdutymessage(self, ctx: commands.Context):
+    @supportset.command(name="refreshpanel")
+    async def supportset_refreshpanel(self, ctx: commands.Context):
         """
-        Aktualisiert die Duty-Nachricht falls sie gelöscht wurde.
+        Aktualisiert das Duty-Panel falls es gelöscht wurde.
         """
-        old_message_id = await self.config.guild(ctx.guild).duty_message_id()
+        old_message_id = await self.config.guild(ctx.guild).panel_message_id()
         if old_message_id:
             try:
-                duty_channel_id = await self.config.guild(ctx.guild).duty_channel()
-                if duty_channel_id:
-                    channel = ctx.guild.get_channel(duty_channel_id)
-                else:
-                    channel_id = await self.config.guild(ctx.guild).channel()
-                    channel = ctx.guild.get_channel(channel_id) if channel_id else ctx.channel
-                
+                channel = await self.get_panel_channel(ctx.guild)
                 if channel:
                     old_msg = await channel.fetch_message(old_message_id)
                     await old_msg.delete()
             except:
                 pass
         
-        await self.create_duty_message(ctx)
-        await ctx.send("✅ Duty-Nachricht wurde aktualisiert!")
+        await self.create_panel_message(ctx)
+        await ctx.send("✅ Duty-Panel wurde aktualisiert!")
 
 
 class DutyButtonView(discord.ui.View):
@@ -618,7 +671,7 @@ class DutyButtonView(discord.ui.View):
     async def start_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Startet den Duty-Modus"""
         guild = interaction.guild
-        ctx = await self.cog.bot.get_context(interaction)
+        member = interaction.user
         
         role_id = await self.cog.config.guild(guild).role()
         
@@ -631,44 +684,39 @@ class DutyButtonView(discord.ui.View):
             await interaction.response.send_message("❌ Die konfigurierte Support-Rolle existiert nicht mehr!", ephemeral=True)
             return
         
-        if base_role not in interaction.user.roles:
+        if base_role not in member.roles:
             await interaction.response.send_message(f"❌ Du benötigst die {base_role.mention} Rolle um dich auf Duty setzen zu können!", ephemeral=True)
             return
         
         # Prüfen ob bereits auf Duty
-        is_on_duty = await self.cog.config.member(interaction.user).on_duty()
+        is_on_duty = await self.cog.config.member(member).on_duty()
         if is_on_duty:
             await interaction.response.send_message("⚠️ Du bist bereits im Duty-Modus!", ephemeral=True)
             return
         
         # Duty aktivieren und Rolle geben
-        await self.cog.config.member(interaction.user).on_duty.set(True)
+        await self.cog.config.member(member).on_duty.set(True)
         start_time = datetime.utcnow()
-        await self.cog.config.member(interaction.user).duty_start.set(start_time.timestamp())
+        await self.cog.config.member(member).duty_start.set(start_time.timestamp())
         
         # Duty-Rolle hinzufügen
-        await self.cog.update_duty_role(interaction.user, True)
+        await self.cog.update_duty_role(member, True)
         
         # Auto-Duty Timer starten falls aktiviert
         auto_duty = await self.cog.config.guild(guild).auto_remove_duty()
         duty_timeout = await self.cog.config.guild(guild).duty_timeout()
         
-        # Nachricht senden
-        duty_channel_id = await self.cog.config.guild(guild).duty_channel()
-        notify_channel = interaction.channel
-        if duty_channel_id:
-            dc = guild.get_channel(duty_channel_id)
-            if dc and isinstance(dc, discord.TextChannel):
-                notify_channel = dc
+        # Nachricht im Log-Channel senden
+        log_channel = await self.cog.get_log_channel(guild)
         
         embed = discord.Embed(
             title="🟢 Duty Gestartet",
-            description=f"{interaction.user.mention} hat sich für den Support-Dienst angemeldet!",
+            description=f"{member.mention} hat sich für den Support-Dienst angemeldet!",
             color=discord.Color.green(),
             timestamp=start_time
         )
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.add_field(name="👤 Mitarbeiter", value=f"{interaction.user.display_name}", inline=True)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
         
         if auto_duty:
             end_time = start_time + timedelta(hours=duty_timeout)
@@ -686,20 +734,26 @@ class DutyButtonView(discord.ui.View):
         embed.add_field(name="📊 Aktive Supporter", value=f"🟢 {duty_count} Teammitglieder im Dienst", inline=True)
         embed.set_footer(text=f"Duty Start • {start_time.strftime('%d.%m.%Y %H:%M')}")
         
-        await notify_channel.send(embed=embed)
+        if log_channel:
+            await log_channel.send(embed=embed)
+        
+        # Update the panel message to show current duty count
+        await self.update_panel_display(guild)
+        
         await interaction.response.send_message("✅ Du bist jetzt im Duty-Modus! Du wirst bei neuen Support-Anfragen gepingt.", ephemeral=True)
     
     @discord.ui.button(label="Duty Beenden", style=discord.ButtonStyle.red, emoji="🔴", custom_id="duty_stop")
     async def stop_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Beendet den Duty-Modus"""
-        is_on_duty = await self.cog.config.member(interaction.user).on_duty()
+        member = interaction.user
+        is_on_duty = await self.cog.config.member(member).on_duty()
         
         if not is_on_duty:
             await interaction.response.send_message("ℹ️ Du bist aktuell nicht im Duty-Modus.", ephemeral=True)
             return
         
         # Hole Startzeit für Statistik
-        start_time = await self.cog.config.member(interaction.user).duty_start()
+        start_time = await self.cog.config.member(member).duty_start()
         duration = "Unbekannt"
         if start_time:
             start_dt = datetime.fromtimestamp(start_time)
@@ -709,32 +763,24 @@ class DutyButtonView(discord.ui.View):
             duration = f"{hours}h {minutes}min"
         
         # Duty deaktivieren und Rolle entfernen
-        await self.cog.config.member(interaction.user).on_duty.set(False)
-        await self.cog.config.member(interaction.user).duty_start.set(None)
+        await self.cog.config.member(member).on_duty.set(False)
+        await self.cog.config.member(member).duty_start.set(None)
         
         # Duty-Rolle entfernen
-        await self.cog.update_duty_role(interaction.user, False)
+        await self.cog.update_duty_role(member, False)
         
-        # Nachricht senden
+        # Nachricht im Log-Channel senden
         guild = interaction.guild
-        duty_channel_id = await self.cog.config.guild(guild).duty_channel()
-        notify_channel = interaction.channel
-        if duty_channel_id:
-            dc = guild.get_channel(duty_channel_id)
-            if dc and isinstance(dc, discord.TextChannel):
-                notify_channel = dc
-        
-        role_id = await self.cog.config.guild(guild).role()
-        base_role = guild.get_role(role_id) if role_id else None
+        log_channel = await self.cog.get_log_channel(guild)
         
         embed = discord.Embed(
             title="🔴 Duty Beendet",
-            description=f"{interaction.user.mention} hat sich vom Support-Dienst abgemeldet.",
+            description=f"{member.mention} hat sich vom Support-Dienst abgemeldet.",
             color=discord.Color.red(),
             timestamp=datetime.utcnow()
         )
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.add_field(name="👤 Mitarbeiter", value=f"{interaction.user.display_name}", inline=True)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
         embed.add_field(name="⏱️ Dauer", value=duration, inline=True)
         
         # Zähle verbleibende aktive Duty-User
@@ -749,8 +795,71 @@ class DutyButtonView(discord.ui.View):
         embed.add_field(name="📊 Verbleibende Supporter", value=f"🟢 {duty_count} Teammitglieder im Dienst", inline=True)
         embed.set_footer(text=f"Duty Ende • {datetime.utcnow().strftime('%d.%m.%Y %H:%M')}")
         
-        await notify_channel.send(embed=embed)
+        if log_channel:
+            await log_channel.send(embed=embed)
+        
+        # Update the panel message to show current duty count
+        await self.update_panel_display(guild)
+        
         await interaction.response.send_message("✅ Du hast den Duty-Modus verlassen.", ephemeral=True)
+    
+    async def update_panel_display(self, guild: discord.Guild):
+        """Updates the panel message to show current duty members"""
+        panel_message_id = await self.cog.config.guild(guild).panel_message_id()
+        if not panel_message_id:
+            return
+        
+        panel_channel = await self.cog.get_panel_channel(guild)
+        if not panel_channel:
+            return
+        
+        try:
+            panel_message = await panel_channel.fetch_message(panel_message_id)
+            
+            # Get current duty members
+            duty_count = 0
+            duty_list = []
+            duty_role = await self.cog.get_or_create_duty_role(guild)
+            role_id = await self.cog.config.guild(guild).role()
+            
+            if role_id and duty_role:
+                base_role = guild.get_role(role_id)
+                if base_role:
+                    for m in base_role.members:
+                        if duty_role in m.roles:
+                            is_duty = await self.cog.config.member(m).on_duty()
+                            if is_duty:
+                                duty_count += 1
+                                duty_list.append(f"• {m.display_name}")
+            
+            # Create new embed with updated info
+            if duty_count > 0:
+                duty_text = "\n".join(duty_list[:10])
+                if len(duty_list) > 10:
+                    duty_text += f"\n• ...und {duty_count - 10} weitere"
+            else:
+                duty_text = "Niemand"
+            
+            new_embed = discord.Embed(
+                title="🎧 Support Duty Panel",
+                description=(
+                    "**Willkommen zum Support-Duty System!**\n\n"
+                    "Klicke auf die Buttons unten um dich für den Support-Dienst an- oder abzumelden.\n\n"
+                    "🟢 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
+                    "🔴 **Duty Beenden** - Du erhältst keine Pings mehr"
+                ),
+                color=discord.Color.blue()
+            )
+            new_embed.add_field(
+                name="🟢 Aktuell im Dienst",
+                value=duty_text,
+                inline=False
+            )
+            new_embed.set_footer(text=f"Aktive Supporter: {duty_count} • Die 🟢 On Duty Rolle wird automatisch zugewiesen/entfernt")
+            
+            await panel_message.edit(embed=new_embed)
+        except:
+            pass  # Ignore errors if panel message was deleted
 
 
 async def setup(bot: Red):
