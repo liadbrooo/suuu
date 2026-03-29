@@ -477,9 +477,8 @@ class SupportCog(commands.Cog):
                 # Sende das Embed mit Role-Ping IM SUPPORT-CHANNEL (nicht Log!)
                 # WICHTIG: allowed_mentions erzwingt den Ping der Rolle
                 if duty_role and duty_members:
-                    # ALLE Duty-Mitglieder individuell pingen statt nur die Rolle
-                    mentions = " ".join([m.mention for m in duty_members])
-                    await support_channel.send(content=mentions, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(users=duty_members))
+                    # Nur die Duty-Rolle pingen statt alle Mitglieder einzeln
+                    await support_channel.send(content=duty_role.mention, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
                 elif base_role:
                     # Fallback zur Basis-Rolle wenn niemand Duty hat
                     await support_channel.send(content=base_role.mention, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
@@ -488,10 +487,9 @@ class SupportCog(commands.Cog):
             else:
                 # Einfache Textnachricht (Fallback)
                 if duty_role and duty_members:
-                    # ALLE Duty-Mitglieder individuell pingen
-                    mentions = " ".join([m.mention for m in duty_members])
-                    message = f"🎧 {mentions} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})"
-                    await support_channel.send(message, allowed_mentions=discord.AllowedMentions(users=duty_members))
+                    # Nur die Duty-Rolle pingen
+                    message = f"🎧 {duty_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})"
+                    await support_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
                 elif base_role:
                     message = f"🎧 {base_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention}) - Niemand im Duty!"
                     await support_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
@@ -602,9 +600,8 @@ class SupportCog(commands.Cog):
 
                 # Sende das Embed mit Role-Ping IM WHITELIST-CHANNEL
                 if duty_role and duty_members:
-                    # ALLE Duty-Mitglieder individuell pingen statt nur die Rolle
-                    mentions = " ".join([m.mention for m in duty_members])
-                    await whitelist_channel.send(content=mentions, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(users=duty_members))
+                    # Nur die Whitelist-Duty-Rolle pingen statt alle Mitglieder einzeln
+                    await whitelist_channel.send(content=duty_role.mention, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
                 elif base_role:
                     await whitelist_channel.send(content=base_role.mention, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
                 else:
@@ -612,10 +609,9 @@ class SupportCog(commands.Cog):
             else:
                 # Einfache Textnachricht (Fallback)
                 if duty_role and duty_members:
-                    # ALLE Duty-Mitglieder individuell pingen
-                    mentions = " ".join([m.mention for m in duty_members])
-                    message = f"📋 {mentions} | {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({after.channel.mention})"
-                    await whitelist_channel.send(message, allowed_mentions=discord.AllowedMentions(users=duty_members))
+                    # Nur die Whitelist-Duty-Rolle pingen
+                    message = f"📋 {duty_role.mention} | {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({after.channel.mention})"
+                    await whitelist_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
                 elif base_role:
                     message = f"📋 {base_role.mention} | {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({after.channel.mention}) - Niemand im Duty!"
                     await whitelist_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
@@ -3128,10 +3124,9 @@ class SupportCallView(discord.ui.View):
         embed.set_footer(text=f"Support-System • {datetime.utcnow().strftime('%d.%m.%Y %H:%M')}")
         
         if call_channel:
-            # Alle Duty-Supporter erwähnen
-            mentions = " ".join([m.mention for m in duty_members])
-            await call_channel.send(content=mentions, embed=embed,
-                                   allowed_mentions=discord.AllowedMentions(users=duty_members))
+            # Nur die Duty-Rolle pingen statt alle Mitglieder einzeln
+            await call_channel.send(content=duty_role.mention, embed=embed,
+                                   allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
         
         supporter_names = ", ".join([m.display_name for m in duty_members[:5]])
         if len(duty_members) > 5:
