@@ -2066,7 +2066,8 @@ class WhitelistSearchModal(discord.ui.Modal):
     
     async def callback(self, interaction: discord.Interaction):
         """Wird ausgelöst wenn das Modal abgesendet wird - Verarbeitet die Whitelist direkt"""
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        # Defer immediately to prevent timeout - NO thinking parameter
+        await interaction.response.defer(ephemeral=True)
         
         try:
             # Hole die eingegebene ID oder den Namen
