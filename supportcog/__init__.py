@@ -2044,12 +2044,12 @@ class WhitelistSearchModal(discord.ui.Modal):
         self.cog = cog
         self.guild = guild
         
-        super().__init__(title="🎮 Spieler whitelisten")
+        super().__init__(title="🎮 Spieler whitelisten", timeout=600)
         
         self.search_input = discord.ui.TextInput(
             label="Spielername oder ID",
             style=discord.TextStyle.short,
-            placeholder="Gib den Discord-Namen oder die User-ID ein...",
+            placeholder="Gib den Discord-Namen oder die User-ID ein (z.B. 123456789012345678)",
             min_length=1,
             max_length=50,
             required=True
@@ -2059,119 +2059,136 @@ class WhitelistSearchModal(discord.ui.Modal):
     
     async def callback(self, interaction: discord.Interaction):
         """Wird ausgelöst wenn das Modal abgesendet wird - Verarbeitet die Whitelist direkt"""
-        # Hole die eingegebene ID oder den Namen
-        search_query = self.search_input.value.strip()
-        
-        member = interaction.user
-        is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
-        if not is_on_duty:
-            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
-            return
-        
-        approved_role = await self.cog.get_whitelist_approved_role(self.guild)
-        if not approved_role:
-            await interaction.response.send_message("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
-            return
-        
-        # Versuche den Spieler zu finden
-        target_user = None
-        
-        # Versuch 1: Als User-ID parsen
         try:
-            user_id = int(search_query)
-            target_user = await self.guild.fetch_member(user_id)
-        except (ValueError, discord.NotFound):
-            pass
-        
-        # Versuch 2: Nach Namen suchen
-        if not target_user:
-            for m in self.guild.members:
-                if m.bot:
-                    continue
-                if (search_query.lower() == m.name.lower() or 
-                    search_query.lower() == m.display_name.lower() or
-                    search_query == str(m.id)):
-                    target_user = m
-                    break
+            # Hole die eingegebene ID oder den Namen
+            search_query = self.search_input.value.strip()
             
-            # Teilübereinstimmung
+            member = interaction.user
+            is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
+            if not is_on_duty:
+                await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
+                return
+            
+            approved_role = await self.cog.get_whitelist_approved_role(self.guild)
+            if not approved_role:
+                await interaction.response.send_message("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
+                return
+            
+            # Versuche den Spieler zu finden
+            target_user = None
+            
+            # Versuch 1: Als User-ID parsen
+            try:
+                user_id = int(search_query)
+                target_user = await self.guild.fetch_member(user_id)
+            except (ValueError, discord.NotFound, discord.HTTPException):
+                pass
+            
+            # Versuch 2: Nach Namen suchen
             if not target_user:
                 for m in self.guild.members:
                     if m.bot:
                         continue
-                    if (search_query.lower() in m.name.lower() or 
-                        search_query.lower() in m.display_name.lower()):
+                    if (search_query.lower() == m.name.lower() or 
+                        search_query.lower() == m.display_name.lower() or
+                        search_query == str(m.id)):
                         target_user = m
                         break
-        
-        if not target_user:
-            await interaction.response.send_message(
-                f"❌ Kein Spieler gefunden für '**{search_query}**'!\n"
-                "Bitte überprüfe die Schreibweise oder verwende die User-ID.",
-                ephemeral=True
-            )
-            return
-        
-        if approved_role in target_user.roles:
-            await interaction.response.send_message(
-                f"ℹ️ {target_user.mention} hat bereits die Whitelist-Rolle!",
-                ephemeral=True
-            )
-            return
-        
-        # Füge die Approved-Rolle hinzu
-        try:
-            await target_user.add_roles(approved_role, reason=f"Whitelist genehmigt von {member.display_name}")
-            
-            embed_success = discord.Embed(
-                title="✅ Whitelist genehmigt",
-                description=f"{target_user.mention} wurde erfolgreich zur Whitelist hinzugefügt!",
-                color=discord.Color.green(),
-                timestamp=datetime.utcnow()
-            )
-            embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention} ({member.display_name})", inline=True)
-            embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
-            
-            await interaction.response.send_message(embed=embed_success, ephemeral=True)
-            
-            # Logge die Aktion
-            log_channel = await self.cog.get_whitelist_log_channel(self.guild)
-            if log_channel:
-                log_embed = discord.Embed(
-                    title="📋 Whitelist Eintrag erstellt",
-                    description=f"**{target_user.mention}** wurde zur Whitelist hinzugefügt.",
-                    color=discord.Color.blue(),
-                    timestamp=datetime.utcnow()
-                )
-                log_embed.set_thumbnail(url=target_user.display_avatar.url)
-                log_embed.add_field(name="🔹 Genehmigt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
-                log_embed.add_field(name="🔹 Spieler", value=f"{target_user.mention}\n*{target_user.display_name}* (ID: `{target_user.id}`)", inline=True)
-                log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
-                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
-                log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {member.display_name}")
                 
-                await log_channel.send(embed=log_embed)
+                # Teilübereinstimmung
+                if not target_user:
+                    for m in self.guild.members:
+                        if m.bot:
+                            continue
+                        if (search_query.lower() in m.name.lower() or 
+                            search_query.lower() in m.display_name.lower()):
+                            target_user = m
+                            break
             
-            # Benachrichtige den Spieler
+            if not target_user:
+                await interaction.response.send_message(
+                    f"❌ Kein Spieler gefunden für '**{search_query}**'!\n"
+                    "Bitte überprüfe die Schreibweise oder verwende die User-ID.",
+                    ephemeral=True
+                )
+                return
+            
+            if approved_role in target_user.roles:
+                await interaction.response.send_message(
+                    f"ℹ️ {target_user.mention} hat bereits die Whitelist-Rolle!",
+                    ephemeral=True
+                )
+                return
+            
+            # Füge die Approved-Rolle hinzu
             try:
-                dm_embed = discord.Embed(
-                    title="🎉 Herzlichen Glückwunsch!",
-                    description=f"Du wurdest von **{member.display_name}** zur Whitelist hinzugefügt!",
+                await target_user.add_roles(approved_role, reason=f"Whitelist genehmigt von {member.display_name}")
+                
+                embed_success = discord.Embed(
+                    title="✅ Whitelist genehmigt",
+                    description=f"{target_user.mention} wurde erfolgreich zur Whitelist hinzugefügt!",
                     color=discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
-                dm_embed.add_field(name="✅ Rolle erhalten", value=f"{approved_role.mention}", inline=False)
-                dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt die freigeschalteten Features nutzen!", inline=False)
-                dm_embed.set_footer(text=f"{self.guild.name} Whitelist System")
-                await target_user.send(embed=dm_embed)
+                embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention} ({member.display_name})", inline=True)
+                embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
+                
+                await interaction.response.send_message(embed=embed_success, ephemeral=True)
+                
+                # Logge die Aktion
+                log_channel = await self.cog.get_whitelist_log_channel(self.guild)
+                if log_channel:
+                    log_embed = discord.Embed(
+                        title="📋 Whitelist Eintrag erstellt",
+                        description=f"**{target_user.mention}** wurde zur Whitelist hinzugefügt.",
+                        color=discord.Color.blue(),
+                        timestamp=datetime.utcnow()
+                    )
+                    log_embed.set_thumbnail(url=target_user.display_avatar.url)
+                    log_embed.add_field(name="🔹 Genehmigt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
+                    log_embed.add_field(name="🔹 Spieler", value=f"{target_user.mention}\n*{target_user.display_name}* (ID: `{target_user.id}`)", inline=True)
+                    log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
+                    log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
+                    log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {member.display_name}")
+                    
+                    await log_channel.send(embed=log_embed)
+                
+                # Benachrichtige den Spieler
+                try:
+                    dm_embed = discord.Embed(
+                        title="🎉 Herzlichen Glückwunsch!",
+                        description=f"Du wurdest von **{member.display_name}** zur Whitelist hinzugefügt!",
+                        color=discord.Color.green(),
+                        timestamp=datetime.utcnow()
+                    )
+                    dm_embed.add_field(name="✅ Rolle erhalten", value=f"{approved_role.mention}", inline=False)
+                    dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt die freigeschalteten Features nutzen!", inline=False)
+                    dm_embed.set_footer(text=f"{self.guild.name} Whitelist System")
+                    await target_user.send(embed=dm_embed)
+                except discord.Forbidden:
+                    pass
+                
             except discord.Forbidden:
-                pass
-            
+                await interaction.response.send_message(
+                    "❌ Ich habe keine Berechtigung um diese Rolle zuzuweisen!",
+                    ephemeral=True
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"❌ Ein Fehler ist beim Hinzufügen der Rolle aufgetreten: `{str(e)}`",
+                    ephemeral=True
+                )
+                
         except Exception as e:
-            await interaction.response.send_message(
-                f"❌ Ein Fehler ist aufgetreten: `{str(e)}`",
-                ephemeral=True
-            )
+            # Fangen alle anderen Fehler ab
+            error_msg = f"❌ Ein unerwarteter Fehler ist aufgetreten: `{str(e)}`"
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(error_msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(error_msg, ephemeral=True)
+            except:
+                pass
 
 
 class WhitelistDutyView(discord.ui.View):
