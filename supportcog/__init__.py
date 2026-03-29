@@ -1452,8 +1452,8 @@ class SupportCog(commands.Cog):
                     color=discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
-                dm_embed.add_field(name="✅ Rolle erhalten", value=f"{approved_role.mention}", inline=False)
-                dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt die freigeschalteten Features nutzen! Das man jetzt auf unserem Server spielen kann.", inline=False)
+                dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{approved_role.name}**", inline=False)
+                dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
                 dm_embed.set_footer(text=f"{guild.name} Whitelist System")
                 await user.send(embed=dm_embed)
             except discord.Forbidden:
@@ -2246,8 +2246,8 @@ class WhitelistPlayerSelect(discord.ui.Select):
                             color=discord.Color.green(),
                             timestamp=datetime.utcnow()
                         )
-                        dm_embed.add_field(name="✅ Rolle erhalten", value=f"{approved_role.mention}", inline=False)
-                        dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt die freigeschalteten Features nutzen!", inline=False)
+                        dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{approved_role.name}**", inline=False)
+                        dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
                         dm_embed.set_footer(text=f"{guild.name} Whitelist System")
                         await target_user.send(embed=dm_embed)
                     except discord.Forbidden:
@@ -2550,8 +2550,8 @@ class WhitelistSearchModal(discord.ui.Modal):
                         color=discord.Color.green(),
                         timestamp=datetime.utcnow()
                     )
-                    dm_embed.add_field(name="✅ Rolle erhalten", value=f"{approved_role.mention}", inline=False)
-                    dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt die freigeschalteten Features nutzen!", inline=False)
+                    dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{approved_role.name}**", inline=False)
+                    dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
                     dm_embed.set_footer(text=f"{self.guild.name} Whitelist System")
                     await target_user.send(embed=dm_embed)
                 except discord.Forbidden:
