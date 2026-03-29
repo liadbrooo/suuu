@@ -2038,7 +2038,7 @@ class WhitelistInputModal(discord.ui.Modal):
 
 
 class WhitelistSearchModal(discord.ui.Modal):
-    """Modal zum Suchen von Spielern für die Whitelist - Öffnet direkt das Whitelist-Modal"""
+    """Modal zum Suchen von Spielern für die Whitelist - Verarbeitet direkt die Whitelist"""
     
     def __init__(self, cog: SupportCog, guild: discord.Guild):
         self.cog = cog
@@ -2054,25 +2054,23 @@ class WhitelistSearchModal(discord.ui.Modal):
             max_length=50,
             required=True
         )
+        # Füge das TextInput-Feld zum Modal hinzu
+        self.add_item(self.search_input)
     
     async def callback(self, interaction: discord.Interaction):
-        """Wird ausgelöst wenn das Modal abgesendet wird - Öffnet das Whitelist-Modal"""
+        """Wird ausgelöst wenn das Modal abgesendet wird - Verarbeitet die Whitelist direkt"""
         # Hole die eingegebene ID oder den Namen
         search_query = self.search_input.value.strip()
-        
-        # Erstelle das WhitelistInputModal und öffne es als neues Modal
-        # Da wir kein Modal aus einem Modal öffnen können, verarbeiten wir die Eingabe direkt
-        await interaction.response.defer(ephemeral=True)
         
         member = interaction.user
         is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
         if not is_on_duty:
-            await interaction.followup.send("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
+            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
             return
         
         approved_role = await self.cog.get_whitelist_approved_role(self.guild)
         if not approved_role:
-            await interaction.followup.send("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
+            await interaction.response.send_message("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
             return
         
         # Versuche den Spieler zu finden
@@ -2107,7 +2105,7 @@ class WhitelistSearchModal(discord.ui.Modal):
                         break
         
         if not target_user:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 f"❌ Kein Spieler gefunden für '**{search_query}**'!\n"
                 "Bitte überprüfe die Schreibweise oder verwende die User-ID.",
                 ephemeral=True
@@ -2115,7 +2113,7 @@ class WhitelistSearchModal(discord.ui.Modal):
             return
         
         if approved_role in target_user.roles:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 f"ℹ️ {target_user.mention} hat bereits die Whitelist-Rolle!",
                 ephemeral=True
             )
@@ -2134,7 +2132,7 @@ class WhitelistSearchModal(discord.ui.Modal):
             embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention} ({member.display_name})", inline=True)
             embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
             
-            await interaction.followup.send(embed=embed_success, ephemeral=True)
+            await interaction.response.send_message(embed=embed_success, ephemeral=True)
             
             # Logge die Aktion
             log_channel = await self.cog.get_whitelist_log_channel(self.guild)
@@ -2170,7 +2168,7 @@ class WhitelistSearchModal(discord.ui.Modal):
                 pass
             
         except Exception as e:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 f"❌ Ein Fehler ist aufgetreten: `{str(e)}`",
                 ephemeral=True
             )
