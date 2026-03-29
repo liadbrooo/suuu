@@ -468,7 +468,10 @@ class SupportCog(commands.Cog):
                 view = discord.ui.View()
                 if duty_members:
                     # Button nur anzeigen wenn Duty-Mitglieder verfügbar sind
-                    button = discord.ui.Button(label="Zum Warteraum gehen", style=discord.ButtonStyle.green, emoji="🎧", url=after.channel.jump_url)
+                    # Button ruft den User zum Teamler (nicht umgekehrt!)
+                    button = discord.ui.Button(label="User zu mir holen", style=discord.ButtonStyle.green, emoji="🎧", custom_id=f"fetch_user_{member.id}")
+                    callback = self.create_fetch_user_callback(member, after.channel)
+                    button.callback = callback
                     view.add_item(button)
 
                 # Sende das Embed mit Role-Ping IM SUPPORT-CHANNEL (nicht Log!)
@@ -591,7 +594,10 @@ class SupportCog(commands.Cog):
                 view = discord.ui.View()
                 if duty_members:
                     # Button nur anzeigen wenn Duty-Mitglieder verfügbar sind
-                    button = discord.ui.Button(label="Zum Warteraum gehen", style=discord.ButtonStyle.green, emoji="📋", url=after.channel.jump_url)
+                    # Button ruft den User zum Teamler (nicht umgekehrt!)
+                    button = discord.ui.Button(label="User zu mir holen", style=discord.ButtonStyle.green, emoji="📋", custom_id=f"fetch_whitelist_user_{member.id}")
+                    callback = self.create_fetch_user_callback(member, after.channel)
+                    button.callback = callback
                     view.add_item(button)
 
                 # Sende das Embed mit Role-Ping IM WHITELIST-CHANNEL
@@ -650,6 +656,66 @@ class SupportCog(commands.Cog):
             return int(role)
         except ValueError:
             return None
+
+    def create_fetch_user_callback(self, user_to_fetch: discord.Member, target_channel: discord.VoiceChannel):
+        """Erstellt eine Callback-Funktion für den 'User zu mir holen' Button"""
+        async def callback(interaction: discord.Interaction):
+            """Callback wenn ein Teamler auf den Button klickt"""
+            teamler = interaction.user
+            
+            # Prüfen ob der Teamler berechtigt ist (Duty-Mitglied oder Support-Rolle)
+            guild = interaction.guild
+            role_id = await self.config.guild(guild).role()
+            base_role = guild.get_role(role_id) if role_id else None
+            
+            is_authorized = False
+            if base_role and base_role in teamler.roles:
+                # Prüfen ob im Duty
+                duty_role = await self.get_or_create_duty_role(guild, whitelist=False)
+                if duty_role and duty_role in teamler.roles:
+                    is_on_duty = await self.config.member(teamler).on_duty()
+                    if is_on_duty:
+                        is_authorized = True
+            
+            if not is_authorized:
+                await interaction.response.send_message("❌ Nur Duty-Supporter können User holen!", ephemeral=True)
+                return
+            
+            # Prüfen ob der User noch im Warteraum ist
+            if user_to_fetch.voice is None or user_to_fetch.voice.channel != target_channel:
+                await interaction.response.send_message(f"ℹ️ {user_to_fetch.display_name} ist nicht mehr im Warteraum.", ephemeral=True)
+                return
+            
+            # Hole den Voice-Channel des Teamlers
+            if teamler.voice is None or teamler.voice.channel is None:
+                await interaction.response.send_message("❌ Du bist nicht in einem Voice-Channel!", ephemeral=True)
+                return
+            
+            target_vc = teamler.voice.channel
+            
+            # Versuche den User zum Teamler zu bewegen
+            try:
+                await user_to_fetch.move_to(target_vc)
+                await interaction.response.send_message(f"✅ {user_to_fetch.display_name} wurde zu dir in {target_vc.mention} geholt!", ephemeral=True)
+                
+                # Logge die Aktion
+                log_channel = await self.get_log_channel(guild)
+                if log_channel:
+                    embed = discord.Embed(
+                        title="🎧 User geholt",
+                        description=f"{teamler.mention} hat {user_to_fetch.mention} aus dem Warteraum geholt.",
+                        color=discord.Color.green(),
+                        timestamp=datetime.utcnow()
+                    )
+                    embed.add_field(name="Von", value=target_channel.mention, inline=True)
+                    embed.add_field(name="Zu", value=target_vc.mention, inline=True)
+                    await log_channel.send(embed=embed)
+            except discord.Forbidden:
+                await interaction.response.send_message("❌ Ich habe keine Berechtigung um diesen User zu bewegen!", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Fehler: {str(e)}", ephemeral=True)
+        
+        return callback
 
     @commands.group(name="supportset", aliases=["supportconfig"])
     @commands.guild_only()
