@@ -127,6 +127,7 @@ class SupportCog(commands.Cog):
             "whitelist_role": None,  # Basis-Whitelist-Handler-Rolle
             "whitelist_duty_role": None,  # Automatische Whitelist Duty-Rolle
             "whitelist_approved_role": None,  # Rolle die Spieler nach Whitelist erhalten
+            "whitelist_grant_role": None,  # Rolle die bei "Whitelist freischalten" Button vergeben wird
             "whitelist_panel_channel": None,  # Channel für Whitelist-Duty-Panel
             "whitelist_log_channel": None,  # Channel für Whitelist-Duty-Logs
             "whitelist_entries_channel": None,  # Channel für Whitelist-Einträge (Hinzufügungen/Entfernungen)
@@ -156,7 +157,9 @@ class SupportCog(commands.Cog):
             "on_duty": False,
             "duty_start": None,
             "whitelist_on_duty": False,
-            "whitelist_duty_start": None
+            "whitelist_duty_start": None,
+            "total_duty_time": 0,  # Gesamte Duty-Zeit in Sekunden (Support)
+            "total_whitelist_duty_time": 0  # Gesamte Duty-Zeit in Sekunden (Whitelist)
         }
 
         self.config.register_guild(**default_guild_settings)
@@ -1706,6 +1709,30 @@ class SupportCog(commands.Cog):
         await self.create_whitelist_panel_message(ctx)
         await ctx.send("✅ Whitelist-Duty-Panel wurde erstellt! Du kannst die Buttons jetzt verwenden.")
 
+    @whitelistset.command(name="grantrole")
+    async def whitelistset_grantrole(self, ctx: commands.Context, role: str = None):
+        """
+        Setze die Rolle die bei Klick auf "Whitelist freischalten" vergeben wird.
+        Ohne Rollen-Angabe wird die Einstellung zurückgesetzt.
+        Unterstützt ID oder Mention.
+        """
+        if role is None or role.lower() == "reset":
+            await self.config.guild(ctx.guild).whitelist_grant_role.set(None)
+            await ctx.send("✅ 'Whitelist freischalten' Rolle zurückgesetzt. Der Button wird nicht mehr angezeigt.")
+        else:
+            role_id = self._parse_role_id(role)
+            if role_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein!")
+                return
+            
+            r = ctx.guild.get_role(role_id)
+            if not r:
+                await ctx.send("❌ Rolle nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).whitelist_grant_role.set(role_id)
+            await ctx.send(f"✅ {r.mention} wird jetzt bei Klick auf 'Whitelist freischalten' vergeben.")
+
     @whitelistset.command(name="autoduty")
     async def whitelistset_autoduty(self, ctx: commands.Context, hours: int = None):
         """
@@ -2566,6 +2593,137 @@ class SupportCog(commands.Cog):
         
         await ctx.send(embed=embed)
 
+    @commands.command(name="dutytime", aliases=["dt"])
+    async def dutytime(self, ctx: commands.Context, member: discord.Member = None):
+        """
+        Zeigt die gesammelte Duty-Zeit eines Users an.
+        
+        - `member`: Der User dessen Duty-Zeit angezeigt werden soll (optional, standardmäßig du selbst)
+        """
+        if not member:
+            member = ctx.author
+        
+        guild = ctx.guild
+        
+        # Hole Duty-Zeiten
+        total_duty_time = await self.config.member(member).total_duty_time()
+        total_wl_duty_time = await self.config.member(member).total_whitelist_duty_time()
+        
+        # Konvertiere zu Stunden und Minuten
+        support_hours = total_duty_time // 3600
+        support_minutes = (total_duty_time % 3600) // 60
+        wl_hours = total_wl_duty_time // 3600
+        wl_minutes = (total_wl_duty_time % 3600) // 60
+        
+        embed = discord.Embed(
+            title=f"⏱️ Duty-Zeit von {member.display_name}",
+            color=member.color,
+            timestamp=datetime.utcnow()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        
+        embed.add_field(
+            name="🟢 Support Duty",
+            value=f"**{support_hours}h {support_minutes}m**\n({total_duty_time:,} Sekunden)",
+            inline=True
+        )
+        embed.add_field(
+            name="📋 Whitelist Duty",
+            value=f"**{wl_hours}h {wl_minutes}m**\n({total_wl_duty_time:,} Sekunden)",
+            inline=True
+        )
+        
+        total_hours = (total_duty_time + total_wl_duty_time) // 3600
+        total_minutes = ((total_duty_time + total_wl_duty_time) % 3600) // 60
+        embed.add_field(
+            name="📊 Gesamt",
+            value=f"**{total_hours}h {total_minutes}m**",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Duty Zeit • {guild.name}")
+        
+        await ctx.send(embed=embed)
+
+    @commands.command(name="dutyleaderboard", aliases=["dutylb", "dutyranking"])
+    async def dutyleaderboard(self, ctx: commands.Context, limit: int = 10):
+        """
+        Zeigt ein Ranking der aktivsten Staff-Mitglieder nach Duty-Zeit.
+        
+        - `limit`: Anzahl der anzuzeigenden Einträge (max. 25)
+        """
+        if limit > 25:
+            limit = 25
+        if limit < 1:
+            limit = 10
+        
+        guild = ctx.guild
+        guild_data = await self.config.guild(guild).all()
+        
+        role_id = guild_data.get("role")
+        wl_role_id = guild_data.get("whitelist_role")
+        
+        if not role_id and not wl_role_id:
+            await ctx.send("❌ Es wurden keine Support- oder Whitelist-Rollen konfiguriert!")
+            return
+        
+        # Sammle alle relevanten Mitglieder
+        members_to_check = set()
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role:
+                members_to_check.update(base_role.members)
+        if wl_role_id:
+            wl_base_role = guild.get_role(wl_role_id)
+            if wl_base_role:
+                members_to_check.update(wl_base_role.members)
+        
+        if not members_to_check:
+            await ctx.send("❌ Keine Teammitglieder gefunden!")
+            return
+        
+        # Sammle Duty-Zeiten
+        duty_times = []
+        for member in members_to_check:
+            if member.bot:
+                continue
+            total_support = await self.config.member(member).total_duty_time()
+            total_wl = await self.config.member(member).total_whitelist_duty_time()
+            total = total_support + total_wl
+            if total > 0:
+                duty_times.append((member, total, total_support, total_wl))
+        
+        if not duty_times:
+            await ctx.send("📊 Noch keine Duty-Zeiten erfasst!")
+            return
+        
+        # Sortiere nach Gesamtzeit (absteigend)
+        duty_times.sort(key=lambda x: x[1], reverse=True)
+        
+        # Erstelle Leaderboard
+        leaderboard_entries = []
+        for i, (member, total, support, wl) in enumerate(duty_times[:limit], 1):
+            total_hours = total // 3600
+            total_minutes = (total % 3600) // 60
+            
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            entry = f"{medal} **{member.display_name}** - {total_hours}h {total_minutes}m"
+            if support > 0 and wl > 0:
+                supp_h = support // 3600
+                wl_h = wl // 3600
+                entry += f"\n   └ 🟢 {supp_h}h Support | 📋 {wl_h}h Whitelist"
+            leaderboard_entries.append(entry)
+        
+        embed = discord.Embed(
+            title="🏆 Duty Leaderboard",
+            description="Die aktivsten Staff-Mitglieder nach gesamter Duty-Zeit\n\n" + "\n\n".join(leaderboard_entries),
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        embed.set_footer(text=f"Duty Ranking • {len(duty_times)} Mitglieder mit Duty-Zeit • {guild.name}")
+        
+        await ctx.send(embed=embed)
+
     # HINWEIS: clearwarns, slowmode, purge, lock, unlock, nick, removenick wurden entfernt - verwende offizielle Red-Cogs (mod, admin, roletools)
     # HINWEIS: serverinfo, roleinfo wurden entfernt - verwende offiziellen Red-Cog (info)
 
@@ -2665,14 +2823,20 @@ class DutyButtonView(discord.ui.View):
             return
         
         # Hole Startzeit für Statistik
-        start_time = await self.cog.config.member(member).duty_start()
+        start_time_ts = await self.cog.config.member(member).duty_start()
         duration = "Unbekannt"
-        if start_time:
-            start_dt = datetime.fromtimestamp(start_time)
+        duration_seconds = 0
+        if start_time_ts:
+            start_dt = datetime.fromtimestamp(start_time_ts)
             delta = datetime.utcnow() - start_dt
             hours = int(delta.total_seconds() // 3600)
             minutes = int((delta.total_seconds() % 3600) // 60)
             duration = f"{hours}h {minutes}min"
+            duration_seconds = int(delta.total_seconds())
+        
+        # Gesamte Duty-Zeit aktualisieren (Statistik)
+        total_time = await self.cog.config.member(member).total_duty_time()
+        await self.cog.config.member(member).total_duty_time.set(total_time + duration_seconds)
         
         # Duty deaktivieren und Rolle entfernen
         await self.cog.config.member(member).on_duty.set(False)
@@ -2924,14 +3088,20 @@ class WhitelistButtonView(discord.ui.View):
             return
         
         # Hole Startzeit für Statistik
-        start_time = await self.cog.config.member(member).whitelist_duty_start()
+        start_time_ts = await self.cog.config.member(member).whitelist_duty_start()
         duration = "Unbekannt"
-        if start_time:
-            start_dt = datetime.fromtimestamp(start_time)
+        duration_seconds = 0
+        if start_time_ts:
+            start_dt = datetime.fromtimestamp(start_time_ts)
             delta = datetime.utcnow() - start_dt
             hours = int(delta.total_seconds() // 3600)
             minutes = int((delta.total_seconds() % 3600) // 60)
             duration = f"{hours}h {minutes}min"
+            duration_seconds = int(delta.total_seconds())
+        
+        # Gesamte Duty-Zeit aktualisieren (Statistik)
+        total_time = await self.cog.config.member(member).total_whitelist_duty_time()
+        await self.cog.config.member(member).total_whitelist_duty_time.set(total_time + duration_seconds)
         
         # Duty deaktivieren und Rolle entfernen
         await self.cog.config.member(member).whitelist_on_duty.set(False)
@@ -2975,7 +3145,7 @@ class WhitelistButtonView(discord.ui.View):
         await interaction.response.send_message("✅ Du hast den Whitelist-Duty-Modus verlassen.", ephemeral=True)
     
     async def update_whitelist_panel_display(self, guild: discord.Guild):
-        """Updates the whitelist panel message to show current duty members"""
+        """Updates the whitelist panel message to show current duty members and grant role button"""
         try:
             panel_message_id = await self.cog.config.guild(guild).whitelist_panel_message_id()
             if not panel_message_id:
@@ -3003,6 +3173,10 @@ class WhitelistButtonView(discord.ui.View):
                                 duty_count += 1
                                 duty_list.append(f"• {m.display_name}")
             
+            # Check if grant role is configured
+            grant_role_id = await self.cog.config.guild(guild).whitelist_grant_role()
+            has_grant_role = grant_role_id is not None
+            
             # Create new embed with updated info
             if duty_count > 0:
                 duty_text = "\n".join(duty_list[:10])
@@ -3011,14 +3185,19 @@ class WhitelistButtonView(discord.ui.View):
             else:
                 duty_text = "Niemand"
             
+            description = (
+                "**Willkommen zum Whitelist-Duty System!**\n\n"
+                "Klicke auf die Buttons unten um dich für den Whitelist-Dienst an- oder abzumelden.\n\n"
+                "🔵 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
+                "🔴 **Duty Beenden** - Du erhältst keine Pings mehr"
+            )
+            
+            if has_grant_role:
+                description += "\n\n✅ **Whitelist freischalten** - Spieler zur Whitelist hinzufügen"
+            
             new_embed = discord.Embed(
                 title="📋 Whitelist Duty Panel",
-                description=(
-                    "**Willkommen zum Whitelist-Duty System!**\n\n"
-                    "Klicke auf die Buttons unten um dich für den Whitelist-Dienst an- oder abzumelden.\n\n"
-                    "🔵 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
-                    "🔴 **Duty Beenden** - Du erhältst keine Pings mehr"
-                ),
+                description=description,
                 color=discord.Color.blue()
             )
             new_embed.add_field(
@@ -3028,7 +3207,10 @@ class WhitelistButtonView(discord.ui.View):
             )
             new_embed.set_footer(text=f"Aktive Handler: {duty_count} • Die 🔵 On Duty Rolle wird automatisch zugewiesen/entfernt")
             
-            await panel_message.edit(embed=new_embed)
+            # Re-create view with grant role button if configured
+            new_view = WhitelistButtonView(self.cog, guild)
+            
+            await panel_message.edit(embed=new_embed, view=new_view)
         except Exception as e:
             pass  # Ignore errors if panel message was deleted
 
