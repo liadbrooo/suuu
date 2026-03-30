@@ -2567,57 +2567,9 @@ class SupportCog(commands.Cog):
         await ctx.send(embed=embed)
 
     # HINWEIS: clearwarns, slowmode, purge, lock, unlock, nick, removenick wurden entfernt - verwende offizielle Red-Cogs (mod, admin, roletools)
+    # HINWEIS: serverinfo, roleinfo wurden entfernt - verwende offiziellen Red-Cog (info)
 
-    @commands.command(name="roleinfo", aliases=["ri", "informationrole"])
-    async def roleinfo(self, ctx: commands.Context, *, role: discord.Role):
-        """
-        Zeigt Informationen über eine Rolle an.
-        """
-        embed = discord.Embed(
-            title=f"📋 Rolle: {role.name}",
-            color=role.color,
-            timestamp=datetime.utcnow()
-        )
-        embed.add_field(name="ID", value=str(role.id), inline=True)
-        embed.add_field(name="Farbe", value=str(role.color), inline=True)
-        embed.add_field(name="Mitglieder", value=str(len(role.members)), inline=True)
-        embed.add_field(name="Erstellt", value=role.created_at.strftime("%d.%m.%Y %H:%M"), inline=True)
-        embed.add_field(name="Mentionable", value="✅ Ja" if role.mentionable else "❌ Nein", inline=True)
-        embed.add_field(name="Hoisted", value="✅ Ja" if role.hoist else "❌ Nein", inline=True)
-        embed.add_field(name="Managed", value="✅ Ja" if role.managed else "❌ Nein", inline=True)
-        embed.set_footer(text=f"Role Info • {ctx.guild.name}")
-        
-        await ctx.send(embed=embed)
-
-    @commands.command(name="serverinfo", aliases=["si", "guildinfo"])
-    async def serverinfo(self, ctx: commands.Context):
-        """
-        Zeigt Informationen über den Server an.
-        """
-        guild = ctx.guild
-        
-        embed = discord.Embed(
-            title=f"🏠 {guild.name}",
-            color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
-        )
-        embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-        
-        embed.add_field(name="Besitzer", value=guild.owner.mention if guild.owner else "Unbekannt", inline=True)
-        embed.add_field(name="Mitglieder", value=str(guild.member_count), inline=True)
-        embed.add_field(name="Online", value=str(len([m for m in guild.members if m.status != discord.Status.offline])), inline=True)
-        embed.add_field(name="Rollen", value=str(len(guild.roles)), inline=True)
-        embed.add_field(name="Text Channels", value=str(len(guild.text_channels)), inline=True)
-        embed.add_field(name="Voice Channels", value=str(len(guild.voice_channels)), inline=True)
-        embed.add_field(name="Kategorien", value=str(len(guild.categories)), inline=True)
-        embed.add_field(name="Emojis", value=f"{len(guild.emojis)}/{guild.emoji_limit}", inline=True)
-        embed.add_field(name="Boost Level", value=f"Level {guild.premium_tier}", inline=True)
-        embed.add_field(name="Boosts", value=str(guild.premium_subscription_count), inline=True)
-        embed.add_field(name="Erstellt", value=guild.created_at.strftime("%d.%m.%Y"), inline=True)
-        
-        embed.set_footer(text=f"Server Info • ID: {guild.id}")
-        
-        await ctx.send(embed=embed)
+    # ENDE DER BEFEHLE - Alle weiteren Befehle (serverinfo, roleinfo) wurden entfernt da sie im offiziellen 'info' Cog enthalten sind
 
 
 class DutyButtonView(discord.ui.View):

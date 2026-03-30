@@ -1,1 +1,1 @@
-Nothing should be ignored in this case, as only a Python source file (`supportcog/__init__.py`) was modified and no build artifacts, dependencies, or temporary files were included in the changes.
+Nothing should be ignored based on the provided file changes. The only modified file is a Python source file (`supportcog/__init__.py`), which should not be ignored.
