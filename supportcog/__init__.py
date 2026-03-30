@@ -3001,6 +3001,12 @@ class WhitelistButtonView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild = guild
+        
+        # Füge den "Whitelist freischalten" Button nur hinzu, wenn eine Rolle konfiguriert ist
+        if guild:
+            grant_role_id = cog.bot.loop.run_until_complete(cog.config.guild(guild).whitelist_grant_role())
+            if grant_role_id:
+                self.add_item(GrantWhitelistButton(cog, guild))
     
     @discord.ui.button(label="Duty Starten", style=discord.ButtonStyle.green, emoji="🔵", custom_id="whitelist_duty_start")
     async def start_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3531,16 +3537,23 @@ class WhitelistInputModal(discord.ui.Modal):
 class WhitelistSearchModal(discord.ui.Modal):
     """Modal zum Suchen von Spielern für die Whitelist - Verarbeitet direkt die Whitelist"""
     
-    def __init__(self, cog: SupportCog, guild: discord.Guild):
+    def __init__(self, cog: SupportCog, guild: discord.Guild, grant_role_mode: bool = False):
         self.cog = cog
         self.guild = guild
+        self.grant_role_mode = grant_role_mode
         
-        super().__init__(title="🎮 Spieler whitelisten", timeout=600)
+        title = "🎮 Spieler whitelisten" if not grant_role_mode else "✅ Whitelist-Rolle vergeben"
+        
+        super().__init__(title=title, timeout=600)
+        
+        placeholder_text = "Gib den Discord-Namen oder die User-ID ein (z.B. 123456789012345678)"
+        if grant_role_mode:
+            placeholder_text = "Gib den Discord-Namen oder die User-ID des Spielers ein dem du die Whitelist-Rolle geben möchtest"
         
         self.search_input = discord.ui.TextInput(
             label="Spielername oder ID",
             style=discord.TextStyle.short,
-            placeholder="Gib den Discord-Namen oder die User-ID ein (z.B. 123456789012345678)",
+            placeholder=placeholder_text,
             min_length=1,
             max_length=50,
             required=True
@@ -3573,10 +3586,21 @@ class WhitelistSearchModal(discord.ui.Modal):
                 await interaction.followup.send("❌ Du benötigst die Whitelist-Handler-Rolle oder musst im Whitelist-Duty sein!", ephemeral=True)
                 return
             
-            approved_role = await self.cog.get_whitelist_approved_role(self.guild)
-            if not approved_role:
-                await interaction.followup.send("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
-                return
+            # Im grant_role_mode verwenden wir die whitelist_grant_role, sonst whitelist_approved_role
+            if self.grant_role_mode:
+                approved_role_id = await self.cog.config.guild(self.guild).whitelist_grant_role()
+                if not approved_role_id:
+                    await interaction.followup.send("❌ Keine 'Whitelist freischalten' Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
+                    return
+                approved_role = self.guild.get_role(approved_role_id)
+                if not approved_role:
+                    await interaction.followup.send("❌ Die konfigurierte 'Whitelist freischalten' Rolle existiert nicht mehr!", ephemeral=True)
+                    return
+            else:
+                approved_role = await self.cog.get_whitelist_approved_role(self.guild)
+                if not approved_role:
+                    await interaction.followup.send("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
+                    return
             
             # Versuche den Spieler zu finden
             target_user = None
@@ -3619,18 +3643,18 @@ class WhitelistSearchModal(discord.ui.Modal):
             
             if approved_role in target_user.roles:
                 await interaction.followup.send(
-                    f"ℹ️ {target_user.mention} hat bereits die Whitelist-Rolle!",
+                    f"ℹ️ {target_user.mention} hat bereits diese Rolle!",
                     ephemeral=True
                 )
                 return
             
             # Füge die Approved-Rolle hinzu
             try:
-                await target_user.add_roles(approved_role, reason=f"Whitelist genehmigt von {member.display_name}")
+                await target_user.add_roles(approved_role, reason=f"{'Whitelist genehmigt' if not self.grant_role_mode else 'Whitelist-Rolle vergeben'} von {member.display_name}")
                 
                 embed_success = discord.Embed(
-                    title="✅ Whitelist genehmigt",
-                    description=f"{target_user.mention} wurde erfolgreich zur Whitelist hinzugefügt!",
+                    title="✅ Whitelist genehmigt" if not self.grant_role_mode else "✅ Whitelist-Rolle vergeben",
+                    description=f"{target_user.mention} wurde erfolgreich {'zur Whitelist hinzugefügt' if not self.grant_role_mode else 'die Whitelist-Rolle zugewiesen'}!",
                     color=discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
@@ -3643,8 +3667,8 @@ class WhitelistSearchModal(discord.ui.Modal):
                 log_channel = await self.cog.get_whitelist_log_channel(self.guild)
                 if log_channel:
                     log_embed = discord.Embed(
-                        title="📋 Whitelist Eintrag erstellt",
-                        description=f"**{target_user.mention}** wurde zur Whitelist hinzugefügt.",
+                        title="📋 Whitelist Eintrag erstellt" if not self.grant_role_mode else "📋 Whitelist-Rolle vergeben",
+                        description=f"**{target_user.mention}** wurde {'zur Whitelist hinzugefügt' if not self.grant_role_mode else 'die Whitelist-Rolle zugewiesen'}.",
                         color=discord.Color.blue(),
                         timestamp=datetime.utcnow()
                     )
@@ -3660,13 +3684,13 @@ class WhitelistSearchModal(discord.ui.Modal):
                 # Benachrichtige den Spieler
                 try:
                     dm_embed = discord.Embed(
-                        title="🎉 Herzlichen Glückwunsch!",
-                        description=f"Du wurdest von **{member.display_name}** zur Whitelist hinzugefügt!",
+                        title="🎉 Herzlichen Glückwunsch!" if not self.grant_role_mode else "✅ Whitelist-Rolle erhalten",
+                        description=f"Du wurdest von **{member.display_name}** {'zur Whitelist hinzugefügt' if not self.grant_role_mode else 'die Whitelist-Rolle zugewiesen'}!",
                         color=discord.Color.green(),
                         timestamp=datetime.utcnow()
                     )
                     dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{approved_role.name}**", inline=False)
-                    dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
+                    dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen." if not self.grant_role_mode else "Deine Whitelist wurde aktiviert.", inline=False)
                     dm_embed.set_footer(text=f"{self.guild.name} Whitelist System")
                     await target_user.send(embed=dm_embed)
                 except discord.Forbidden:
@@ -3710,6 +3734,27 @@ class WhitelistDutyView(discord.ui.View):
             return
         
         modal = WhitelistSearchModal(self.cog, interaction.guild)
+        await interaction.response.send_modal(modal)
+
+
+class GrantWhitelistButton(discord.ui.Button):
+    """Button zum Freischalten der Whitelist für einen Spieler"""
+    
+    def __init__(self, cog: SupportCog, guild: discord.Guild):
+        super().__init__(label="Whitelist freischalten", style=discord.ButtonStyle.success, emoji="✅", custom_id="whitelist_grant_role")
+        self.cog = cog
+        self.guild = guild
+    
+    async def callback(self, interaction: discord.Interaction):
+        """Wird ausgelöst wenn der Button geklickt wird"""
+        # Prüfen ob User im Whitelist-Duty ist
+        is_on_duty = await self.cog.config.member(interaction.user).whitelist_on_duty()
+        if not is_on_duty:
+            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler zur Whitelist hinzuzufügen!", ephemeral=True)
+            return
+        
+        # Öffne Modal zur Spielerauswahl
+        modal = WhitelistSearchModal(self.cog, self.guild, grant_role_mode=True)
         await interaction.response.send_modal(modal)
 
 
