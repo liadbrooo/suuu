@@ -78,6 +78,7 @@ class SupportCog(commands.Cog):
             
             # FEEDBACK SYSTEM
             "feedback_channel": None,  # Channel für Feedback-Logs
+            "feedback_panel_channel": None,  # Channel NUR für das Feedback-Panel (getrennt vom Log)
             "feedback_panel_message_id": None,  # Message ID des Feedback-Panels
             
             # SUPPORT CALL SYSTEM
@@ -97,6 +98,21 @@ class SupportCog(commands.Cog):
             "whitelist_duty_timeout": 4,
             "whitelist_panel_message_id": None,
             "whitelist_always_allowed_role": None,  # Rolle die immer User holen darf (ohne Duty-Pflicht)
+            
+            # TICKET SYSTEM
+            "ticket_category": None,  # Kategorie für Tickets
+            "ticket_panel_channel": None,  # Channel für Ticket-Panel
+            "ticket_panel_message_id": None,  # Message ID des Ticket-Panels
+            "ticket_support_role": None,  # Rolle die Tickets bearbeiten kann
+            
+            # MODERATION SYSTEM
+            "mod_log_channel": None,  # Channel für Moderations-Logs
+            "warn_threshold": 3,  # Anzahl Warns vor Auto-Mute
+            "mute_duration": 60,  # Standard Mute-Dauer in Minuten
+            
+            # STATS & TRACKING
+            "track_stats": True,  # Ob Statistiken getrackt werden sollen
+            "support_stats_channel": None,  # Channel für Support-Statistiken
         }
 
         # Speichert On-Duty Status pro User (für beide Systeme)
@@ -333,6 +349,81 @@ class SupportCog(commands.Cog):
                 return channel
         
         return None
+
+    async def get_feedback_panel_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Channel NUR für das Feedback-Panel (getrennt vom Log-Channel)"""
+        panel_channel_id = await self.config.guild(guild).feedback_panel_channel()
+
+        if panel_channel_id:
+            channel = guild.get_channel(panel_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+
+        # Fallback auf feedback_channel
+        return await self.get_feedback_channel(guild)
+
+    async def get_mod_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Moderations-Log-Channel"""
+        mod_log_id = await self.config.guild(guild).mod_log_channel()
+
+        if mod_log_id:
+            channel = guild.get_channel(mod_log_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+
+        # Fallback auf allgemeinen log_channel
+        return await self.get_log_channel(guild)
+
+    async def get_ticket_category(self, guild: discord.Guild) -> Optional[discord.CategoryChannel]:
+        """Holt die Ticket-Kategorie"""
+        category_id = await self.config.guild(guild).ticket_category()
+
+        if category_id:
+            category = guild.get_channel(category_id)
+            if category and isinstance(category, discord.CategoryChannel):
+                return category
+
+        return None
+
+    async def get_ticket_panel_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Channel für das Ticket-Panel"""
+        panel_channel_id = await self.config.guild(guild).ticket_panel_channel()
+
+        if panel_channel_id:
+            channel = guild.get_channel(panel_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+
+        # Fallback auf support_channel
+        return await self.get_support_channel(guild)
+
+    async def get_ticket_support_role(self, guild: discord.Guild) -> Optional[discord.Role]:
+        """Holt die Rolle die Tickets bearbeiten kann"""
+        role_id = await self.config.guild(guild).ticket_support_role()
+
+        if role_id:
+            role = guild.get_role(role_id)
+            if role:
+                return role
+
+        # Fallback auf Support-Basisrolle
+        role_id = await self.config.guild(guild).role()
+        if role_id:
+            return guild.get_role(role_id)
+
+        return None
+
+    async def get_stats_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Channel für Support-Statistiken"""
+        stats_channel_id = await self.config.guild(guild).support_stats_channel()
+
+        if stats_channel_id:
+            channel = guild.get_channel(stats_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+
+        # Fallback auf team_channel
+        return await self.get_team_channel(guild)
 
     async def create_panel_message(self, ctx: commands.Context):
         """Erstellt eine permanente Panel-Nachricht mit Buttons"""
@@ -2026,6 +2117,347 @@ class SupportCog(commands.Cog):
         
         except Exception as e:
             await ctx.send(f"❌ Fehler beim Abrufen der Logs: `{str(e)}`")
+
+    # ============================================
+    # NEUE SUPPORT & MODERATION BEFEHLE
+    # ============================================
+
+    @commands.command(name="supportstats", aliases=["supportstatistik", "supportstats"])
+    async def supportstats(self, ctx: commands.Context):
+        """
+        Zeigt Support-Statistiken für diesen Server.
+        
+        - Anzahl der aktiven Duty-Mitglieder
+        - Gesamte Support-Anfragen (wenn getrackt)
+        - Durchschnittliche Wartezeit
+        """
+        guild = ctx.guild
+        guild_data = await self.config.guild(guild).all()
+        
+        # Zähle aktive Duty-User
+        duty_count = 0
+        duty_members_list = []
+        duty_role_id = guild_data.get("duty_role")
+        role_id = guild_data.get("role")
+        
+        if role_id and duty_role_id:
+            base_role = guild.get_role(role_id)
+            duty_role = guild.get_role(duty_role_id)
+            if base_role and duty_role:
+                for m in base_role.members:
+                    if duty_role in m.roles:
+                        is_on_duty = await self.config.member(m).on_duty()
+                        if is_on_duty:
+                            duty_count += 1
+                            duty_members_list.append(m.display_name)
+        
+        # Hole Duty-Zeiten
+        total_duty_time = 0
+        members_with_duty = 0
+        
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role:
+                for m in base_role.members:
+                    duty_start = await self.config.member(m).duty_start()
+                    if duty_start:
+                        start_dt = datetime.fromtimestamp(duty_start)
+                        duration = (datetime.utcnow() - start_dt).total_seconds()
+                        total_duty_time += duration
+                        members_with_duty += 1
+        
+        avg_duty_hours = (total_duty_time / 3600) / max(members_with_duty, 1)
+        
+        embed = discord.Embed(
+            title="📊 Support Statistiken",
+            description="Aktuelle Übersicht des Support-Systems",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        active_duty_display = "\n".join([f"• {name}" for name in duty_members_list[:10]]) if duty_members_list else "Niemand im Duty"
+        
+        embed.add_field(name="🟢 Aktive Duty-Mitglieder", value=f"{duty_count}\n{active_duty_display}", inline=False)
+        embed.add_field(name="⏱️ Ø Duty-Zeit pro Member", value=f"{avg_duty_hours:.1f} Stunden", inline=True)
+        embed.add_field(name="👥 Teammitglieder gesamt", value=str(len(base_role.members)) if base_role else "N/A", inline=True)
+        
+        stats_channel = await self.get_stats_channel(guild)
+        if stats_channel:
+            embed.add_field(name="📈 Stats Channel", value=stats_channel.mention, inline=True)
+        
+        embed.set_footer(text=f"Support-Stats • {guild.name}")
+        
+        await ctx.send(embed=embed)
+
+    @commands.command(name="feedbackpanel", aliases=["feedbackcreate", "createfeedback"])
+    @checks.admin_or_permissions(manage_guild=True)
+    async def feedbackpanel(self, ctx: commands.Context):
+        """
+        Erstellt ein Feedback-Panel mit Buttons für positives/negatives Feedback und Vorschläge.
+        """
+        guild = ctx.guild
+        channel = await self.get_feedback_panel_channel(guild)
+        
+        if not channel:
+            await ctx.send("❌ Kein Feedback-Channel konfiguriert!")
+            return
+        
+        embed = discord.Embed(
+            title="💬 Feedback Panel",
+            description=(
+                "**Wir freuen uns über dein Feedback!**\n\n"
+                "Klicke auf einen der Buttons unten um uns dein Feedback zu geben.\n\n"
+                "😊 **Positives Feedback** - Das läuft gut!\n"
+                "😞 **Negatives Feedback** - Das muss verbessert werden\n"
+                "💡 **Vorschlag machen** - Hast du eine Idee?"
+            ),
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text="Dein Feedback hilft uns besser zu werden!")
+        
+        view = FeedbackPanelView(self)
+        message = await channel.send(embed=embed, view=view)
+        
+        await self.config.guild(guild).feedback_panel_message_id.set(message.id)
+        
+        await ctx.send(f"✅ Feedback-Panel wurde in {channel.mention} erstellt!")
+
+    @commands.command(name="teampanel", aliases=["teamupdate", "updateteam"])
+    async def teampanel(self, ctx: commands.Context):
+        """
+        Aktualisiert oder erstellt das Team-Übersichts-Panel.
+        Zeigt alle Teammitglieder und deren Duty-Status.
+        """
+        guild = ctx.guild
+        channel = await self.get_team_channel(guild)
+        
+        if not channel:
+            await ctx.send("❌ Kein Team-Channel konfiguriert!")
+            return
+        
+        # Hole View-Klasse und aktualisiere Panel
+        from discord.ui import View
+        
+        role_id = await self.config.guild(guild).role()
+        duty_role = await self.get_or_create_duty_role(guild)
+        
+        team_members = []
+        on_duty_count = 0
+        off_duty_count = 0
+        
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role:
+                for m in sorted(base_role.members, key=lambda x: x.display_name.lower()):
+                    is_duty = await self.config.member(m).on_duty()
+                    status_emoji = "🟢" if is_duty else "🔴"
+                    if is_duty:
+                        on_duty_count += 1
+                    else:
+                        off_duty_count += 1
+                    team_members.append(f"{status_emoji} {m.display_name}")
+        
+        embed = discord.Embed(
+            title="👥 Team Übersicht",
+            description="**Unser Support-Team**\n\nHier siehst du alle Teammitglieder und deren aktuellen Status.",
+            color=discord.Color.blue()
+        )
+        
+        if team_members:
+            embed.add_field(name=f"🟢 Im Dienst ({on_duty_count})", value=f"Insgesamt {len(team_members)} Teammitglieder", inline=False)
+            embed.add_field(name="📋 Teammitglieder", value="\n".join(team_members[:20]) + (f"\n...und {len(team_members) - 20} weitere" if len(team_members) > 20 else ""), inline=False)
+        else:
+            embed.add_field(name="Keine Teammitglieder", value="Es wurden noch keine Teammitglieder mit der Support-Basisrolle ausgestattet.", inline=False)
+        
+        embed.set_footer(text=f"On Duty: {on_duty_count} | Off Duty: {off_duty_count}")
+        
+        team_panel_message_id = await self.config.guild(guild).team_panel_message_id()
+        
+        if team_panel_message_id:
+            try:
+                message = await channel.fetch_message(team_panel_message_id)
+                await message.edit(embed=embed)
+                await ctx.send(f"✅ Team-Panel aktualisiert!")
+                return
+            except:
+                pass
+        
+        message = await channel.send(embed=embed)
+        await self.config.guild(guild).team_panel_message_id.set(message.id)
+        await ctx.send(f"✅ Team-Panel in {channel.mention} erstellt!")
+
+    @commands.command(name="warn", aliases=["verwarnen", "warning"])
+    @checks.mod_or_permissions(manage_messages=True)
+    async def warn_user(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """
+        Verwarnt einen Benutzer.
+        
+        Bei达到一定数量的警告 wird der Benutzer automatisch gemutet.
+        """
+        guild = ctx.guild
+        author = ctx.author
+        
+        # Logge die Warnung
+        mod_log = await self.get_mod_log_channel(guild)
+        
+        embed = discord.Embed(
+            title="⚠️ Verwarnung",
+            description=f"{member.mention} wurde verwarnt.",
+            color=discord.Color.orange(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="Moderator", value=f"{author.mention}\n(`{author.id}`)", inline=True)
+        embed.add_field(name="Grund", value=reason, inline=False)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"Warnung • ID: {hash(str(member.id) + str(datetime.utcnow().timestamp()))}")
+        
+        if mod_log:
+            await mod_log.send(embed=embed)
+        
+        await ctx.send(f"✅ {member.mention} wurde verwarnt.\n**Grund:** {reason}")
+        
+        try:
+            await member.send(f"⚠️ Du wurdest auf **{guild.name}** verwarnt.\n**Grund:** {reason}")
+        except:
+            pass
+
+    @commands.command(name="mute", aliases=["stummschalten", "timeout"])
+    @checks.mod_or_permissions(manage_messages=True)
+    async def mute_user(self, ctx: commands.Context, member: discord.Member, duration_minutes: int = 60, *, reason: str = "Kein Grund angegeben"):
+        """
+        Stummschaltet einen Benutzer für eine bestimmte Zeit.
+        
+        - `duration_minutes`: Dauer in Minuten (Standard: 60)
+        - `reason`: Grund für den Mute
+        """
+        guild = ctx.guild
+        author = ctx.author
+        
+        try:
+            duration = timedelta(minutes=duration_minutes)
+            await member.timeout(duration, reason=reason)
+            
+            mod_log = await self.get_mod_log_channel(guild)
+            
+            embed = discord.Embed(
+                title="🔇 Mute",
+                description=f"{member.mention} wurde für {duration_minutes} Minuten stummgeschaltet.",
+                color=discord.Color.red(),
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Moderator", value=f"{author.mention}\n(`{author.id}`)", inline=True)
+            embed.add_field(name="Dauer", value=f"{duration_minutes} Minuten", inline=True)
+            embed.add_field(name="Grund", value=reason, inline=False)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            
+            if mod_log:
+                await mod_log.send(embed=embed)
+            
+            await ctx.send(f"✅ {member.mention} wurde für {duration_minutes} Minuten stummgeschaltet.")
+            
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung diesen Benutzer stummzuschalten!")
+        except Exception as e:
+            await ctx.send(f"❌ Fehler: `{str(e)}`")
+
+    @commands.command(name="unmute", aliases=["unmute", "untimeout"])
+    @checks.mod_or_permissions(manage_messages=True)
+    async def unmute_user(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """
+        Hebt die Stummschaltung eines Benutzers auf.
+        """
+        guild = ctx.guild
+        author = ctx.author
+        
+        try:
+            await member.timeout(None, reason=reason)
+            
+            mod_log = await self.get_mod_log_channel(guild)
+            
+            embed = discord.Embed(
+                title="🔊 Unmute",
+                description=f"{member.mention} wurde wieder stummgeschaltet.",
+                color=discord.Color.green(),
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Moderator", value=f"{author.mention}\n(`{author.id}`)", inline=True)
+            embed.add_field(name="Grund", value=reason, inline=False)
+            
+            if mod_log:
+                await mod_log.send(embed=embed)
+            
+            await ctx.send(f"✅ {member.mention} kann wieder sprechen.")
+            
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung die Stummschaltung aufzuheben!")
+        except Exception as e:
+            await ctx.send(f"❌ Fehler: `{str(e)}`")
+
+    @commands.command(name="modlog", aliases=["modlogs", "moderationlog"])
+    @checks.mod_or_permissions(manage_messages=True)
+    async def modlog_view(self, ctx: commands.Context, limit: int = 10):
+        """
+        Zeigt die letzten Moderations-Logs.
+        """
+        guild = ctx.guild
+        mod_log = await self.get_mod_log_channel(guild)
+        
+        if not mod_log:
+            await ctx.send("❌ Kein Moderations-Log-Channel konfiguriert!")
+            return
+        
+        limit = min(limit, 50)
+        
+        embed = discord.Embed(
+            title="📜 Moderations-Logs",
+            description=f"Die letzten {limit} Moderations-Einträge",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        entries = []
+        async for message in mod_log.history(limit=limit):
+            if message.embeds:
+                embed_obj = message.embeds[0]
+                time_str = f"<t:{int(message.created_at.timestamp())}:R>"
+                desc = embed_obj.description[:100] + "..." if len(embed_obj.description) > 100 else embed_obj.description
+                entries.append(f"{time_str} - {desc}")
+        
+        if entries:
+            embed.add_field(name="Einträge", value="\n".join(entries), inline=False)
+        else:
+            embed.add_field(name="Keine Einträge", value="Es wurden noch keine Moderations-Aktionen protokolliert.", inline=False)
+        
+        await ctx.send(embed=embed)
+
+    @commands.command(name="callpanel", aliases=["createcallpanel", "supportcallpanel"])
+    @checks.admin_or_permissions(manage_guild=True)
+    async def callpanel(self, ctx: commands.Context):
+        """
+        Erstellt ein Panel für Support-Aufrufe.
+        User können auf einen Button klicken um Support zu rufen.
+        """
+        guild = ctx.guild
+        channel = await self.get_support_call_channel(guild)
+        
+        if not channel:
+            channel = ctx.channel
+        
+        embed = discord.Embed(
+            title="📞 Support Aufruf",
+            description=(
+                "**Benötigst du Hilfe?**\n\n"
+                "Klicke auf den Button unten um einen Supporter zu rufen.\n\n"
+                "Ein Supporter wird sich so schnell wie möglich bei dir melden!"
+            ),
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text="Bitte missbrauche diese Funktion nicht!")
+        
+        view = SupportCallView(self)
+        message = await channel.send(embed=embed, view=view)
+        
+        await ctx.send(f"✅ Support-Aufruf-Panel wurde in {channel.mention} erstellt!")
 
 
 class DutyButtonView(discord.ui.View):
