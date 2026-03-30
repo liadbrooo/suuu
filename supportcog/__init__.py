@@ -2183,7 +2183,7 @@ class SupportCog(commands.Cog):
     # NEUE SUPPORT & MODERATION BEFEHLE
     # ============================================
 
-    @commands.command(name="supportstats", aliases=["supportstatistik", "stats"])
+    @commands.command(name="supportstats", aliases=["stats"])
     async def supportstats(self, ctx: commands.Context):
         """
         Zeigt Support-Statistiken für diesen Server.
