@@ -1731,7 +1731,10 @@ class SupportCog(commands.Cog):
                 return
                 
             await self.config.guild(ctx.guild).whitelist_grant_role.set(role_id)
-            await ctx.send(f"✅ {r.mention} wird jetzt bei Klick auf 'Whitelist freischalten' vergeben.")
+            await ctx.send(f"✅ {r.mention} wird jetzt bei Klick auf 'Whitelist freischalten' vergeben.\n\n📝 **Wichtig:** Der Button erscheint jetzt im Whitelist-Duty-Panel. Falls das Panel noch nicht existiert, erstelle es mit `{ctx.prefix}whitelistset createpanel`")
+            
+            # Update the panel to show the new button immediately
+            await self.update_whitelist_panel_display(ctx.guild)
 
     @whitelistset.command(name="autoduty")
     async def whitelistset_autoduty(self, ctx: commands.Context, hours: int = None):
@@ -3747,10 +3750,16 @@ class GrantWhitelistButton(discord.ui.Button):
     
     async def callback(self, interaction: discord.Interaction):
         """Wird ausgelöst wenn der Button geklickt wird"""
-        # Prüfen ob User im Whitelist-Duty ist
+        # Prüfen ob User im Whitelist-Duty ist ODER die always_allowed_role hat
         is_on_duty = await self.cog.config.member(interaction.user).whitelist_on_duty()
-        if not is_on_duty:
-            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler zur Whitelist hinzuzufügen!", ephemeral=True)
+        
+        # Prüfen auf always_allowed_role
+        always_allowed_role_id = await self.cog.config.guild(self.guild).whitelist_always_allowed_role()
+        always_allowed_role = self.guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
+        has_always_allowed = always_allowed_role and always_allowed_role in interaction.user.roles
+        
+        if not is_on_duty and not has_always_allowed:
+            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein oder die 'Always Allowed' Rolle haben um Spieler zur Whitelist hinzuzufügen!", ephemeral=True)
             return
         
         # Öffne Modal zur Spielerauswahl
