@@ -1734,7 +1734,7 @@ class SupportCog(commands.Cog):
             await ctx.send(f"✅ {r.mention} wird jetzt bei Klick auf 'Whitelist freischalten' vergeben.\n\n📝 **Wichtig:** Der Button erscheint jetzt im Whitelist-Duty-Panel. Falls das Panel noch nicht existiert, erstelle es mit `{ctx.prefix}whitelistset createpanel`")
             
             # Update the panel to show the new button immediately
-            await self.update_whitelist_panel_display(ctx.guild)
+            await self.cog.update_whitelist_panel_display(ctx.guild)
 
     @whitelistset.command(name="autoduty")
     async def whitelistset_autoduty(self, ctx: commands.Context, hours: int = None):
@@ -3082,7 +3082,7 @@ class WhitelistButtonView(discord.ui.View):
             await log_channel.send(embed=embed)
         
         # Update the panel message to show current duty count
-        await self.update_whitelist_panel_display(guild)
+        await self.cog.update_whitelist_panel_display(guild)
         
         await interaction.response.send_message("✅ Du bist jetzt im Whitelist-Duty-Modus! Du wirst bei neuen Anfragen gepingt.", ephemeral=True)
     
@@ -3149,7 +3149,7 @@ class WhitelistButtonView(discord.ui.View):
             await log_channel.send(embed=embed)
         
         # Update the panel message to show current duty count
-        await self.update_whitelist_panel_display(guild)
+        await self.cog.update_whitelist_panel_display(guild)
         
         await interaction.response.send_message("✅ Du hast den Whitelist-Duty-Modus verlassen.", ephemeral=True)
     
