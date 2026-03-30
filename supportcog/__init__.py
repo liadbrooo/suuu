@@ -3564,7 +3564,7 @@ class WhitelistSearchModal(discord.ui.Modal):
         # Füge das TextInput-Feld zum Modal hinzu
         self.add_item(self.search_input)
     
-    async def callback(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
         """Wird ausgelöst wenn das Modal abgesendet wird - Verarbeitet die Whitelist direkt"""
         # Defer immediately to prevent timeout - NO thinking parameter
         await interaction.response.defer(ephemeral=True)
