@@ -1734,7 +1734,7 @@ class SupportCog(commands.Cog):
             await ctx.send(f"✅ {r.mention} wird jetzt bei Klick auf 'Whitelist freischalten' vergeben.\n\n📝 **Wichtig:** Der Button erscheint jetzt im Whitelist-Duty-Panel. Falls das Panel noch nicht existiert, erstelle es mit `{ctx.prefix}whitelistset createpanel`")
             
             # Update the panel to show the new button immediately
-            await self.cog.update_whitelist_panel_display(ctx.guild)
+            await self.update_whitelist_panel_display(ctx.guild)
 
     @whitelistset.command(name="autoduty")
     async def whitelistset_autoduty(self, ctx: commands.Context, hours: int = None):
