@@ -800,6 +800,12 @@ class SupportCog(commands.Cog):
                     button.callback = callback
                     view.add_item(button)
 
+                # "Whitelist freischalten" Button hinzufügen wenn Rolle konfiguriert ist
+                grant_role_id = await self.config.guild(guild).whitelist_grant_role()
+                if grant_role_id:
+                    grant_button = GrantWhitelistButton(self, guild)
+                    view.add_item(grant_button)
+
                 # Sende das Embed mit Role-Ping IM WHITELIST-CHANNEL
                 if duty_role and duty_members:
                     # Nur die Whitelist-Duty-Rolle pingen statt alle Mitglieder einzeln
@@ -3068,18 +3074,14 @@ class DutyButtonView(discord.ui.View):
 
 
 class WhitelistButtonView(discord.ui.View):
-    """Button-View für Whitelist Duty An-/Abmeldung mit Button für Spieler-Verwaltung"""
+    """Button-View für Whitelist Duty An-/Abmeldung"""
     
     def __init__(self, cog: SupportCog, guild: discord.Guild = None):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild = guild
-        
-        # Füge den "Whitelist freischalten" Button nur hinzu, wenn eine Rolle konfiguriert ist
-        if guild:
-            grant_role_id = cog.bot.loop.run_until_complete(cog.config.guild(guild).whitelist_grant_role())
-            if grant_role_id:
-                self.add_item(GrantWhitelistButton(cog, guild))
+        # Hinweis: Der "Whitelist freischalten" Button gehört nicht hierher,
+        # sondern wird dynamisch bei den Whitelist-Anfrage-Nachrichten hinzugefügt.
     
     @discord.ui.button(label="Duty Starten", style=discord.ButtonStyle.green, emoji="🔵", custom_id="whitelist_duty_start")
     async def start_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
