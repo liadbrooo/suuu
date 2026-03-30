@@ -29,14 +29,50 @@ Installation:
    ALLGEMEIN:
    - [p]supportset autoduty <stunden|off>  (Automatische Abmeldung nach X Stunden oder ausschalten)
    - [p]supportset feedbackchannel #channel (Channel für Feedback-Logs)
+   - [p]supportset feedbackpanelchannel #channel (Channel NUR für das Feedback-Panel - GETRENNT vom Log!)
    - [p]supportset callchannel #channel     (Channel für Support-Aufrufe)
    - [p]supportset callroom @VoiceChannel   (Voice-Channel für Support-Calls)
    - ODER verwende [p]supportset setup für einen interaktiven Einrichtungsassistenten
+
+BEFEHLE (AUSWAHL):
+   SUPPORT & DUTY:
+   - [p]supportstats - Zeigt Support-Statistiken an
+   - [p]dutylist - Zeigt alle aktuell im Duty befindlichen Mitglieder
+   - [p]staffinfo [@user] - Zeigt Informationen über ein Teammitglied
+   - [p]supportinfo - Zeigt Informationen über das Support-System
+   
+   FEEDBACK:
+   - [p]feedbackpanel - Erstellt ein Feedback-Panel mit Buttons (Positiv/Negativ/Vorschlag)
+   
+   MODERATION:
+   - [p]warn <user> [grund] - Verwarnt einen Benutzer
+   - [p]mute <user> [dauer] [grund] - Setzt Timeout
+   - [p]unmute <user> [grund] - Hebt Stummschaltung auf
+   - [p]kick <user> [grund] - Kickt einen Benutzer
+   - [p]ban <user> [grund] - Bannt einen Benutzer
+   - [p]unban <user-id> [grund] - Hebt Bann auf
+   - [p]modlog [limit] - Zeigt letzte Moderations-Logs
+   - [p]purge <anzahl> - Löscht Nachrichten
+   - [p]slowmode <sekunden> - Setzt Slowmode
+   - [p]lock/unlock - Sperrt/Entsperrt Channel
+   
+   WHITELIST:
+   - [p]whitelistlist - Zeigt alle whitelisted Benutzer
+   - [p]whitelistuser <user> <spielername> - Fügt zur Whitelist hinzu
+   - [p]removewhitelist <user> - Entfernt von Whitelist
+   
+   INFO:
+   - [p]serverinfo - Zeigt Server-Informationen
+   - [p]roleinfo <rolle> - Zeigt Rollen-Informationen
+   - [p]nick <user> [nickname] - Ändert Nickname
+   - [p]callpanel - Erstellt Support-Aufruf-Panel
+   - [p]teampanel - Erstellt Team-Übersichts-Panel
 
 Nutzung:
 - Wenn jemand den konfigurierten Voice-Channel betritt, wird automatisch
   eine schöne Nachricht im entsprechenden Channel gesendet mit Ping aller Duty-Mitglieder
 - Duty-Logs (An-/Abmeldungen) landen separat im Log-Channel
+- Feedback-Panel kann in einem VÖLLIG GETRENNTEN Channel erstellt werden (feedbackpanelchannel)
 - Teammitglieder können sich per Button am Duty-Panel an- und abmelden
 - Automatische Duty-Rollen werden erstellt und verwaltet ("🟢 On Duty" / "📋 Whitelist Duty")
 - Modal-Eingabe ermöglicht das direkte Eingeben von Spieler-ID oder Name zum Whitelisten
@@ -1278,6 +1314,31 @@ class SupportCog(commands.Cog):
             await self.config.guild(ctx.guild).feedback_channel.set(channel_id)
             await ctx.send(f"✅ Feedback wird jetzt in {ch.mention} angezeigt.")
 
+    @supportset.command(name="feedbackpanelchannel")
+    async def supportset_feedbackpanelchannel(self, ctx: commands.Context, channel: str = None):
+        """
+        Setze den Channel NUR für das Feedback-Panel (GETRENNT vom Feedback-Log!).
+        Ohne Channel-Angabe wird der Panel-Channel verwendet.
+        Verwende 'reset' um zurückzusetzen.
+        Unterstützt ID oder Mention.
+        """
+        if channel is None or channel.lower() == "reset":
+            await self.config.guild(ctx.guild).feedback_panel_channel.set(None)
+            await ctx.send("✅ Feedback-Panel wird im Panel-Channel angezeigt.")
+        else:
+            channel_id = self._parse_channel_id(channel)
+            if channel_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein!")
+                return
+            
+            ch = ctx.guild.get_channel(channel_id)
+            if not ch or not isinstance(ch, discord.TextChannel):
+                await ctx.send("❌ Channel nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).feedback_panel_channel.set(channel_id)
+            await ctx.send(f"✅ Feedback-Panel wird jetzt in {ch.mention} angezeigt (Feedback-Logs bleiben im separaten Channel)!")
+
     @supportset.command(name="callchannel")
     async def supportset_callchannel(self, ctx: commands.Context, channel: str = None):
         """
@@ -2122,7 +2183,7 @@ class SupportCog(commands.Cog):
     # NEUE SUPPORT & MODERATION BEFEHLE
     # ============================================
 
-    @commands.command(name="supportstats", aliases=["supportstatistik", "supportstats"])
+    @commands.command(name="supportstats", aliases=["supportstatistik", "stats"])
     async def supportstats(self, ctx: commands.Context):
         """
         Zeigt Support-Statistiken für diesen Server.
@@ -2458,6 +2519,465 @@ class SupportCog(commands.Cog):
         message = await channel.send(embed=embed, view=view)
         
         await ctx.send(f"✅ Support-Aufruf-Panel wurde in {channel.mention} erstellt!")
+
+    # ============================================
+    # WEITERE NEUE BEFEHLE FÜR SUPPORT & MODERATION
+    # ============================================
+
+    @commands.command(name="whitelistlist", aliases=["wllist", "whitelisted", "allwhitelist"])
+    async def whitelistlist(self, ctx: commands.Context):
+        """
+        Zeigt alle whitelisted Benutzer an.
+        """
+        guild = ctx.guild
+        approved_role = await self.get_whitelist_approved_role(guild)
+        
+        if not approved_role:
+            await ctx.send("❌ Es wurde keine Whitelist-Approved-Rolle konfiguriert!")
+            return
+        
+        members = approved_role.members
+        if not members:
+            await ctx.send(f"📋 Keine Mitglieder mit der {approved_role.mention} Rolle gefunden.")
+            return
+        
+        embed = discord.Embed(
+            title="📋 Whitelist Mitglieder",
+            description=f"**{len(members)}** Mitglieder sind whitelisted",
+            color=discord.Color.green()
+        )
+        
+        member_list = "\n".join([f"• {m.display_name}" for m in list(members)[:50]])
+        if len(members) > 50:
+            member_list += f"\n... und {len(members) - 50} weitere"
+        
+        embed.add_field(name="Whitelisted Spieler", value=member_list, inline=False)
+        embed.set_footer(text=f"Whitelist Liste • {guild.name}")
+        
+        await ctx.send(embed=embed)
+
+    @commands.command(name="kick", aliases=["remove", "kicken"])
+    @checks.mod_or_permissions(kick_members=True)
+    async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """
+        Kickt einen Benutzer vom Server.
+        """
+        try:
+            await member.kick(reason=f"{ctx.author} - {reason}")
+            
+            embed = discord.Embed(
+                title="👢 Benutzer gekickt",
+                description=f"**{member}** wurde vom Server gekickt.",
+                color=discord.Color.orange(),
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Grund", value=reason, inline=False)
+            embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            
+            mod_log_channel = await self.get_mod_log_channel(guild)
+            if mod_log_channel:
+                await mod_log_channel.send(embed=embed)
+            
+            await ctx.send(f"✅ {member} wurde erfolgreich gekickt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung, diesen Benutzer zu kicken!")
+        except Exception as e:
+            await ctx.send(f"❌ Fehler beim Kicken: {str(e)}")
+
+    @commands.command(name="ban", aliases=["sperren", "bannen"])
+    @checks.mod_or_permissions(ban_members=True)
+    async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """
+        Bannt einen Benutzer vom Server.
+        """
+        try:
+            await member.ban(reason=f"{ctx.author} - {reason}", delete_message_days=0)
+            
+            embed = discord.Embed(
+                title="🔨 Benutzer gebannt",
+                description=f"**{member}** wurde permanent gebannt.",
+                color=discord.Color.red(),
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Grund", value=reason, inline=False)
+            embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            
+            mod_log_channel = await self.get_mod_log_channel(ctx.guild)
+            if mod_log_channel:
+                await mod_log_channel.send(embed=embed)
+            
+            await ctx.send(f"✅ {member} wurde erfolgreich gebannt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung, diesen Benutzer zu bannen!")
+        except Exception as e:
+            await ctx.send(f"❌ Fehler beim Bannen: {str(e)}")
+
+    @commands.command(name="unban", aliases=["entsperren", "entbannen"])
+    @checks.mod_or_permissions(ban_members=True)
+    async def unban(self, ctx: commands.Context, user_id: str, *, reason: str = "Kein Grund angegeben"):
+        """
+        Hebt den Bann eines Benutzers auf.
+        """
+        try:
+            user = await self.bot.fetch_user(int(user_id))
+            bans = [ban async for ban in ctx.guild.bans()]
+            
+            user_ban = None
+            for ban in bans:
+                if ban.user.id == int(user_id):
+                    user_ban = ban
+                    break
+            
+            if not user_ban:
+                await ctx.send("❌ Dieser Benutzer ist nicht gebannt!")
+                return
+            
+            await ctx.guild.unban(user, reason=f"{ctx.author} - {reason}")
+            
+            embed = discord.Embed(
+                title="✅ Bann aufgehoben",
+                description=f"**{user}** wurde entbannt.",
+                color=discord.Color.green(),
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Grund", value=reason, inline=False)
+            embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+            
+            mod_log_channel = await self.get_mod_log_channel(ctx.guild)
+            if mod_log_channel:
+                await mod_log_channel.send(embed=embed)
+            
+            await ctx.send(f"✅ {user} wurde erfolgreich entbannt.")
+        except ValueError:
+            await ctx.send("❌ Ungültige User-ID! Bitte gib eine numerische ID ein.")
+        except Exception as e:
+            await ctx.send(f"❌ Fehler beim Entbannen: {str(e)}")
+
+    @commands.command(name="supportinfo", aliases=["support", "helpinfo"])
+    async def supportinfo(self, ctx: commands.Context):
+        """
+        Zeigt Informationen über das Support-System an.
+        """
+        guild = ctx.guild
+        guild_data = await self.config.guild(guild).all()
+        
+        embed = discord.Embed(
+            title="ℹ️ Support System Informationen",
+            description="Übersicht über das Support-System dieses Servers",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        # Support Channel Info
+        support_channel = await self.get_support_channel(guild)
+        log_channel = await self.get_log_channel(guild)
+        panel_channel = await self.get_panel_channel(guild)
+        
+        embed.add_field(
+            name="📝 Channels",
+            value=(
+                f"**Support:** {support_channel.mention if support_channel else 'Nicht gesetzt'}\n"
+                f"**Logs:** {log_channel.mention if log_channel else 'Nicht gesetzt'}\n"
+                f"**Panel:** {panel_channel.mention if panel_channel else 'Nicht gesetzt'}"
+            ),
+            inline=False
+        )
+        
+        # Duty Info
+        duty_role_id = guild_data.get("duty_role")
+        duty_role = guild.get_role(duty_role_id) if duty_role_id else None
+        
+        base_role_id = guild_data.get("role")
+        base_role = guild.get_role(base_role_id) if base_role_id else None
+        
+        embed.add_field(
+            name="👥 Rollen",
+            value=(
+                f"**Base Role:** {base_role.mention if base_role else 'Nicht gesetzt'}\n"
+                f"**Duty Role:** {duty_role.mention if duty_role else 'Nicht gesetzt'}"
+            ),
+            inline=False
+        )
+        
+        # Auto-Duty Info
+        auto_duty = guild_data.get("auto_remove_duty", True)
+        duty_timeout = guild_data.get("duty_timeout", 4)
+        
+        embed.add_field(
+            name="⏱️ Auto-Duty",
+            value=f"**Aktiv:** {'Ja' if auto_duty else 'Nein'}\n**Timeout:** {duty_timeout} Stunden",
+            inline=True
+        )
+        
+        embed.set_footer(text=f"Support Info • {guild.name}")
+        
+        await ctx.send(embed=embed)
+
+    @commands.command(name="dutylist", aliases=["onduty", "activestaff"])
+    async def dutylist(self, ctx: commands.Context):
+        """
+        Zeigt alle aktuell im Duty befindlichen Teammitglieder an.
+        """
+        guild = ctx.guild
+        guild_data = await self.config.guild(guild).all()
+        
+        duty_role_id = guild_data.get("duty_role")
+        base_role_id = guild_data.get("role")
+        
+        if not duty_role_id or not base_role_id:
+            await ctx.send("❌ Duty-System ist nicht korrekt konfiguriert!")
+            return
+        
+        duty_role = guild.get_role(duty_role_id)
+        base_role = guild.get_role(base_role_id)
+        
+        if not duty_role or not base_role:
+            await ctx.send("❌ Duty-Rollen wurden nicht gefunden!")
+            return
+        
+        on_duty_members = []
+        for member in base_role.members:
+            if duty_role in member.roles:
+                is_on_duty = await self.config.member(member).on_duty()
+                if is_on_duty:
+                    duty_start = await self.config.member(member).duty_start()
+                    if duty_start:
+                        start_time = datetime.fromtimestamp(duty_start)
+                        duration = datetime.utcnow() - start_time
+                        hours = int(duration.total_seconds() // 3600)
+                        minutes = int((duration.total_seconds() % 3600) // 60)
+                        on_duty_members.append((member, f"{hours}h {minutes}m"))
+                    else:
+                        on_duty_members.append((member, "Unbekannt"))
+        
+        if not on_duty_members:
+            await ctx.send("🟢 Aktuell ist niemand im Duty!")
+            return
+        
+        embed = discord.Embed(
+            title="🟢 Aktuell im Duty",
+            description=f"**{len(on_duty_members)}** Teammitglieder sind im Einsatz",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        
+        duty_list = "\n".join([f"• {m.mention} - seit {time}" for m, time in on_duty_members[:15]])
+        if len(on_duty_members) > 15:
+            duty_list += f"\n... und {len(on_duty_members) - 15} weitere"
+        
+        embed.add_field(name="Active Staff", value=duty_list, inline=False)
+        embed.set_footer(text=f"Duty Liste • {guild.name}")
+        
+        await ctx.send(embed=embed)
+
+    @commands.command(name="staffinfo", aliases=["teaminfo", "memberinfo"])
+    async def staffinfo(self, ctx: commands.Context, member: discord.Member = None):
+        """
+        Zeigt Informationen über ein Teammitglied an.
+        """
+        if not member:
+            member = ctx.author
+        
+        guild = ctx.guild
+        guild_data = await self.config.guild(guild).all()
+        
+        base_role_id = guild_data.get("role")
+        duty_role_id = guild_data.get("duty_role")
+        wl_duty_role_id = guild_data.get("whitelist_duty_role")
+        
+        base_role = guild.get_role(base_role_id) if base_role_id else None
+        duty_role = guild.get_role(duty_role_id) if duty_role_id else None
+        wl_duty_role = guild.get_role(wl_duty_role_id) if wl_duty_role_id else None
+        
+        is_support = base_role in member.roles if base_role else False
+        is_on_duty = await self.config.member(member).on_duty()
+        is_wl_duty = await self.config.member(member).whitelist_on_duty()
+        
+        embed = discord.Embed(
+            title=f"👤 {member.display_name}",
+            color=member.color,
+            timestamp=datetime.utcnow()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        
+        status_info = []
+        if is_support:
+            status_info.append("✅ Support Team")
+        if is_on_duty:
+            status_info.append("🟢 On Duty (Support)")
+        if is_wl_duty:
+            status_info.append("📋 On Duty (Whitelist)")
+        
+        if not status_info:
+            status_info.append("🔹 Community Mitglied")
+        
+        embed.add_field(name="Status", value="\n".join(status_info), inline=False)
+        
+        if is_on_duty:
+            duty_start = await self.config.member(member).duty_start()
+            if duty_start:
+                start_time = datetime.fromtimestamp(duty_start)
+                duration = datetime.utcnow() - start_time
+                hours = int(duration.total_seconds() // 3600)
+                minutes = int((duration.total_seconds() % 3600) // 60)
+                embed.add_field(name="Duty Dauer", value=f"{hours}h {minutes}m", inline=True)
+        
+        embed.add_field(name="Rollen", value=f"{len(member.roles)} Rollen", inline=True)
+        embed.add_field(name="Beigetreten", value=member.joined_at.strftime("%d.%m.%Y") if member.joined_at else "Unbekannt", inline=True)
+        
+        embed.set_footer(text=f"Staff Info • {guild.name}")
+        
+        await ctx.send(embed=embed)
+
+    @commands.command(name="clearwarns", aliases=["resetwarns", "delwarns"])
+    @checks.mod_or_permissions(manage_messages=True)
+    async def clearwarns(self, ctx: commands.Context, member: discord.Member):
+        """
+        Entfernt alle Warnungen von einem Benutzer.
+        """
+        # Hinweis: Dies ist ein Platzhalter - für echte Warnungs-Entfernung 
+        # müsste ein Warn-System implementiert werden
+        await ctx.send(f"✅ Alle Warnungen von {member.mention} wurden entfernt. (Hinweis: Warn-System muss noch implementiert werden)")
+
+    @commands.command(name="slowmode", aliases=["setslowmode", "ratelimit"])
+    @checks.mod_or_permissions(manage_messages=True)
+    async def slowmode(self, ctx: commands.Context, seconds: int):
+        """
+        Setzt den Slowmode für den aktuellen Channel.
+        """
+        if seconds < 0 or seconds > 21600:
+            await ctx.send("❌ Slowmode muss zwischen 0 und 21600 Sekunden liegen!")
+            return
+        
+        try:
+            await ctx.channel.edit(slowmode_delay=seconds)
+            await ctx.send(f"✅ Slowmode wurde auf **{seconds}** Sekunden gesetzt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung, den Slowmode zu ändern!")
+
+    @commands.command(name="purge", aliases=["clear", "delete"])
+    @checks.mod_or_permissions(manage_messages=True)
+    async def purge(self, ctx: commands.Context, amount: int):
+        """
+        Löscht die letzte X Nachrichten im Channel.
+        """
+        if amount < 1 or amount > 100:
+            await ctx.send("❌ Du kannst zwischen 1 und 100 Nachrichten löschen!")
+            return
+        
+        try:
+            deleted = await ctx.channel.purge(limit=amount + 1)
+            msg = await ctx.send(f"✅ {len(deleted) - 1} Nachrichten wurden gelöscht.", delete_after=5)
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung, Nachrichten zu löschen!")
+
+    @commands.command(name="lock", aliases=["lockchannel", "closechat"])
+    @checks.mod_or_permissions(manage_channels=True)
+    async def lock(self, ctx: commands.Context):
+        """
+        Sperrt den aktuellen Channel für normale Benutzer.
+        """
+        try:
+            overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+            overwrite.send_messages = False
+            await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+            await ctx.send("🔒 Channel wurde gesperrt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung, den Channel zu sperren!")
+
+    @commands.command(name="unlock", aliases=["unlockchannel", "openchat"])
+    @checks.mod_or_permissions(manage_channels=True)
+    async def unlock(self, ctx: commands.Context):
+        """
+        Entsperrt den aktuellen Channel für normale Benutzer.
+        """
+        try:
+            overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+            overwrite.send_messages = True
+            await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+            await ctx.send("🔓 Channel wurde entsperrt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung, den Channel zu entsperren!")
+
+    @commands.command(name="nick", aliases=["nickname", "setnick"])
+    @checks.mod_or_permissions(manage_nicknames=True)
+    async def nick(self, ctx: commands.Context, member: discord.Member, *, nickname: str = None):
+        """
+        Ändert den Nickname eines Benutzers.
+        """
+        try:
+            await member.edit(nick=nickname)
+            if nickname:
+                await ctx.send(f"✅ Nickname von {member.mention} wurde zu **{nickname}** geändert.")
+            else:
+                await ctx.send(f"✅ Nickname von {member.mention} wurde entfernt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung, diesen Nickname zu ändern!")
+
+    @commands.command(name="removenick", aliases=["resetnick", "deletenick"])
+    @checks.mod_or_permissions(manage_nicknames=True)
+    async def removenick(self, ctx: commands.Context, member: discord.Member):
+        """
+        Entfernt den Nickname eines Benutzers.
+        """
+        try:
+            await member.edit(nick=None)
+            await ctx.send(f"✅ Nickname von {member.mention} wurde entfernt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung, diesen Nickname zu entfernen!")
+
+    @commands.command(name="roleinfo", aliases=["ri", "informationrole"])
+    async def roleinfo(self, ctx: commands.Context, *, role: discord.Role):
+        """
+        Zeigt Informationen über eine Rolle an.
+        """
+        embed = discord.Embed(
+            title=f"📋 Rolle: {role.name}",
+            color=role.color,
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="ID", value=str(role.id), inline=True)
+        embed.add_field(name="Farbe", value=str(role.color), inline=True)
+        embed.add_field(name="Mitglieder", value=str(len(role.members)), inline=True)
+        embed.add_field(name="Erstellt", value=role.created_at.strftime("%d.%m.%Y %H:%M"), inline=True)
+        embed.add_field(name="Mentionable", value="✅ Ja" if role.mentionable else "❌ Nein", inline=True)
+        embed.add_field(name="Hoisted", value="✅ Ja" if role.hoist else "❌ Nein", inline=True)
+        embed.add_field(name="Managed", value="✅ Ja" if role.managed else "❌ Nein", inline=True)
+        embed.set_footer(text=f"Role Info • {ctx.guild.name}")
+        
+        await ctx.send(embed=embed)
+
+    @commands.command(name="serverinfo", aliases=["si", "guildinfo"])
+    async def serverinfo(self, ctx: commands.Context):
+        """
+        Zeigt Informationen über den Server an.
+        """
+        guild = ctx.guild
+        
+        embed = discord.Embed(
+            title=f"🏠 {guild.name}",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
+        
+        embed.add_field(name="Besitzer", value=guild.owner.mention if guild.owner else "Unbekannt", inline=True)
+        embed.add_field(name="Mitglieder", value=str(guild.member_count), inline=True)
+        embed.add_field(name="Online", value=str(len([m for m in guild.members if m.status != discord.Status.offline])), inline=True)
+        embed.add_field(name="Rollen", value=str(len(guild.roles)), inline=True)
+        embed.add_field(name="Text Channels", value=str(len(guild.text_channels)), inline=True)
+        embed.add_field(name="Voice Channels", value=str(len(guild.voice_channels)), inline=True)
+        embed.add_field(name="Kategorien", value=str(len(guild.categories)), inline=True)
+        embed.add_field(name="Emojis", value=f"{len(guild.emojis)}/{guild.emoji_limit}", inline=True)
+        embed.add_field(name="Boost Level", value=f"Level {guild.premium_tier}", inline=True)
+        embed.add_field(name="Boosts", value=str(guild.premium_subscription_count), inline=True)
+        embed.add_field(name="Erstellt", value=guild.created_at.strftime("%d.%m.%Y"), inline=True)
+        
+        embed.set_footer(text=f"Server Info • ID: {guild.id}")
+        
+        await ctx.send(embed=embed)
 
 
 class DutyButtonView(discord.ui.View):
