@@ -3317,7 +3317,7 @@ class StatusSelectView(discord.ui.View):
         await self.cog.config.member(member).duty_break_count.set(break_count + 1)
         await self._set_status(interaction, "break", "Du bist jetzt in Pause.")
     
-    @discord.ui.button(label="Abwesend", style=discord.ButtonStyle.yellow, emoji="🟡")
+    @discord.ui.button(label="Abwesend", style=discord.ButtonStyle.secondary, emoji="⚪")
     async def set_away(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._set_status(interaction, "away", "Du bist jetzt abwesend.")
     
