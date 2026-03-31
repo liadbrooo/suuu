@@ -112,6 +112,15 @@ class SupportCog(commands.Cog):
             "team_panel_message_id": None,  # Message ID des Team-Panels
             "support_always_allowed_role": None,  # Rolle die immer User holen darf (ohne Duty-Pflicht)
             
+            # ERWEITERTE DUTY FUNKTIONEN
+            "duty_status_display_channel": None,  # Channel für das erweiterte Duty-Status-Display
+            "duty_status_display_message_id": None,  # Message ID des Status-Displays
+            "max_duty_hours_per_day": 8,  # Maximale Duty-Stunden pro Tag
+            "min_break_minutes": 15,  # Minimale Pausenzeit nach X Minuten Duty
+            "duty_handover_enabled": False,  # Duty-Übergabe-System aktivieren
+            "duty_schedule_channel": None,  # Channel für Duty-Planung
+            "allow_status_messages": True,  # Benutzerdefinierte Status-Nachrichten erlauben
+            
             # FEEDBACK SYSTEM
             "feedback_channel": None,  # Channel für Feedback-Logs
             "feedback_panel_channel": None,  # Channel NUR für das Feedback-Panel (getrennt vom Log)
@@ -159,7 +168,19 @@ class SupportCog(commands.Cog):
             "whitelist_on_duty": False,
             "whitelist_duty_start": None,
             "total_duty_time": 0,  # Gesamte Duty-Zeit in Sekunden (Support)
-            "total_whitelist_duty_time": 0  # Gesamte Duty-Zeit in Sekunden (Whitelist)
+            "total_whitelist_duty_time": 0,  # Gesamte Duty-Zeit in Sekunden (Whitelist)
+            
+            # ERWEITERTE DUTY FUNKTIONEN
+            "duty_status": "available",  # available, busy, break, away
+            "duty_status_message": None,  # Benutzerdefinierter Status-Text
+            "duty_scheduled": [],  # Geplante Duty-Schichten [{"start": timestamp, "end": timestamp}]
+            "duty_handover_target": None,  # User-ID für geplante Übergabe
+            "duty_handover_time": None,  # Timestamp für geplante Übergabe
+            "duty_session_count": 0,  # Anzahl der Duty-Sitzungen
+            "last_duty_end": None,  # Timestamp des letzten Duty-Endes
+            "duty_break_count": 0,  # Anzahl der Pausen in aktueller Sitzung
+            "duty_total_break_time": 0,  # Gesamte Pausenzeit in Sekunden
+            "current_break_start": None,  # Startzeit der aktuellen Pause
         }
 
         self.config.register_guild(**default_guild_settings)
@@ -485,6 +506,30 @@ class SupportCog(commands.Cog):
 
         # Fallback auf feedback_channel
         return await self.get_feedback_channel(guild)
+
+    async def get_status_display_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Channel für das erweiterte Duty-Status-Display"""
+        status_channel_id = await self.config.guild(guild).duty_status_display_channel()
+
+        if status_channel_id:
+            channel = guild.get_channel(status_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+
+        # Fallback auf team_channel
+        return await self.get_team_channel(guild)
+
+    async def get_duty_schedule_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Holt den Channel für Duty-Planung"""
+        schedule_channel_id = await self.config.guild(guild).duty_schedule_channel()
+
+        if schedule_channel_id:
+            channel = guild.get_channel(schedule_channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                return channel
+
+        # Fallback auf panel_channel
+        return await self.get_panel_channel(guild)
 
     async def get_mod_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """Holt den Moderations-Log-Channel"""
@@ -1367,6 +1412,36 @@ class SupportCog(commands.Cog):
         await self.create_panel_message(ctx)
         await ctx.send("✅ Duty-Panel wurde erstellt! Du kannst die Buttons jetzt verwenden um dich an-/abzumelden.")
 
+    @supportset.command(name="createstatusdisplay")
+    async def supportset_createstatusdisplay(self, ctx: commands.Context):
+        """
+        Erstellt das erweiterte Duty-Status-Display mit detaillierter Übersicht.
+        Diese Nachricht zeigt alle Teammitglieder nach Status sortiert an.
+        """
+        guild = ctx.guild
+        channel = await self.get_status_display_channel(guild)
+        
+        if not channel:
+            channel = ctx.channel
+        
+        # Erstelle initiales Embed
+        embed = discord.Embed(
+            title="📊 Live Duty Status Übersicht",
+            description="**Aktueller Status aller Teammitglieder im Dienst**\n\n_Lade Status..._",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="🟢 Verfügbar", value="Keine", inline=True)
+        embed.add_field(name="🔵 Beschäftigt", value="Keine", inline=True)
+        embed.add_field(name="☕ In Pause", value="Keine", inline=True)
+        embed.add_field(name="🟡 Abwesend", value="Keine", inline=False)
+        embed.add_field(name="📈 Statistik", value="**0** im Duty", inline=False)
+        
+        message = await channel.send(embed=embed)
+        await self.config.guild(guild).duty_status_display_message_id.set(message.id)
+        
+        await ctx.send(f"✅ Erweitertes Status-Display wurde in {channel.mention} erstellt!")
+
     @supportset.command(name="refreshpanel")
     async def supportset_refreshpanel(self, ctx: commands.Context):
         """
@@ -1481,6 +1556,59 @@ class SupportCog(commands.Cog):
                 
             await self.config.guild(ctx.guild).call_room.set(room_id)
             await ctx.send(f"✅ Call-Room auf {ch.mention} gesetzt.")
+
+    @supportset.command(name="statusdisplaychannel")
+    async def supportset_statusdisplaychannel(self, ctx: commands.Context, channel: str = None):
+        """
+        Setze den Channel für das erweiterte Duty-Status-Display.
+        Ohne Channel-Angabe wird der Team-Channel verwendet.
+        Verwende 'reset' um zurückzusetzen.
+        Unterstützt ID oder Mention.
+        """
+        if channel is None or channel.lower() == "reset":
+            await self.config.guild(ctx.guild).duty_status_display_channel.set(None)
+            await ctx.send("✅ Status-Display wird im Team-Channel angezeigt.")
+        else:
+            channel_id = self._parse_channel_id(channel)
+            if channel_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein!")
+                return
+            
+            ch = ctx.guild.get_channel(channel_id)
+            if not ch or not isinstance(ch, discord.TextChannel):
+                await ctx.send("❌ Channel nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).duty_status_display_channel.set(channel_id)
+            await ctx.send(f"✅ Erweitertes Status-Display wird jetzt in {ch.mention} angezeigt.")
+
+    @supportset.command(name="statusmessage")
+    async def supportset_statusmessage(self, ctx: commands.Context, enabled: bool = None):
+        """
+        Aktiviere oder deaktiviere benutzerdefinierte Status-Nachrichten.
+        Ohne Angabe wird der aktuelle Status angezeigt.
+        """
+        if enabled is None:
+            current = await self.config.guild(ctx.guild).allow_status_messages()
+            await ctx.send(f"{'✅' if current else '❌'} Benutzerdefinierte Status-Nachrichten sind aktuell {'aktiviert' if current else 'deaktiviert'}.")
+        else:
+            await self.config.guild(ctx.guild).allow_status_messages.set(enabled)
+            await ctx.send(f"✅ Benutzerdefinierte Status-Nachrichten wurden {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @supportset.command(name="maxdutyhours")
+    async def supportset_maxdutyhours(self, ctx: commands.Context, hours: int = None):
+        """
+        Setze die maximale Duty-Stunden pro Tag.
+        Ohne Angabe wird der aktuelle Wert angezeigt.
+        """
+        if hours is None:
+            current = await self.config.guild(ctx.guild).max_duty_hours_per_day()
+            await ctx.send(f"⏰ Maximale Duty-Stunden pro Tag: **{current}**")
+        elif hours < 1 or hours > 24:
+            await ctx.send("❌ Bitte gib eine gültige Stundenzahl zwischen 1 und 24 an!")
+        else:
+            await self.config.guild(ctx.guild).max_duty_hours_per_day.set(hours)
+            await ctx.send(f"✅ Maximale Duty-Stunden pro Tag auf **{hours}** gesetzt.")
 
     @supportset.command(name="createfeedbackpanel")
     async def supportset_createfeedbackpanel(self, ctx: commands.Context):
@@ -2826,7 +2954,7 @@ class SupportCog(commands.Cog):
 
 
 class DutyButtonView(discord.ui.View):
-    """Button-View für Duty An-/Abmeldung"""
+    """Button-View für Duty An-/Abmeldung mit erweiterten Funktionen"""
     
     def __init__(self, cog: SupportCog):
         super().__init__(timeout=None)
@@ -2834,7 +2962,7 @@ class DutyButtonView(discord.ui.View):
     
     @discord.ui.button(label="Duty Starten", style=discord.ButtonStyle.green, emoji="🟢", custom_id="duty_start")
     async def start_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Startet den Duty-Modus"""
+        """Startet den Duty-Modus mit erweitertem Status-System"""
         guild = interaction.guild
         member = interaction.user
         
@@ -2864,6 +2992,17 @@ class DutyButtonView(discord.ui.View):
         start_time = datetime.utcnow()
         await self.cog.config.member(member).duty_start.set(start_time.timestamp())
         
+        # Duty-Status auf "available" setzen
+        await self.cog.config.member(member).duty_status.set("available")
+        await self.cog.config.member(member).duty_status_message.set(None)
+        
+        # Session-Count erhöhen
+        current_sessions = await self.cog.config.member(member).duty_session_count()
+        await self.cog.config.member(member).duty_session_count.set(current_sessions + 1)
+        
+        # Pausen-Zähler zurücksetzen
+        await self.cog.config.member(member).duty_break_count.set(0)
+        
         # Duty-Rolle hinzufügen (wichtig: erst Rolle, dann Log)
         await self.cog.update_duty_role(member, True)
         
@@ -2882,6 +3021,9 @@ class DutyButtonView(discord.ui.View):
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
+        
+        session_count = await self.cog.config.member(member).duty_session_count()
+        embed.add_field(name="📊 Sessions", value=f"Session #{session_count}", inline=True)
         
         if auto_duty:
             end_time = start_time + timedelta(hours=duty_timeout)
@@ -2904,12 +3046,13 @@ class DutyButtonView(discord.ui.View):
         
         # Update the panel message to show current duty count
         await self.update_panel_display(guild)
+        await self.update_status_display(guild)
         
         await interaction.response.send_message("✅ Du bist jetzt im Duty-Modus! Du wirst bei neuen Support-Anfragen gepingt.", ephemeral=True)
     
     @discord.ui.button(label="Duty Beenden", style=discord.ButtonStyle.red, emoji="🔴", custom_id="duty_stop")
     async def stop_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Beendet den Duty-Modus"""
+        """Beendet den Duty-Modus mit erweiterter Statistik"""
         member = interaction.user
         is_on_duty = await self.cog.config.member(member).on_duty()
         
@@ -2936,6 +3079,9 @@ class DutyButtonView(discord.ui.View):
         # Duty deaktivieren und Rolle entfernen
         await self.cog.config.member(member).on_duty.set(False)
         await self.cog.config.member(member).duty_start.set(None)
+        await self.cog.config.member(member).last_duty_end.set(datetime.utcnow().timestamp())
+        await self.cog.config.member(member).duty_status.set("off_duty")
+        await self.cog.config.member(member).duty_status_message.set(None)
         
         # Duty-Rolle entfernen
         await self.cog.update_duty_role(member, False)
@@ -2954,6 +3100,13 @@ class DutyButtonView(discord.ui.View):
         embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
         embed.add_field(name="⏱️ Dauer", value=duration, inline=True)
         
+        # Pausen-Info anzeigen
+        break_count = await self.cog.config.member(member).duty_break_count()
+        total_break_time = await self.cog.config.member(member).duty_total_break_time()
+        break_minutes = total_break_time // 60
+        if break_count > 0:
+            embed.add_field(name="☕ Pausen", value=f"{break_count} Pausen ({break_minutes} min)", inline=True)
+        
         # Zähle verbleibende aktive Duty-User
         duty_count = 0
         duty_role = await self.cog.get_or_create_duty_role(guild)
@@ -2971,8 +3124,26 @@ class DutyButtonView(discord.ui.View):
         
         # Update the panel message to show current duty count
         await self.update_panel_display(guild)
+        await self.update_status_display(guild)
         
         await interaction.response.send_message("✅ Du hast den Duty-Modus verlassen.", ephemeral=True)
+    
+    @discord.ui.button(label="Status Ändern", style=discord.ButtonStyle.secondary, emoji="📝", custom_id="duty_status")
+    async def change_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Zeigt ein Modal zum Ändern des Duty-Status an"""
+        is_on_duty = await self.cog.config.member(interaction.user).on_duty()
+        
+        if not is_on_duty:
+            await interaction.response.send_message("❌ Du musst im Duty sein um deinen Status zu ändern!", ephemeral=True)
+            return
+        
+        # Erstelle eine View mit Status-Buttons
+        view = StatusSelectView(self.cog)
+        await interaction.response.send_message(
+            "Wähle deinen aktuellen Status:",
+            view=view,
+            ephemeral=True
+        )
     
     async def update_panel_display(self, guild: discord.Guild):
         """Updates the panel message to show current duty members"""
@@ -2987,7 +3158,7 @@ class DutyButtonView(discord.ui.View):
             
             panel_message = await panel_channel.fetch_message(panel_message_id)
             
-            # Get current duty members
+            # Get current duty members with their status
             duty_count = 0
             duty_list = []
             duty_role = await self.cog.get_or_create_duty_role(guild)
@@ -3001,13 +3172,16 @@ class DutyButtonView(discord.ui.View):
                             is_duty = await self.cog.config.member(m).on_duty()
                             if is_duty:
                                 duty_count += 1
-                                duty_list.append(f"• {m.display_name}")
+                                # Status-Emoji holen
+                                status = await self.cog.config.member(m).duty_status()
+                                status_emoji = {"available": "🟢", "busy": "🔵", "break": "☕", "away": "🟡"}.get(status, "🟢")
+                                duty_list.append(f"{status_emoji} {m.display_name}")
             
             # Create new embed with updated info
             if duty_count > 0:
-                duty_text = "\n".join(duty_list[:10])
-                if len(duty_list) > 10:
-                    duty_text += f"\n• ...und {duty_count - 10} weitere"
+                duty_text = "\n".join(duty_list[:15])
+                if len(duty_list) > 15:
+                    duty_text += f"\n• ...und {duty_count - 15} weitere"
             else:
                 duty_text = "Niemand"
             
@@ -3017,16 +3191,146 @@ class DutyButtonView(discord.ui.View):
                     "**Willkommen zum Support-Duty System!**\n\n"
                     "Klicke auf die Buttons unten um dich für den Support-Dienst an- oder abzumelden.\n\n"
                     "🟢 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
-                    "🔴 **Duty Beenden** - Du erhältst keine Pings mehr"
+                    "🔴 **Duty Beenden** - Du erhältst keine Pings mehr\n"
+                    "📝 **Status Ändern** - Setze deinen aktuellen Status (Verfügbar/Beschäftigt/Pause)"
                 ),
                 color=discord.Color.blue()
             )
-            new_embed.add_field(name=f"🟢 Aktuell im Dienst ({duty_count})", value=duty_text, inline=False)
+            new_embed.add_field(name=f"🟢 Aktuell im Dienst ({duty_count})", value=duty_text or "Niemand", inline=False)
             new_embed.set_footer(text="Die 🟢 On Duty Rolle wird automatisch zugewiesen/entfernt")
             
             await panel_message.edit(embed=new_embed)
         except Exception as e:
             print(f"Fehler beim Aktualisieren des Duty-Panels: {e}")
+    
+    async def update_status_display(self, guild: discord.Guild):
+        """Aktualisiert das erweiterte Duty-Status-Display mit detaillierten Informationen"""
+        try:
+            status_display_id = await self.cog.config.guild(guild).duty_status_display_message_id()
+            if not status_display_id:
+                return
+            
+            status_channel = await self.cog.get_status_display_channel(guild)
+            if not status_channel:
+                return
+            
+            status_message = await status_channel.fetch_message(status_display_id)
+            
+            # Sammle alle Duty-Mitglieder mit ihren Details
+            duty_role = await self.cog.get_or_create_duty_role(guild)
+            role_id = await self.cog.config.guild(guild).role()
+            
+            available_list = []
+            busy_list = []
+            break_list = []
+            away_list = []
+            
+            if role_id and duty_role:
+                base_role = guild.get_role(role_id)
+                if base_role:
+                    for m in base_role.members:
+                        if duty_role in m.roles:
+                            is_duty = await self.cog.config.member(m).on_duty()
+                            if is_duty:
+                                status = await self.cog.config.member(m).duty_status()
+                                status_msg = await self.cog.config.member(m).duty_status_message()
+                                
+                                entry = f"• {m.display_name}"
+                                if status_msg:
+                                    entry += f"\n  └ _{status_msg}_"
+                                
+                                if status == "available":
+                                    available_list.append(entry)
+                                elif status == "busy":
+                                    busy_list.append(entry)
+                                elif status == "break":
+                                    break_list.append(entry)
+                                elif status == "away":
+                                    away_list.append(entry)
+            
+            # Erstelle detailliertes Embed
+            embed = discord.Embed(
+                title="📊 Live Duty Status Übersicht",
+                description="**Aktueller Status aller Teammitglieder im Dienst**",
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
+            )
+            
+            # Verfügbarkeit anzeigen
+            avail_text = "\n".join(available_list[:10]) if available_list else "Keine"
+            if len(available_list) > 10:
+                avail_text += f"\n_...und {len(available_list) - 10} weitere_"
+            embed.add_field(name="🟢 Verfügbar", value=avail_text, inline=True)
+            
+            busy_text = "\n".join(busy_list[:10]) if busy_list else "Keine"
+            if len(busy_list) > 10:
+                busy_text += f"\n_...und {len(busy_list) - 10} weitere_"
+            embed.add_field(name="🔵 Beschäftigt", value=busy_text, inline=True)
+            
+            break_text = "\n".join(break_list[:10]) if break_list else "Keine"
+            if len(break_list) > 10:
+                break_text += f"\n_...und {len(break_list) - 10} weitere_"
+            embed.add_field(name="☕ In Pause", value=break_text, inline=True)
+            
+            away_text = "\n".join(away_list[:10]) if away_list else "Keine"
+            if len(away_list) > 10:
+                away_text += f"\n_...und {len(away_list) - 10} weitere_"
+            embed.add_field(name="🟡 Abwesend", value=away_text, inline=False)
+            
+            # Gesamtstatistik
+            total = len(available_list) + len(busy_list) + len(break_list) + len(away_list)
+            embed.add_field(
+                name="📈 Statistik",
+                value=f"**{total}** im Duty | 🟢 {len(available_list)} frei | 🔵 {len(busy_list)} beschäftigt | ☕ {len(break_list)} Pause",
+                inline=False
+            )
+            
+            embed.set_footer(text=f"Zuletzt aktualisiert")
+            embed.timestamp = datetime.utcnow()
+            
+            await status_message.edit(embed=embed)
+        except Exception as e:
+            print(f"Fehler beim Aktualisieren des Status-Displays: {e}")
+
+
+class StatusSelectView(discord.ui.View):
+    """View zur Auswahl des Duty-Status"""
+    
+    def __init__(self, cog: SupportCog):
+        super().__init__(timeout=180)  # 3 Minuten Timeout
+        self.cog = cog
+    
+    @discord.ui.button(label="Verfügbar", style=discord.ButtonStyle.green, emoji="🟢")
+    async def set_available(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_status(interaction, "available", "Du bist jetzt verfügbar.")
+    
+    @discord.ui.button(label="Beschäftigt", style=discord.ButtonStyle.blurple, emoji="🔵")
+    async def set_busy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_status(interaction, "busy", "Du bist jetzt beschäftigt.")
+    
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="☕")
+    async def set_break(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.user
+        # Pausen-Startzeit speichern
+        await self.cog.config.member(member).current_break_start.set(datetime.utcnow().timestamp())
+        break_count = await self.cog.config.member(member).duty_break_count()
+        await self.cog.config.member(member).duty_break_count.set(break_count + 1)
+        await self._set_status(interaction, "break", "Du bist jetzt in Pause.")
+    
+    @discord.ui.button(label="Abwesend", style=discord.ButtonStyle.yellow, emoji="🟡")
+    async def set_away(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_status(interaction, "away", "Du bist jetzt abwesend.")
+    
+    async def _set_status(self, interaction: discord.Interaction, status: str, message: str):
+        member = interaction.user
+        await self.cog.config.member(member).duty_status.set(status)
+        
+        # Status-Display aktualisieren
+        guild = interaction.guild
+        duty_view = DutyButtonView(self.cog)
+        await duty_view.update_status_display(guild)
+        
+        await interaction.response.edit_message(content=f"✅ {message}", view=None)
 
     async def update_team_panel(self, channel: discord.TextChannel, guild: discord.Guild):
         """Erstellt oder aktualisiert das Team-Übersichts-Panel"""
