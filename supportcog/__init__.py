@@ -168,6 +168,15 @@ class SupportCog(commands.Cog):
         # Cache für aktive Duty-User (wird bei Bot-Start neu aufgebaut)
         self.duty_cache = {}
 
+    async def cog_load(self):
+        """Wird beim Laden des Cogs aufgerufen - registriert persistente Views"""
+        # Registere die persistent Views für Buttons
+        self.bot.add_view(DutyButtonView(self))
+        self.bot.add_view(WhitelistButtonView(self))
+        self.bot.add_view(FeedbackPanelView())  # Keine cog Referenz für persistente View
+        self.bot.add_view(SupportCallView(self))
+        self.bot.add_view(PersistentWhitelistGrantView(self))  # Persistente View für Whitelist-Rollenvergabe
+
     async def get_or_create_duty_role(self, guild: discord.Guild, whitelist: bool = False) -> Optional[discord.Role]:
         """Erstellt oder holt die automatische Duty-Rolle"""
         if whitelist:
@@ -673,7 +682,7 @@ class SupportCog(commands.Cog):
                 embed.set_footer(text="Support Warteraum System • On-Duty aktiv")
 
                 # Buttons für Duty-Mitglieder hinzufügen (User im Warteraum zu sich holen)
-                view = discord.ui.View()
+                view = discord.ui.View(timeout=None)  # Kein Timeout damit Buttons dauerhaft funktionieren
                 if duty_members:
                     # Button nur anzeigen wenn Duty-Mitglieder verfügbar sind
                     # Button ruft den User zum Teamler (nicht umgekehrt!)
@@ -797,7 +806,7 @@ class SupportCog(commands.Cog):
                 embed.set_footer(text="Whitelist Warteraum System • On-Duty aktiv")
 
                 # Buttons für Duty-Mitglieder hinzufügen (User im Warteraum zu sich holen)
-                view = discord.ui.View()
+                view = discord.ui.View(timeout=None)  # Kein Timeout damit Buttons dauerhaft funktionieren
                 if duty_members:
                     # Button nur anzeigen wenn Duty-Mitglieder verfügbar sind
                     # Button ruft den User zum Teamler (nicht umgekehrt!)
@@ -4231,20 +4240,10 @@ class SupportCallView(discord.ui.View):
 async def setup(bot: Red):
     """Lädt den Cog"""
     cog = SupportCog(bot)
-    # Registere die persistent Views für Buttons OHNE cog Referenz für FeedbackPanelView
-    bot.add_view(DutyButtonView(cog))
-    bot.add_view(WhitelistButtonView(cog))
-    bot.add_view(FeedbackPanelView())  # Keine cog Referenz für persistente View
-    bot.add_view(SupportCallView(cog))
-    bot.add_view(PersistentWhitelistGrantView(cog))  # Persistente View für Whitelist-Rollenvergabe
+    # Die persistent Views werden jetzt in cog_load() registriert
     await bot.add_cog(cog)
 
 
 async def teardown(bot: Red):
     """Entfernt den Cog"""
-    bot.remove_view(DutyButtonView)
-    bot.remove_view(WhitelistButtonView)
-    bot.remove_view(FeedbackPanelView)
-    bot.remove_view(SupportCallView)
-    bot.remove_view(PersistentWhitelistGrantView)
     await bot.remove_cog("SupportCog")
