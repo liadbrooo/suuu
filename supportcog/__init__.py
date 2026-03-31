@@ -2704,7 +2704,7 @@ class SupportCog(commands.Cog):
     # DUTY COMMANDS - Neue Textbefehle für Duty
     # ============================================
     
-    @commands.group(name="duty", aliases=["onduty"])
+    @commands.group(name="duty")
     @commands.guild_only()
     async def duty_group(self, ctx: commands.Context):
         """
@@ -3153,7 +3153,7 @@ class SupportCog(commands.Cog):
         
         await ctx.send("✅ Deine Status-Nachricht wurde gelöscht.")
 
-    @commands.command(name="dutylist", aliases=["onduty", "activestaff"])
+    @commands.command(name="dutylist", aliases=["activestaff"])
     async def dutylist(self, ctx: commands.Context):
         """
         Zeigt alle aktuell im Duty befindlichen Teammitglieder an.
@@ -3780,8 +3780,7 @@ class StatusSelectView(discord.ui.View):
         
         # Status-Display aktualisieren
         guild = interaction.guild
-        duty_view = DutyButtonView(self.cog)
-        await duty_view.update_status_display(guild)
+        await self.cog.update_status_display(guild)
         
         await interaction.response.edit_message(content=f"✅ {message}", view=None)
 
