@@ -2700,6 +2700,459 @@ class SupportCog(commands.Cog):
         
         await ctx.send(embed=embed)
 
+    # ============================================
+    # DUTY COMMANDS - Neue Textbefehle für Duty
+    # ============================================
+    
+    @commands.group(name="duty", aliases=["onduty"])
+    @commands.guild_only()
+    async def duty_group(self, ctx: commands.Context):
+        """
+        Duty-System Befehle für Support-Mitarbeiter.
+        
+        Verwende `[p]duty help` für eine Liste aller Unterbefehle.
+        """
+        pass
+    
+    @duty_group.command(name="start", aliases=["on", "begin"])
+    async def duty_start_command(self, ctx: commands.Context):
+        """
+        Startet deinen Duty-Dienst.
+        
+        Du wirst bei neuen Support-Anfragen gepingt.
+        """
+        guild = ctx.guild
+        member = ctx.author
+        
+        role_id = await self.config.guild(guild).role()
+        
+        if not role_id:
+            await ctx.send("❌ Es wurde keine Support-Rolle konfiguriert! Bitte wende dich an einen Admin.")
+            return
+        
+        base_role = guild.get_role(role_id)
+        if not base_role:
+            await ctx.send("❌ Die konfigurierte Support-Rolle existiert nicht mehr!")
+            return
+        
+        if base_role not in member.roles:
+            await ctx.send(f"❌ Du benötigst die {base_role.mention} Rolle um dich auf Duty setzen zu können!")
+            return
+        
+        # Prüfen ob bereits auf Duty
+        is_on_duty = await self.config.member(member).on_duty()
+        if is_on_duty:
+            status = await self.config.member(member).duty_status()
+            status_emoji = {"available": "🟢", "busy": "🔵", "break": "☕", "away": "⚪", "off_duty": "⚪"}.get(status, "🟢")
+            await ctx.send(f"⚠️ Du bist bereits im Duty-Modus! Status: {status_emoji}")
+            return
+        
+        # Duty aktivieren und Rolle geben
+        await self.config.member(member).on_duty.set(True)
+        start_time = datetime.utcnow()
+        await self.config.member(member).duty_start.set(start_time.timestamp())
+        
+        # Duty-Status auf "available" setzen
+        await self.config.member(member).duty_status.set("available")
+        await self.config.member(member).duty_status_message.set(None)
+        
+        # Session-Count erhöhen
+        current_sessions = await self.config.member(member).duty_session_count()
+        await self.config.member(member).duty_session_count.set(current_sessions + 1)
+        
+        # Pausen-Zähler zurücksetzen
+        await self.config.member(member).duty_break_count.set(0)
+        await self.config.member(member).duty_total_break_time.set(0)
+        
+        # Duty-Rolle hinzufügen
+        await self.update_duty_role(member, True)
+        
+        # Nachricht im Log-Channel senden
+        log_channel = await self.get_log_channel(guild)
+        
+        embed = discord.Embed(
+            title="🟢 Duty Gestartet",
+            description=f"{member.mention} hat sich für den Support-Dienst angemeldet!",
+            color=discord.Color.green(),
+            timestamp=start_time
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
+        
+        session_count = await self.config.member(member).duty_session_count()
+        embed.add_field(name="📊 Sessions", value=f"Session #{session_count}", inline=True)
+        
+        # Zähle alle aktiven Duty-User
+        duty_count = 0
+        duty_role = await self.get_or_create_duty_role(guild)
+        if duty_role:
+            for m in duty_role.members:
+                is_duty = await self.config.member(m).on_duty()
+                if is_duty:
+                    duty_count += 1
+        
+        embed.add_field(name="📊 Aktive Supporter", value=f"🟢 {duty_count} Teammitglieder im Dienst", inline=True)
+        embed.set_footer(text=f"Duty Start • {start_time.strftime('%d.%m.%Y %H:%M')}")
+        
+        if log_channel:
+            await log_channel.send(embed=embed)
+        
+        # Update Displays
+        await self.update_panel_display(guild)
+        await self.update_status_display(guild)
+        
+        await ctx.send("✅ Du bist jetzt im Duty-Modus! Du wirst bei neuen Support-Anfragen gepingt.")
+    
+    @duty_group.command(name="stop", aliases=["off", "end"])
+    async def duty_stop_command(self, ctx: commands.Context):
+        """
+        Beendet deinen Duty-Dienst.
+        
+        Deine gesammelte Zeit wird zur Statistik hinzugefügt.
+        """
+        member = ctx.author
+        is_on_duty = await self.config.member(member).on_duty()
+        
+        if not is_on_duty:
+            await ctx.send("ℹ️ Du bist aktuell nicht im Duty-Modus.")
+            return
+        
+        # Hole Startzeit für Statistik
+        start_time_ts = await self.config.member(member).duty_start()
+        duration = "Unbekannt"
+        duration_seconds = 0
+        if start_time_ts:
+            start_dt = datetime.fromtimestamp(start_time_ts)
+            delta = datetime.utcnow() - start_dt
+            hours = int(delta.total_seconds() // 3600)
+            minutes = int((delta.total_seconds() % 3600) // 60)
+            duration = f"{hours}h {minutes}min"
+            duration_seconds = int(delta.total_seconds())
+        
+        # Gesamte Duty-Zeit aktualisieren
+        total_time = await self.config.member(member).total_duty_time()
+        await self.config.member(member).total_duty_time.set(total_time + duration_seconds)
+        
+        # Duty deaktivieren
+        await self.config.member(member).on_duty.set(False)
+        await self.config.member(member).duty_start.set(None)
+        await self.config.member(member).last_duty_end.set(datetime.utcnow().timestamp())
+        await self.config.member(member).duty_status.set("off_duty")
+        await self.config.member(member).duty_status_message.set(None)
+        
+        # Duty-Rolle entfernen
+        await self.update_duty_role(member, False)
+        
+        # Nachricht im Log-Channel senden
+        guild = ctx.guild
+        log_channel = await self.get_log_channel(guild)
+        
+        embed = discord.Embed(
+            title="🔴 Duty Beendet",
+            description=f"{member.mention} hat sich vom Support-Dienst abgemeldet.",
+            color=discord.Color.red(),
+            timestamp=datetime.utcnow()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
+        embed.add_field(name="⏱️ Dauer", value=duration, inline=True)
+        
+        # Pausen-Info
+        break_count = await self.config.member(member).duty_break_count()
+        total_break_time = await self.config.member(member).duty_total_break_time()
+        break_minutes = total_break_time // 60
+        if break_count > 0:
+            embed.add_field(name="☕ Pausen", value=f"{break_count} Pausen ({break_minutes} min)", inline=True)
+        
+        # Zähle verbleibende aktive Duty-User
+        duty_count = 0
+        duty_role = await self.get_or_create_duty_role(guild)
+        if duty_role:
+            for m in duty_role.members:
+                is_duty = await self.config.member(m).on_duty()
+                if is_duty:
+                    duty_count += 1
+        
+        embed.add_field(name="📊 Verbleibende Supporter", value=f"🟢 {duty_count} Teammitglieder im Dienst", inline=True)
+        embed.set_footer(text=f"Duty Ende • {datetime.utcnow().strftime('%d.%m.%Y %H:%M')}")
+        
+        if log_channel:
+            await log_channel.send(embed=embed)
+        
+        # Update Displays
+        await self.update_panel_display(guild)
+        await self.update_status_display(guild)
+        
+        await ctx.send(f"✅ Du hast den Duty-Modus verlassen. Gesamte Zeit: {duration}")
+    
+    @duty_group.command(name="pause", aliases=["break", "coffee"])
+    async def duty_pause_command(self, ctx: commands.Context):
+        """
+        Setzt deinen Status auf Pause.
+        
+        Nützlich für kurze Pausen während des Duty.
+        """
+        member = ctx.author
+        is_on_duty = await self.config.member(member).on_duty()
+        
+        if not is_on_duty:
+            await ctx.send("❌ Du musst im Duty sein um eine Pause zu machen!")
+            return
+        
+        current_status = await self.config.member(member).duty_status()
+        if current_status == "break":
+            await ctx.send("☕ Du bist bereits in Pause!")
+            return
+        
+        # Pausen-Startzeit speichern
+        await self.config.member(member).current_break_start.set(datetime.utcnow().timestamp())
+        break_count = await self.config.member(member).duty_break_count()
+        await self.config.member(member).duty_break_count.set(break_count + 1)
+        
+        # Status setzen
+        await self.config.member(member).duty_status.set("break")
+        
+        # Status-Display aktualisieren
+        guild = ctx.guild
+        await self.update_status_display(guild)
+        
+        await ctx.send("☕ Du bist jetzt in Pause! Vergiss nicht `duty resume` zu verwenden wenn du zurückkommst.")
+    
+    @duty_group.command(name="resume", aliases=["continue", "back"])
+    async def duty_resume_command(self, ctx: commands.Context):
+        """
+        Setzt deinen Status von Pause zurück auf Verfügbar.
+        """
+        member = ctx.author
+        is_on_duty = await self.config.member(member).on_duty()
+        
+        if not is_on_duty:
+            await ctx.send("❌ Du bist nicht im Duty!")
+            return
+        
+        current_status = await self.config.member(member).duty_status()
+        if current_status != "break":
+            await ctx.send(f"ℹ️ Du bist nicht in Pause. Dein aktueller Status: {current_status}")
+            return
+        
+        # Pausenzeit berechnen und speichern
+        break_start = await self.config.member(member).current_break_start()
+        if break_start:
+            break_duration = int(datetime.utcnow().timestamp() - break_start)
+            total_break = await self.config.member(member).duty_total_break_time()
+            await self.config.member(member).duty_total_break_time.set(total_break + break_duration)
+            await self.config.member(member).current_break_start.set(None)
+        
+        # Status setzen
+        await self.config.member(member).duty_status.set("available")
+        
+        # Status-Display aktualisieren
+        guild = ctx.guild
+        await self.update_status_display(guild)
+        
+        await ctx.send("✅ Willkommen zurück! Du bist jetzt wieder verfügbar.")
+    
+    @duty_group.command(name="busy", aliases=["occupied"])
+    async def duty_busy_command(self, ctx: commands.Context):
+        """
+        Setzt deinen Status auf Beschäftigt.
+        
+        Zeigt an dass du gerade ein Ticket bearbeitest.
+        """
+        member = ctx.author
+        is_on_duty = await self.config.member(member).on_duty()
+        
+        if not is_on_duty:
+            await ctx.send("❌ Du musst im Duty sein um deinen Status zu ändern!")
+            return
+        
+        await self.config.member(member).duty_status.set("busy")
+        
+        # Status-Display aktualisieren
+        guild = ctx.guild
+        await self.update_status_display(guild)
+        
+        await ctx.send("🔵 Du bist jetzt als beschäftigt markiert.")
+    
+    @duty_group.command(name="away", aliases=["afk"])
+    async def duty_away_command(self, ctx: commands.Context):
+        """
+        Setzt deinen Status auf Abwesend.
+        """
+        member = ctx.author
+        is_on_duty = await self.config.member(member).on_duty()
+        
+        if not is_on_duty:
+            await ctx.send("❌ Du musst im Duty sein um deinen Status zu ändern!")
+            return
+        
+        await self.config.member(member).duty_status.set("away")
+        
+        # Status-Display aktualisieren
+        guild = ctx.guild
+        await self.update_status_display(guild)
+        
+        await ctx.send("⚪ Du bist jetzt als abwesend markiert.")
+    
+    @duty_group.command(name="status", aliases=["me", "current"])
+    async def duty_status_command(self, ctx: commands.Context):
+        """
+        Zeigt deinen aktuellen Duty-Status an.
+        """
+        member = ctx.author
+        is_on_duty = await self.config.member(member).on_duty()
+        
+        if not is_on_duty:
+            await ctx.send("ℹ️ Du bist aktuell nicht im Duty-Modus.")
+            return
+        
+        status = await self.config.member(member).duty_status()
+        status_message = await self.config.member(member).duty_status_message()
+        
+        status_emojis = {
+            "available": ("🟢", "Verfügbar"),
+            "busy": ("🔵", "Beschäftigt"),
+            "break": ("☕", "Pause"),
+            "away": ("⚪", "Abwesend"),
+            "off_duty": ("⚫", "Nicht im Duty")
+        }
+        
+        emoji, status_name = status_emojis.get(status, ("⚪", "Unbekannt"))
+        
+        # Berechne aktuelle Session-Zeit
+        start_time_ts = await self.config.member(member).duty_start()
+        session_time = "Unbekannt"
+        if start_time_ts:
+            start_dt = datetime.fromtimestamp(start_time_ts)
+            delta = datetime.utcnow() - start_dt
+            hours = int(delta.total_seconds() // 3600)
+            minutes = int((delta.total_seconds() % 3600) // 60)
+            session_time = f"{hours}h {minutes}m"
+        
+        embed = discord.Embed(
+            title=f"{emoji} Dein Duty-Status",
+            description=f"**Status:** {status_name}\n**Session-Zeit:** {session_time}",
+            color=discord.Color.green()
+        )
+        
+        if status_message:
+            embed.add_field(name="📝 Status-Nachricht", value=status_message, inline=False)
+        
+        # Pausen-Info
+        break_count = await self.config.member(member).duty_break_count()
+        total_break_time = await self.config.member(member).duty_total_break_time()
+        if break_count > 0:
+            break_minutes = total_break_time // 60
+            embed.add_field(name="☕ Pausen heute", value=f"{break_count} Pausen ({break_minutes} min)", inline=True)
+        
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"Duty Status • {member.display_name}")
+        
+        await ctx.send(embed=embed)
+    
+    @duty_group.command(name="today", aliases=["daily", "shift"])
+    async def duty_today_command(self, ctx: commands.Context, member: discord.Member = None):
+        """
+        Zeigt deine heutige Duty-Übersicht an.
+        
+        Optional kannst du auch einen anderen User angeben.
+        """
+        if not member:
+            member = ctx.author
+        
+        is_on_duty = await self.config.member(member).on_duty()
+        
+        # Hole Statistiken
+        total_duty_time = await self.config.member(member).total_duty_time()
+        session_count = await self.config.member(member).duty_session_count()
+        break_count = await self.config.member(member).duty_break_count()
+        total_break_time = await self.config.member(member).duty_total_break_time()
+        
+        # Konvertiere Zeiten
+        duty_hours = total_duty_time // 3600
+        duty_minutes = (total_duty_time % 3600) // 60
+        break_minutes = total_break_time // 60
+        
+        status = await self.config.member(member).duty_status()
+        status_emojis = {
+            "available": "🟢 Verfügbar",
+            "busy": "🔵 Beschäftigt",
+            "break": "☕ Pause",
+            "away": "⚪ Abwesend",
+            "off_duty": "⚫ Nicht im Duty"
+        }
+        status_text = status_emojis.get(status, "Unbekannt")
+        
+        embed = discord.Embed(
+            title=f"📊 Duty Übersicht für {member.display_name}",
+            description=f"**Aktueller Status:** {status_text}",
+            color=member.color
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        
+        embed.add_field(name="⏱️ Gesamtzeit", value=f"{duty_hours}h {duty_minutes}m", inline=True)
+        embed.add_field(name="🔄 Sessions", value=str(session_count), inline=True)
+        embed.add_field(name="☕ Pausen", value=f"{break_count} ({break_minutes} min)", inline=True)
+        
+        if is_on_duty:
+            start_time_ts = await self.config.member(member).duty_start()
+            if start_time_ts:
+                start_dt = datetime.fromtimestamp(start_time_ts)
+                embed.add_field(name="🕐 Session Start", value=start_dt.strftime("%d.%m.%Y %H:%M"), inline=True)
+        
+        embed.set_footer(text=f"Duty Today • {guild.name}")
+        
+        await ctx.send(embed=embed)
+    
+    @duty_group.command(name="setmessage", aliases=["msg", "statusmsg"])
+    async def duty_setmessage_command(self, ctx: commands.Context, *, message: str = None):
+        """
+        Setze eine benutzerdefinierte Status-Nachricht.
+        
+        Ohne Nachricht wird die aktuelle Nachricht gelöscht.
+        Beispiel: `[p]duty setmessage Bearbeite gerade Tickets`
+        """
+        member = ctx.author
+        is_on_duty = await self.config.member(member).on_duty()
+        
+        if not is_on_duty:
+            await ctx.send("❌ Du musst im Duty sein um eine Status-Nachricht zu setzen!")
+            return
+        
+        # Prüfen ob Feature aktiviert ist
+        guild = ctx.guild
+        allow_messages = await self.config.guild(guild).allow_status_messages()
+        
+        if message:
+            if not allow_messages:
+                await ctx.send("❌ Benutzerdefinierte Status-Nachrichten sind derzeit deaktiviert!")
+                return
+            
+            if len(message) > 100:
+                await ctx.send("❌ Die Nachricht darf maximal 100 Zeichen lang sein!")
+                return
+            
+            await self.config.member(member).duty_status_message.set(message)
+            await self.update_status_display(guild)
+            await ctx.send(f"✅ Deine Status-Nachricht wurde gesetzt: \"{message}\"")
+        else:
+            await self.config.member(member).duty_status_message.set(None)
+            await self.update_status_display(guild)
+            await ctx.send("✅ Deine Status-Nachricht wurde gelöscht.")
+    
+    @duty_group.command(name="clearmessage", aliases=["removemsg"])
+    async def duty_clearmessage_command(self, ctx: commands.Context):
+        """
+        Löscht deine benutzerdefinierte Status-Nachricht.
+        """
+        member = ctx.author
+        await self.config.member(member).duty_status_message.set(None)
+        
+        guild = ctx.guild
+        await self.update_status_display(guild)
+        
+        await ctx.send("✅ Deine Status-Nachricht wurde gelöscht.")
+
     @commands.command(name="dutylist", aliases=["onduty", "activestaff"])
     async def dutylist(self, ctx: commands.Context):
         """
@@ -3331,66 +3784,6 @@ class StatusSelectView(discord.ui.View):
         await duty_view.update_status_display(guild)
         
         await interaction.response.edit_message(content=f"✅ {message}", view=None)
-
-    async def update_team_panel(self, channel: discord.TextChannel, guild: discord.Guild):
-        """Erstellt oder aktualisiert das Team-Übersichts-Panel"""
-        try:
-            team_panel_message_id = await self.config.guild(guild).team_panel_message_id()
-            
-            # Hole alle Teammitglieder (Basisrolle)
-            role_id = await self.config.guild(guild).role()
-            duty_role = await self.get_or_create_duty_role(guild)
-            
-            team_members = []
-            on_duty_count = 0
-            off_duty_count = 0
-            
-            if role_id:
-                base_role = guild.get_role(role_id)
-                if base_role:
-                    for m in sorted(base_role.members, key=lambda x: x.display_name.lower()):
-                        is_duty = await self.config.member(m).on_duty()
-                        status_emoji = "🟢" if is_duty else "🔴"
-                        if is_duty:
-                            on_duty_count += 1
-                        else:
-                            off_duty_count += 1
-                        team_members.append(f"{status_emoji} {m.display_name}")
-            
-            # Erstelle Embed
-            embed = discord.Embed(
-                title="👥 Team Übersicht",
-                description="**Unser Support-Team**\n\nHier siehst du alle Teammitglieder und deren aktuellen Status.",
-                color=discord.Color.blue()
-            )
-            
-            if team_members:
-                embed.add_field(name=f"🟢 Im Dienst ({on_duty_count})", value=f"Insgesamt {len(team_members)} Teammitglieder", inline=False)
-                embed.add_field(name="📋 Teammitglieder", value="\n".join(team_members[:20]) + (f"\n...und {len(team_members) - 20} weitere" if len(team_members) > 20 else ""), inline=False)
-            else:
-                embed.add_field(name="Keine Teammitglieder", value="Es wurden noch keine Teammitglieder mit der Support-Basisrolle ausgestattet.", inline=False)
-            
-            embed.set_footer(text=f"On Duty: {on_duty_count} | Off Duty: {off_duty_count}")
-            
-            view = discord.ui.View()
-            # Button kann hier hinzugefügt werden falls gewünscht
-            
-            if team_panel_message_id:
-                # Existierende Nachricht aktualisieren
-                try:
-                    message = await channel.fetch_message(team_panel_message_id)
-                    await message.edit(embed=embed, view=view)
-                except discord.NotFound:
-                    # Nachricht nicht gefunden, neue erstellen
-                    message = await channel.send(embed=embed, view=view)
-                    await self.config.guild(guild).team_panel_message_id.set(message.id)
-            else:
-                # Neue Nachricht erstellen
-                message = await channel.send(embed=embed, view=view)
-                await self.config.guild(guild).team_panel_message_id.set(message.id)
-                
-        except Exception as e:
-            print(f"Fehler beim Aktualisieren des Team-Panels: {e}")
 
 
 class WhitelistButtonView(discord.ui.View):
