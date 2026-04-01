@@ -144,6 +144,11 @@ class SupportCog(commands.Cog):
             "whitelist_duty_timeout": 4,
             "whitelist_panel_message_id": None,
             "whitelist_always_allowed_role": None,  # Rolle die immer User holen darf (ohne Duty-Pflicht)
+            "whitelist_duty_grant_role": None,  # Rolle die berechtigt ist anderen die Whitelist-Duty-Rolle zu geben
+            
+            # SUPPORT CASE TRACKING
+            "active_support_cases": {},  # {message_id: {"user_id": user_id, "helper_id": helper_id, "timestamp": timestamp, "channel": channel_id}}
+            "active_whitelist_cases": {},  # {message_id: {"user_id": user_id, "helper_id": helper_id, "timestamp": timestamp, "channel": channel_id}}
             
             # TICKET SYSTEM
             "ticket_category": None,  # Kategorie für Tickets
@@ -1973,6 +1978,89 @@ class SupportCog(commands.Cog):
             await self.config.guild(ctx.guild).whitelist_auto_remove_duty.set(True)
             await self.config.guild(ctx.guild).whitelist_duty_timeout.set(hours)
             await ctx.send(f"✅ Whitelist-Duty wird automatisch nach {hours} Stunden beendet.")
+
+    @whitelistset.command(name="dutygrantrole")
+    async def whitelistset_dutygrantrole(self, ctx: commands.Context, role: str = None):
+        """
+        Setze die Rolle die berechtigt ist anderen Nutzern die Whitelist-Duty-Rolle zu geben.
+        
+        Dies ermöglicht es bestimmten Rollen (z.B. "Whitelist Admin"), anderen Nutzern
+        die Berechtigung zu geben, Whitelist-Duty zu machen, ohne dass sie selbst
+        die Whitelist-Handler-Rolle benötigen.
+        
+        Ohne Rollen-Angabe wird die Einstellung zurückgesetzt.
+        Unterstützt ID oder Mention.
+        """
+        if role is None or role.lower() == "reset":
+            await self.config.guild(ctx.guild).whitelist_duty_grant_role.set(None)
+            await ctx.send("✅ Whitelist-Duty-Grant-Rolle zurückgesetzt.")
+        else:
+            role_id = self._parse_role_id(role)
+            if role_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein!")
+                return
+            
+            r = ctx.guild.get_role(role_id)
+            if not r:
+                await ctx.send("❌ Rolle nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).whitelist_duty_grant_role.set(role_id)
+            await ctx.send(f"✅ {r.mention} kann jetzt anderen Nutzern die Whitelist-Duty-Berechtigung geben.")
+    
+    @commands.command(name="whitelistdutygrant", aliases=["wlgrantduty", "grantwhitelistduty"])
+    @commands.guild_only()
+    async def whitelistdutygrant(self, ctx: commands.Context, target_user: discord.Member):
+        """
+        Gib einem anderen Nutzer die Whitelist-Duty-Berechtigung.
+        
+        Dies setzt den Nutzer direkt auf Whitelist-Duty, auch wenn er keine
+        Whitelist-Handler-Rolle hat. Erfordert die konfigurierte Grant-Rolle.
+        """
+        guild = ctx.guild
+        author = ctx.author
+        
+        # Prüfe ob Autor die Grant-Rolle hat
+        grant_role_id = await self.config.guild(guild).whitelist_duty_grant_role()
+        has_grant_role = False
+        if grant_role_id:
+            grant_role = guild.get_role(grant_role_id)
+            if grant_role and grant_role in author.roles:
+                has_grant_role = True
+        
+        if not has_grant_role:
+            await ctx.send("❌ Du benötigst die Berechtigung um anderen Nutzern Whitelist-Duty zu geben!")
+            return
+        
+        # Prüfe ob Target bereits auf Duty ist
+        is_on_duty = await self.config.member(target_user).whitelist_on_duty()
+        if is_on_duty:
+            await ctx.send(f"ℹ️ {target_user.mention} ist bereits im Whitelist-Duty!")
+            return
+        
+        # Setze Target auf Duty
+        await self.config.member(target_user).whitelist_on_duty.set(True)
+        start_time = datetime.utcnow()
+        await self.config.member(target_user).whitelist_duty_start.set(start_time.timestamp())
+        
+        # Duty-Rolle hinzufügen
+        await self.update_duty_role(target_user, True, whitelist=True)
+        
+        # Log-Nachricht senden
+        log_channel = await self.get_whitelist_log_channel(guild)
+        if log_channel:
+            embed = discord.Embed(
+                title="🔵 Whitelist Duty zugewiesen",
+                description=f"{target_user.mention} wurde von {author.mention} auf Duty gesetzt!",
+                color=discord.Color.blue(),
+                timestamp=start_time
+            )
+            embed.set_thumbnail(url=target_user.display_avatar.url)
+            embed.add_field(name="👤 Zugewiesen von", value=f"{author.display_name}", inline=True)
+            embed.add_field(name="⏰ Automatische Abmeldung", value="Nach konfigurierter Zeit", inline=True)
+            await log_channel.send(embed=embed)
+        
+        await ctx.send(f"✅ {target_user.mention} ist jetzt im Whitelist-Duty!")
 
     @commands.command(name="whitelistinfo", aliases=["wlinfo"])
     async def whitelistinfo(self, ctx: commands.Context):
