@@ -153,6 +153,12 @@ class SupportCog(commands.Cog):
             "whitelist_always_allowed_role": None,  # Rolle die immer User holen darf (ohne Duty-Pflicht)
             "whitelist_duty_grant_role": None,  # Rolle die berechtigt ist anderen die Whitelist-Duty-Rolle zu geben
             
+            # NEUE WHITELIST FEATURES
+            "whitelist_welcome_message": None,  # Individuelle Willkommensnachricht nach Whitelist
+            "whitelist_cooldown_minutes": 5,  # Cooldown in Minuten für Whitelist desselben Users
+            "whitelist_notes": {},  # Notizen zu Usern: {user_id: [{\"author_id\": id, \"note\": text, \"timestamp\": ts}]}
+            "whitelist_temp_entries": {},  # Temporäre Whitelist-Einträge: {user_id: expiry_timestamp}
+            
             # SUPPORT CASE TRACKING
             "active_support_cases": {},  # {message_id: {"user_id": user_id, "helper_id": helper_id, "timestamp": timestamp, "channel": channel_id}}
             "active_whitelist_cases": {},  # {message_id: {"user_id": user_id, "helper_id": helper_id, "timestamp": timestamp, "channel": channel_id}}
@@ -2278,6 +2284,404 @@ class SupportCog(commands.Cog):
         embed.add_field(name="📄 Einträge-Channel", value=entries_channel_mention, inline=True)
         embed.set_footer(text=f"Whitelist-Info • {guild.name}")
 
+        await ctx.send(embed=embed)
+    
+    # ============================================
+    # NEUE WHITELIST FEATURES
+    # ============================================
+    
+    @whitelistset.command(name="welcomemessage")
+    async def whitelistset_welcomemessage(self, ctx: commands.Context, *, message: str = None):
+        """
+        Setzt eine individuelle Willkommensnachricht für ge-whitelistete Spieler.
+        
+        Verwendung: [p]whitelistset welcomemessage <Nachricht>
+        Verwende {user} für den Spielernamen und {helper} für den Helper-Namen.
+        Ohne Nachricht wird die Standardnachricht verwendet.
+        """
+        guild = ctx.guild
+        
+        if message is None:
+            await self.config.guild(guild).whitelist_welcome_message.set(None)
+            await ctx.send("✅ Die Willkommensnachricht wurde zurückgesetzt. Standardnachricht wird verwendet.")
+        else:
+            await self.config.guild(guild).whitelist_welcome_message.set(message)
+            await ctx.send(f"✅ Die Willkommensnachricht wurde gesetzt:\n\n*{message}*")
+    
+    @whitelistset.command(name="cooldown")
+    async def whitelistset_cooldown(self, ctx: commands.Context, minutes: int = None):
+        """
+        Setzt den Cooldown für das Whitelisting desselben Spielers.
+        
+        Verwendung: [p]whitelistset cooldown <Minuten>
+        Standard: 5 Minuten
+        Setze auf 0 um den Cooldown zu deaktivieren.
+        """
+        guild = ctx.guild
+        
+        if minutes is None:
+            current = await self.config.guild(guild).whitelist_cooldown_minutes()
+            await ctx.send(f"⏱️ Der aktuelle Cooldown beträgt **{current} Minuten**.")
+            return
+        
+        if minutes < 0:
+            await ctx.send("❌ Der Cooldown kann nicht negativ sein!")
+            return
+        
+        await self.config.guild(guild).whitelist_cooldown_minutes.set(minutes)
+        if minutes == 0:
+            await ctx.send("✅ Der Cooldown wurde deaktiviert.")
+        else:
+            await ctx.send(f"✅ Der Cooldown wurde auf **{minutes} Minuten** gesetzt.")
+    
+    @commands.command(name="wlstats", aliases=["whiteliststats"])
+    async def wlstats(self, ctx: commands.Context):
+        """
+        Zeigt Whitelist-Statistiken an.
+        """
+        guild = ctx.guild
+        approved_role = await self.get_whitelist_approved_role(guild)
+        
+        if not approved_role:
+            await ctx.send("❌ Es wurde keine Whitelist-Approved-Rolle konfiguriert!")
+            return
+        
+        total_whitelisted = len(approved_role.members)
+        
+        # Hole alle Duty-Zeiten der aktuellen Mitglieder
+        total_duty_time = 0
+        duty_count = 0
+        duty_role = await self.get_or_create_duty_role(guild, whitelist=True)
+        
+        if duty_role:
+            for member in duty_role.members:
+                is_duty = await self.config.member(member).whitelist_on_duty()
+                if is_duty:
+                    duty_count += 1
+                total_time = await self.config.member(member).total_whitelist_duty_time()
+                total_duty_time += total_time
+        
+        # Konvertiere zu Stunden
+        total_duty_hours = total_duty_time / 3600
+        
+        embed = discord.Embed(
+            title="📊 Whitelist Statistiken",
+            description=f"Statistiken für {guild.name}",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(name="👥 Whitelisted Spieler", value=f"**{total_whitelisted}**", inline=True)
+        embed.add_field(name="🔵 Aktive Handler", value=f"**{duty_count}**", inline=True)
+        embed.add_field(name="⏱️ Gesamte Duty-Zeit", value=f"**{total_duty_hours:.1f} Stunden**", inline=True)
+        
+        # Top 5 Handler nach Duty-Zeit
+        duty_times = []
+        if duty_role:
+            for member in duty_role.members:
+                total_time = await self.config.member(member).total_whitelist_duty_time()
+                if total_time > 0:
+                    duty_times.append((member, total_time))
+        
+        duty_times.sort(key=lambda x: x[1], reverse=True)
+        
+        if duty_times:
+            top_handlers = ""
+            for i, (member, time) in enumerate(duty_times[:5], 1):
+                hours = time / 3600
+                top_handlers += f"{i}. {member.display_name}: {hours:.1f}h\n"
+            embed.add_field(name="🏆 Top Handler", value=top_handlers, inline=False)
+        
+        embed.set_footer(text="Whitelist Stats • Aktualisiert")
+        await ctx.send(embed=embed)
+    
+    @commands.command(name="wlcheck", aliases=["checkwl", "whitelistcheck"])
+    async def wlcheck(self, ctx: commands.Context, user: discord.Member = None):
+        """
+        Überprüft den Whitelist-Status eines Spielers.
+        
+        Verwendung: [p]wlcheck [@User] oder [p]wlcheck <User-ID>
+        """
+        guild = ctx.guild
+        approved_role = await self.get_whitelist_approved_role(guild)
+        
+        if not approved_role:
+            await ctx.send("❌ Es wurde keine Whitelist-Approved-Rolle konfiguriert!")
+            return
+        
+        if user is None:
+            user = ctx.author
+        
+        is_whitelisted = approved_role in user.roles
+        
+        embed = discord.Embed(
+            title="🔍 Whitelist Status",
+            color=discord.Color.green() if is_whitelisted else discord.Color.red(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(name="👤 Spieler", value=f"{user.mention}\n*{user.display_name}*", inline=True)
+        embed.add_field(name="✅ Status", value="**Whitelisted** ✅" if is_whitelisted else "**Nicht whitelisted** ❌", inline=True)
+        
+        if is_whitelisted:
+            embed.add_field(name="🎮 Rolle", value=f"{approved_role.mention}", inline=True)
+        
+        # Prüfe auf temporäre Whitelist
+        temp_entries = await self.config.guild(guild).whitelist_temp_entries()
+        if str(user.id) in temp_entries:
+            expiry_ts = temp_entries[str(user.id)]
+            expiry_dt = datetime.fromtimestamp(expiry_ts)
+            if expiry_dt > datetime.utcnow():
+                remaining = expiry_dt - datetime.utcnow()
+                hours = remaining.total_seconds() / 3600
+                embed.add_field(name="⏳ Temporär", value=f"Läuft ab in **{hours:.1f} Stunden**", inline=False)
+            else:
+                # Abgelaufen - Rolle entfernen
+                if approved_role in user.roles:
+                    try:
+                        await user.remove_roles(approved_role, reason="Temporäre Whitelist abgelaufen")
+                    except:
+                        pass
+                temp_entries.pop(str(user.id))
+                await self.config.guild(guild).whitelist_temp_entries.set(temp_entries)
+                embed.add_field(name="⏳ Temporär", value="**Abgelaufen** (Rolle entfernt)", inline=False)
+        
+        # Zeige Notizen falls vorhanden
+        notes = await self.config.guild(guild).whitelist_notes()
+        if str(user.id) in notes and notes[str(user.id)]:
+            user_notes = notes[str(user.id)]
+            embed.add_field(name="📝 Notizen", value=f"**{len(user_notes)}** Notiz(en) vorhanden", inline=False)
+        
+        embed.set_footer(text=f"Geprüft von {ctx.author.display_name}")
+        await ctx.send(embed=embed)
+    
+    @commands.command(name="wlnote", aliases=["whitelistnote", "wlnotes"])
+    async def wlnote(self, ctx: commands.Context, user: discord.Member, *, note: str = None):
+        """
+        Fügt eine Notiz zu einem Spieler hinzu oder zeigt alle Notizen an.
+        
+        Verwendung: 
+        - [p]wlnote @User <Notiztext> - Fügt Notiz hinzu
+        - [p]wlnote @User - Zeigt alle Notizen
+        """
+        guild = ctx.guild
+        
+        # Berechtigung prüfen
+        role_id = await self.config.guild(guild).whitelist_role()
+        has_base_role = False
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and base_role in ctx.author.roles:
+                has_base_role = True
+        
+        is_on_duty = await self.config.member(ctx.author).whitelist_on_duty()
+        always_allowed_role_id = await self.config.guild(guild).whitelist_always_allowed_role()
+        always_allowed_role = guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
+        has_always_allowed = always_allowed_role and always_allowed_role in ctx.author.roles
+        
+        if not has_always_allowed and not has_base_role and not is_on_duty:
+            await ctx.send("❌ Du benötigst die Whitelist-Handler-Rolle, musst im Duty sein oder die 'Always Allowed' Rolle haben!")
+            return
+        
+        notes = await self.config.guild(guild).whitelist_notes()
+        user_id = str(user.id)
+        
+        if note is None:
+            # Zeige Notizen
+            if user_id not in notes or not notes[user_id]:
+                await ctx.send(f"📝 Keine Notizen zu {user.display_name} vorhanden.")
+                return
+            
+            user_notes = notes[user_id]
+            embed = discord.Embed(
+                title=f"📝 Notizen zu {user.display_name}",
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
+            )
+            
+            for i, entry in enumerate(user_notes[-10:], 1):  # Letzte 10 Notizen
+                author_id = entry.get("author_id")
+                author = guild.get_member(author_id)
+                author_name = author.display_name if author else "Unbekannt"
+                note_text = entry.get("note", "Kein Text")
+                ts = entry.get("timestamp", 0)
+                time_str = f"<t:{int(ts)}:R>" if ts else "Unbekannt"
+                
+                embed.add_field(
+                    name=f"Notiz #{i} von {author_name} ({time_str})",
+                    value=note_text[:1000],  # Begrenze Länge
+                    inline=False
+                )
+            
+            embed.set_footer(text=f"Zeige letzte {min(len(user_notes), 10)} von {len(user_notes)} Notiz(en)")
+            await ctx.send(embed=embed)
+        else:
+            # Füge Notiz hinzu
+            if user_id not in notes:
+                notes[user_id] = []
+            
+            new_note = {
+                "author_id": ctx.author.id,
+                "note": note,
+                "timestamp": datetime.utcnow().timestamp()
+            }
+            notes[user_id].append(new_note)
+            await self.config.guild(guild).whitelist_notes.set(notes)
+            
+            await ctx.send(f"✅ Notiz zu {user.display_name} hinzugefügt!")
+    
+    @commands.command(name="wltemp", aliases=["tempwl", "whitelisttemp", "temporarywhitelist"])
+    async def wltemp(self, ctx: commands.Context, user: discord.Member, duration: str):
+        """
+        Fügt einen Spieler temporär zur Whitelist hinzu.
+        
+        Verwendung: [p]wltemp @User <Stunden|Tage>
+        Beispiele:
+        - [p]wltemp @User 2h - 2 Stunden
+        - [p]wltemp @User 3d - 3 Tage
+        """
+        guild = ctx.guild
+        member = ctx.author
+        
+        # Berechtigung prüfen (gleiche wie bei !wl)
+        role_id = await self.config.guild(guild).whitelist_role()
+        has_base_role = False
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and base_role in member.roles:
+                has_base_role = True
+        
+        is_on_duty = await self.config.member(member).whitelist_on_duty()
+        always_allowed_role_id = await self.config.guild(guild).whitelist_always_allowed_role()
+        always_allowed_role = guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
+        has_always_allowed = always_allowed_role and always_allowed_role in member.roles
+        
+        if not has_always_allowed and not has_base_role and not is_on_duty:
+            await ctx.send("❌ Du benötigst die Whitelist-Handler-Rolle, musst im Duty sein oder die 'Always Allowed' Rolle haben!")
+            return
+        
+        approved_role = await self.get_whitelist_approved_role(guild)
+        if not approved_role:
+            await ctx.send("❌ Keine Whitelist-Approved-Rolle konfiguriert!")
+            return
+        
+        # Dauer parsen
+        duration = duration.lower().strip()
+        try:
+            if duration.endswith('h'):
+                hours = float(duration[:-1])
+                minutes = hours * 60
+            elif duration.endswith('d'):
+                days = float(duration[:-1])
+                hours = days * 24
+                minutes = hours * 60
+            elif duration.endswith('m'):
+                minutes = float(duration[:-1])
+                hours = minutes / 60
+            else:
+                # Versuche als Stunden zu interpretieren
+                hours = float(duration)
+                minutes = hours * 60
+        except ValueError:
+            await ctx.send("❌ Ungültiges Dauer-Format! Verwende z.B. `2h` für 2 Stunden oder `3d` für 3 Tage.")
+            return
+        
+        if hours <= 0:
+            await ctx.send("❌ Die Dauer muss größer als 0 sein!")
+            return
+        
+        # Prüfe ob bereits whitelisted
+        if approved_role in user.roles:
+            await ctx.send(f"ℹ️ {user.mention} hat bereits die Whitelist-Rolle!")
+            return
+        
+        # Berechne Ablaufzeit
+        expiry_dt = datetime.utcnow() + timedelta(minutes=minutes)
+        expiry_ts = expiry_dt.timestamp()
+        
+        # Füge Rolle hinzu
+        try:
+            await user.add_roles(approved_role, reason=f"Temporäre Whitelist ({hours:.1f}h) von {member.display_name}")
+            
+            # Speichere temporären Eintrag
+            temp_entries = await self.config.guild(guild).whitelist_temp_entries()
+            temp_entries[str(user.id)] = expiry_ts
+            await self.config.guild(guild).whitelist_temp_entries.set(temp_entries)
+            
+            embed_success = discord.Embed(
+                title="⏳ Temporäre Whitelist",
+                description=f"{user.mention} wurde temporär zur Whitelist hinzugefügt!",
+                color=discord.Color.gold(),
+                timestamp=datetime.utcnow()
+            )
+            embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention}", inline=True)
+            embed_success.add_field(name="⏰ Dauer", value=f"{hours:.1f} Stunden", inline=True)
+            embed_success.add_field(name="⏳ Läuft ab", value=f"<t:{int(expiry_ts)}:R>", inline=True)
+            
+            await ctx.send(embed=embed_success)
+            
+            # Logge die Aktion
+            entries_channel = await self.get_whitelist_entries_channel(guild)
+            if entries_channel:
+                log_embed = discord.Embed(
+                    title="⏳ Temporärer Whitelist Eintrag",
+                    description=f"**{user.mention}** wurde temporär whitelisted.",
+                    color=discord.Color.gold(),
+                    timestamp=datetime.utcnow()
+                )
+                log_embed.set_thumbnail(url=user.display_avatar.url)
+                log_embed.add_field(name="🔹 Von", value=f"{member.mention}", inline=True)
+                log_embed.add_field(name="🔹 Dauer", value=f"{hours:.1f} Stunden", inline=True)
+                log_embed.add_field(name="🔹 Ablauf", value=f"<t:{int(expiry_ts)}:F>", inline=True)
+                log_embed.set_footer(text="Temporärer Whitelist-Eintrag")
+                await entries_channel.send(embed=log_embed)
+            
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung um diese Rolle zuzuweisen!")
+        except Exception as e:
+            await ctx.send(f"❌ Fehler: `{str(e)}`")
+    
+    @commands.command(name="wllog", aliases=["whitelistlog"])
+    async def wllog(self, ctx: commands.Context, limit: int = 10):
+        """
+        Zeigt die letzten Whitelist-Aktionen an.
+        
+        Verwendung: [p]wllog [Anzahl, Standard: 10]
+        """
+        guild = ctx.guild
+        entries_channel = await self.get_whitelist_entries_channel(guild)
+        
+        if not entries_channel:
+            await ctx.send("❌ Kein Whitelist-Einträge-Channel konfiguriert!")
+            return
+        
+        # Hole letzte Nachrichten
+        messages = []
+        async for msg in entries_channel.history(limit=min(limit, 100)):
+            if msg.embeds:
+                messages.append(msg)
+        
+        if not messages:
+            await ctx.send("📭 Keine Whitelist-Einträge gefunden.")
+            return
+        
+        embed = discord.Embed(
+            title="📋 Letzte Whitelist-Aktionen",
+            description=f"Zeige die letzten {len(messages)} Einträge",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        for i, msg in enumerate(messages[:10], 1):  # Max 10 anzeigen
+            embed_desc = msg.embeds[0].description if msg.embeds[0].description else "Keine Beschreibung"
+            embed.add_field(
+                name=f"#{i} - {msg.created_at.strftime('%d.%m %H:%M')}",
+                value=embed_desc[:200],  # Begrenze Länge
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Quelle: {entries_channel.name}")
         await ctx.send(embed=embed)
     
     @commands.command(name="whitelistuser", aliases=["wluser", "addwhitelist", "wl"])
