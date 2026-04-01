@@ -1460,14 +1460,19 @@ class SupportCog(commands.Cog):
         
         # Prüfe ob Autor die Grant-Rolle hat
         grant_role_id = await self.config.guild(guild).support_duty_grant_role()
+        
+        if not grant_role_id:
+            await ctx.send("❌ Es wurde keine Support-Duty-Grant-Rolle konfiguriert! Nutze `[p]supportset dutygrantrole <Rolle>` um sie festzulegen.")
+            return
+        
         has_grant_role = False
-        if grant_role_id:
-            grant_role = guild.get_role(grant_role_id)
-            if grant_role and grant_role in author.roles:
-                has_grant_role = True
+        grant_role = guild.get_role(grant_role_id)
+        if grant_role and grant_role in author.roles:
+            has_grant_role = True
         
         if not has_grant_role:
-            await ctx.send("❌ Du benötigst die Berechtigung um anderen Nutzern Support-Duty zu geben!")
+            missing_role_msg = f"❌ Du benötigst die {grant_role.mention if grant_role else 'konfigurierte'} Rolle um anderen Nutzern Support-Duty zu geben!"
+            await ctx.send(missing_role_msg)
             return
         
         # Prüfe ob Target bereits auf Duty ist
@@ -1496,7 +1501,10 @@ class SupportCog(commands.Cog):
             embed.set_thumbnail(url=target_user.display_avatar.url)
             embed.add_field(name="👤 Zugewiesen von", value=f"{author.display_name}", inline=True)
             embed.add_field(name="⏰ Automatische Abmeldung", value="Nach konfigurierter Zeit", inline=True)
-            await log_channel.send(embed=embed)
+            try:
+                await log_channel.send(embed=embed)
+            except discord.Forbidden:
+                pass
         
         await ctx.send(f"✅ {target_user.mention} ist jetzt im Support-Duty!")
 
@@ -2115,14 +2123,19 @@ class SupportCog(commands.Cog):
         
         # Prüfe ob Autor die Grant-Rolle hat
         grant_role_id = await self.config.guild(guild).whitelist_duty_grant_role()
+        
+        if not grant_role_id:
+            await ctx.send("❌ Es wurde keine Whitelist-Duty-Grant-Rolle konfiguriert! Nutze `[p]whitelistset dutygrantrole <Rolle>` um sie festzulegen.")
+            return
+        
         has_grant_role = False
-        if grant_role_id:
-            grant_role = guild.get_role(grant_role_id)
-            if grant_role and grant_role in author.roles:
-                has_grant_role = True
+        grant_role = guild.get_role(grant_role_id)
+        if grant_role and grant_role in author.roles:
+            has_grant_role = True
         
         if not has_grant_role:
-            await ctx.send("❌ Du benötigst die Berechtigung um anderen Nutzern Whitelist-Duty zu geben!")
+            missing_role_msg = f"❌ Du benötigst die {grant_role.mention if grant_role else 'konfigurierte'} Rolle um anderen Nutzern Whitelist-Duty zu geben!"
+            await ctx.send(missing_role_msg)
             return
         
         # Prüfe ob Target bereits auf Duty ist
@@ -2151,7 +2164,10 @@ class SupportCog(commands.Cog):
             embed.set_thumbnail(url=target_user.display_avatar.url)
             embed.add_field(name="👤 Zugewiesen von", value=f"{author.display_name}", inline=True)
             embed.add_field(name="⏰ Automatische Abmeldung", value="Nach konfigurierter Zeit", inline=True)
-            await log_channel.send(embed=embed)
+            try:
+                await log_channel.send(embed=embed)
+            except discord.Forbidden:
+                pass
         
         await ctx.send(f"✅ {target_user.mention} ist jetzt im Whitelist-Duty!")
 
