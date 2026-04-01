@@ -867,13 +867,13 @@ class SupportCog(commands.Cog):
 
                 # Buttons für Duty-Mitglieder hinzufügen (User im Warteraum zu sich holen)
                 view = discord.ui.View(timeout=None)  # Kein Timeout damit Buttons dauerhaft funktionieren
-                if duty_members:
-                    # Button nur anzeigen wenn Duty-Mitglieder verfügbar sind
-                    # Button ruft den User zum Teamler (nicht umgekehrt!)
-                    button = discord.ui.Button(label="User zu mir holen", style=discord.ButtonStyle.green, emoji="📋", custom_id=f"fetch_whitelist_user_{member.id}")
-                    callback = self.create_fetch_user_callback(member, after.channel, whitelist=True)
-                    button.callback = callback
-                    view.add_item(button)
+                
+                # Button immer anzeigen - die Berechtigung wird im Callback geprüft!
+                # Button ruft den User zum Teamler (nicht umgekehrt!)
+                button = discord.ui.Button(label="User zu mir holen", style=discord.ButtonStyle.green, emoji="📋", custom_id=f"fetch_whitelist_user_{member.id}")
+                callback = self.create_fetch_user_callback(member, after.channel, whitelist=True)
+                button.callback = callback
+                view.add_item(button)
 
                 # "Whitelist freischalten" Button hinzufügen wenn Rolle konfiguriert ist
                 grant_role_id = await self.config.guild(guild).whitelist_grant_role()
