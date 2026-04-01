@@ -3060,6 +3060,7 @@ class SupportCog(commands.Cog):
         if not member:
             member = ctx.author
         
+        guild = ctx.guild
         is_on_duty = await self.config.member(member).on_duty()
         
         # Hole Statistiken
@@ -3100,7 +3101,7 @@ class SupportCog(commands.Cog):
                 start_dt = datetime.fromtimestamp(start_time_ts)
                 embed.add_field(name="🕐 Session Start", value=start_dt.strftime("%d.%m.%Y %H:%M"), inline=True)
         
-        embed.set_footer(text=f"Duty Today • {guild.name}")
+        embed.set_footer(text=f"Duty Today • {ctx.guild.name}")
         
         await ctx.send(embed=embed)
     
@@ -4588,13 +4589,13 @@ class WhitelistGrantRoleModal(discord.ui.Modal):
             # Benachrichtige den Spieler
             try:
                 dm_embed = discord.Embed(
-                    title="✅ Whitelist-Rolle erhalten",
-                    description=f"Du wurdest von **{interaction.user.display_name}** die Whitelist-Rolle zugewiesen!",
+                    title="🎉 Herzlichen Glückwunsch!",
+                    description=f"Du wurdest von **{interaction.user.display_name}** zur Whitelist hinzugefügt!",
                     color=discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
                 dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{self.grant_role.name}**", inline=False)
-                dm_embed.add_field(name="📝 Hinweis", value="Deine Whitelist wurde aktiviert.", inline=False)
+                dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
                 dm_embed.set_footer(text=f"{self.guild.name} Whitelist System")
                 await target_user.send(embed=dm_embed)
             except discord.Forbidden:
@@ -4694,13 +4695,13 @@ class GrantWhitelistButton(discord.ui.Button):
             # Benachrichtige den Spieler
             try:
                 dm_embed = discord.Embed(
-                    title="✅ Whitelist-Rolle erhalten",
-                    description=f"Du wurdest von **{interaction.user.display_name}** die Whitelist-Rolle zugewiesen!",
+                    title="🎉 Herzlichen Glückwunsch!",
+                    description=f"Du wurdest von **{interaction.user.display_name}** zur Whitelist hinzugefügt!",
                     color=discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
                 dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{grant_role.name}**", inline=False)
-                dm_embed.add_field(name="📝 Hinweis", value="Deine Whitelist wurde aktiviert.", inline=False)
+                dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
                 dm_embed.set_footer(text=f"{self.guild.name} Whitelist System")
                 await target_user.send(embed=dm_embed)
             except discord.Forbidden:
