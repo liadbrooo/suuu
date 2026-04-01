@@ -2642,7 +2642,7 @@ class SupportCog(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Fehler: `{str(e)}`")
     
-    @commands.command(name="wllog", aliases=["whitelistlog"])
+    @commands.command(name="wllog", aliases=["whitelistlogs"])
     async def wllog(self, ctx: commands.Context, limit: int = 10):
         """
         Zeigt die letzten Whitelist-Aktionen an.
@@ -2994,8 +2994,8 @@ class SupportCog(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Fehler beim Durchsuchen der Logs: `{str(e)}`")
     
-    @commands.command(name="whitelistlog", aliases=["whitelistlogs"])
-    async def whitelistlog(self, ctx: commands.Context, limit: int = 10):
+    @commands.command(name="whitelistlogfull", aliases=["whitelistlogs", "fullwllog"])
+    async def whitelistlogfull(self, ctx: commands.Context, limit: int = 10):
         """
         Zeigt die letzten Whitelist-Einträge an.
         
