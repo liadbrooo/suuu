@@ -2334,7 +2334,7 @@ class SupportCog(commands.Cog):
         else:
             await ctx.send(f"✅ Der Cooldown wurde auf **{minutes} Minuten** gesetzt.")
     
-    @commands.command(name="wlstats", aliases=["whiteliststats"])
+    @commands.command(name="wlstats", aliases=["whitelist_statistics"])
     async def wlstats(self, ctx: commands.Context):
         """
         Zeigt Whitelist-Statistiken an.
@@ -2395,7 +2395,7 @@ class SupportCog(commands.Cog):
         embed.set_footer(text="Whitelist Stats • Aktualisiert")
         await ctx.send(embed=embed)
     
-    @commands.command(name="wlcheck", aliases=["checkwl", "whitelistcheck"])
+    @commands.command(name="wlcheck", aliases=["checkwl_user", "whitelist_check"])
     async def wlcheck(self, ctx: commands.Context, user: discord.Member = None):
         """
         Überprüft den Whitelist-Status eines Spielers.
@@ -2456,7 +2456,7 @@ class SupportCog(commands.Cog):
         embed.set_footer(text=f"Geprüft von {ctx.author.display_name}")
         await ctx.send(embed=embed)
     
-    @commands.command(name="wlnote", aliases=["whitelistnote", "wlnotes"])
+    @commands.command(name="wlnote", aliases=["whitelist_note", "wl_notes"])
     async def wlnote(self, ctx: commands.Context, user: discord.Member, *, note: str = None):
         """
         Fügt eine Notiz zu einem Spieler hinzu oder zeigt alle Notizen an.
@@ -2531,7 +2531,7 @@ class SupportCog(commands.Cog):
             
             await ctx.send(f"✅ Notiz zu {user.display_name} hinzugefügt!")
     
-    @commands.command(name="wltemp", aliases=["tempwl", "whitelisttemp", "temporarywhitelist"])
+    @commands.command(name="wltemp", aliases=["tempwl_user", "whitelist_temp"])
     async def wltemp(self, ctx: commands.Context, user: discord.Member, duration: str):
         """
         Fügt einen Spieler temporär zur Whitelist hinzu.
@@ -2642,7 +2642,7 @@ class SupportCog(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Fehler: `{str(e)}`")
     
-    @commands.command(name="wllog", aliases=["whitelistlogs"])
+    @commands.command(name="wllog", aliases=["whitelist_logs"])
     async def wllog(self, ctx: commands.Context, limit: int = 10):
         """
         Zeigt die letzten Whitelist-Aktionen an.
@@ -2994,7 +2994,7 @@ class SupportCog(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Fehler beim Durchsuchen der Logs: `{str(e)}`")
     
-    @commands.command(name="whitelistlogfull", aliases=["whitelistlogs", "fullwllog"])
+    @commands.command(name="whitelistlogfull", aliases=["fullwllog", "detailed_wllog"])
     async def whitelistlogfull(self, ctx: commands.Context, limit: int = 10):
         """
         Zeigt die letzten Whitelist-Einträge an.
