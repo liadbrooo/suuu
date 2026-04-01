@@ -2531,6 +2531,97 @@ class SupportCog(commands.Cog):
             
             await ctx.send(f"✅ Notiz zu {user.display_name} hinzugefügt!")
     
+    @commands.command(name="wldelnote", aliases=["whitelist_delnote", "wl_removenote", "delwlnote"])
+    async def wldelnote(self, ctx: commands.Context, user: discord.Member, note_index: int = None):
+        """
+        Entfernt eine oder alle Notizen zu einem Spieler.
+        
+        Verwendung: 
+        - [p]wldelnote @User <Nummer> - Entfernt spezifische Notiz (z.B. 1, 2, 3)
+        - [p]wldelnote @User all - Entfernt ALLE Notizen zu diesem User
+        - [p]wldelnote @User - Zeigt verfügbare Notizen zur Auswahl
+        """
+        guild = ctx.guild
+        
+        # Berechtigung prüfen
+        role_id = await self.config.guild(guild).whitelist_role()
+        has_base_role = False
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role and base_role in ctx.author.roles:
+                has_base_role = True
+        
+        is_on_duty = await self.config.member(ctx.author).whitelist_on_duty()
+        always_allowed_role_id = await self.config.guild(guild).whitelist_always_allowed_role()
+        always_allowed_role = guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
+        has_always_allowed = always_allowed_role and always_allowed_role in ctx.author.roles
+        
+        if not has_always_allowed and not has_base_role and not is_on_duty:
+            await ctx.send("❌ Du benötigst die Whitelist-Handler-Rolle, musst im Duty sein oder die 'Always Allowed' Rolle haben!")
+            return
+        
+        notes = await self.config.guild(guild).whitelist_notes()
+        user_id = str(user.id)
+        
+        if user_id not in notes or not notes[user_id]:
+            await ctx.send(f"📝 Keine Notizen zu {user.display_name} vorhanden.")
+            return
+        
+        user_notes = notes[user_id]
+        
+        # Wenn keine Index angegeben, zeige verfügbare Notizen
+        if note_index is None:
+            embed = discord.Embed(
+                title=f"📝 Verfügbare Notizen zu {user.display_name}",
+                color=discord.Color.orange(),
+                timestamp=datetime.utcnow()
+            )
+            
+            for i, entry in enumerate(user_notes, 1):
+                author_id = entry.get("author_id")
+                author = guild.get_member(author_id)
+                author_name = author.display_name if author else "Unbekannt"
+                note_text = entry.get("note", "Kein Text")[:50] + "..." if len(entry.get("note", "")) > 50 else entry.get("note", "Kein Text")
+                ts = entry.get("timestamp", 0)
+                time_str = f"<t:{int(ts)}:R>" if ts else "Unbekannt"
+                
+                embed.add_field(
+                    name=f"#{i} von {author_name} ({time_str})",
+                    value=note_text,
+                    inline=False
+                )
+            
+            embed.set_footer(text=f"Verwende [p]wldelnote @User <Nummer> zum Löschen oder 'all' für alle")
+            await ctx.send(embed=embed)
+            return
+        
+        # Prüfen ob "all" eingegeben wurde
+        if isinstance(note_index, str) and note_index.lower() == "all":
+            # Alle Notizen löschen
+            del notes[user_id]
+            await self.config.guild(guild).whitelist_notes.set(notes)
+            await ctx.send(f"🗑️ Alle **{len(user_notes)}** Notiz(en) zu {user.display_name} wurden gelöscht!")
+            return
+        
+        # Spezifische Notiz löschen (1-basiert)
+        if note_index < 1 or note_index > len(user_notes):
+            await ctx.send(f"❌ Ungültige Nummer! Verfügbare Nummern: 1-{len(user_notes)}")
+            return
+        
+        deleted_note = user_notes.pop(note_index - 1)
+        
+        # Wenn keine Notizen mehr übrig, Eintrag entfernen
+        if not user_notes:
+            del notes[user_id]
+        
+        await self.config.guild(guild).whitelist_notes.set(notes)
+        
+        author_id = deleted_note.get("author_id")
+        author = guild.get_member(author_id)
+        author_name = author.display_name if author else "Unbekannt"
+        
+        await ctx.send(f"🗑️ Notiz #{note_index} von {author_name} wurde gelöscht!\nInhalt: `{deleted_note.get('note', 'Kein Text')[:100]}`")
+    
     @commands.command(name="wltemp", aliases=["tempwl_user", "whitelist_temp"])
     async def wltemp(self, ctx: commands.Context, user: discord.Member, duration: str):
         """
