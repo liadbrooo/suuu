@@ -2115,16 +2115,17 @@ class SupportCog(commands.Cog):
         """
         Gib einem anderen Nutzer die Berechtigung für Whitelist-Aktionen.
 
-        Dies gibt dem Nutzer die Berechtigung, den "Whitelist freischalten" Button 
-        und den !wl Befehl zu nutzen, OHNE ihn dauerhaft in den Duty-Modus zu versetzen.
-        Erfordert die konfigurierte Grant-Rolle.
+        Dies gibt dem Nutzer die whitelist_duty_grant_role, welche ihn berechtigt:
+        - Den "Whitelist freischalten" Button zu nutzen
+        - Den !wl Befehl zu verwenden
         
-        Der Nutzer muss NICHT im Duty sein - er erhält eine temporäre Berechtigung.
+        Der Nutzer wird NICHT in den Duty-Modus versetzt! Er erhält nur die Berechtigungsrolle.
+        Erfordert die konfigurierte Grant-Rolle (via !whitelistset dutygrantrole eingestellt).
         """
         guild = ctx.guild
         author = ctx.author
 
-        # Prüfe ob Autor die Grant-Rolle hat
+        # Prüfe ob Autor die Grant-Rolle hat (die Rolle die via !whitelistset dutygrantrole eingestellt wurde)
         grant_role_id = await self.config.guild(guild).whitelist_duty_grant_role()
 
         if not grant_role_id:
@@ -2149,29 +2150,57 @@ class SupportCog(commands.Cog):
             await ctx.send(f"ℹ️ {target_user.mention} hat bereits die 'Always Allowed' Rolle und kann immer Whitelist-Aktionen durchführen!")
             return
 
-        # Setze NICHT auf Duty - gib nur die Information dass der Nutzer jetzt berechtigt ist
-        # Die eigentliche Prüfung erfolgt bei Button/Befehl-Nutzung via Grant-Rolle oder Always-Allowed
-        # Hier markieren wir den User einfach als "berechtigt" durch eine Notiz
+        # Prüfe ob Target bereits die Grant-Rolle hat
+        if grant_role and grant_role in target_user.roles:
+            await ctx.send(f"ℹ️ {target_user.mention} hat bereits die Whitelist-Berechtigungsrolle!")
+            return
+
+        # Gib dem Target die whitelist_duty_grant_role (das ist die Rolle die bei !whitelistset role eingestellt wurde!)
+        # NEIN - warte! Die whitelist_duty_grant_role ist die Rolle die der Author braucht um DEN BEFEHL auszuführen
+        # Die Rolle die der TARGET bekommt ist EINE SEPARATE ROLE - nennen wir sie "whitelist_handler_temp_role"
+        # ABER laut Anforderung: "die rolle die ich bei !whitelistdutygrant einstelle soll die berechtigung haben leuten die rolle zu geben"
+        # Also: 
+        # - !whitelistset dutygrantrole setzt die rolle die DEN BEFEHL ausführen darf
+        # - !whitelistset role setzt die rolle die für den duty modus notwendig ist (die gepingt wird)
+        # - !whitelistdutygrant gibt dem target die rolle (!whitelistset role) - also die whitelist handler role
         
+        # Hole die Rolle die via !whitelistset role eingestellt wurde (das ist die Basis-Whitelist-Handler-Rolle)
+        whitelist_handler_role_id = await self.config.guild(guild).whitelist_role()
+        if not whitelist_handler_role_id:
+            await ctx.send("❌ Es wurde keine Whitelist-Handler-Rolle konfiguriert! Nutze `[p]whitelistset role <Rolle>`")
+            return
+        
+        whitelist_handler_role = guild.get_role(whitelist_handler_role_id)
+        if not whitelist_handler_role:
+            await ctx.send("❌ Die konfigurierte Whitelist-Handler-Rolle existiert nicht mehr!")
+            return
+
+        # Gib dem Target die Whitelist-Handler-Rolle (das ermöglicht Button & !wl Nutzung)
+        try:
+            await target_user.add_roles(whitelist_handler_role, reason=f"Whitelist-Berechtigung von {author.display_name} via !whitelistdutygrant")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung diese Rolle zu vergeben!")
+            return
+
         # Log-Nachricht senden
         log_channel = await self.get_whitelist_log_channel(guild)
         start_time = datetime.utcnow()
         if log_channel:
             embed = discord.Embed(
                 title="🔵 Whitelist-Berechtigung zugewiesen",
-                description=f"{target_user.mention} kann jetzt Whitelist-Aktionen durchführen (Button & !wl)!",
+                description=f"{target_user.mention} hat die {whitelist_handler_role.mention} erhalten und kann jetzt Whitelist-Aktionen durchführen!",
                 color=discord.Color.blue(),
                 timestamp=start_time
             )
             embed.set_thumbnail(url=target_user.display_avatar.url)
             embed.add_field(name="👤 Zugewiesen von", value=f"{author.display_name}", inline=True)
-            embed.add_field(name="⚠️ Hinweis", value="Diese Berechtigung gilt solange bis sie entzogen wird.", inline=True)
+            embed.add_field(name="⚠️ Hinweis", value="Diese Rolle gilt solange bis sie entzogen wird.", inline=True)
             try:
                 await log_channel.send(embed=embed)
             except discord.Forbidden:
                 pass
 
-        await ctx.send(f"✅ {target_user.mention} kann jetzt Whitelist-Aktionen durchführen (Button & !wl)!")
+        await ctx.send(f"✅ {target_user.mention} hat die {whitelist_handler_role.mention} erhalten und kann jetzt den Button & !wl nutzen!")
 
     @commands.command(name="whitelistinfo", aliases=["wlinfo"])
     async def whitelistinfo(self, ctx: commands.Context):
@@ -2265,7 +2294,8 @@ class SupportCog(commands.Cog):
         guild = ctx.guild
         member = ctx.author
         
-        # Prüfe Berechtigung: Whitelist-Handler-Rolle ODER im Duty ODER Always-Allowed ODER Duty-Grant-Rolle
+        # Prüfe Berechtigung: Whitelist-Handler-Rolle ODER im Whitelist-Duty ODER Always-Allowed
+        # WICHTIG: Duty-Grant-Rolle berechtigt NICHT zum Ausführen von !wl - nur zum Vergeben der Handler-Rolle via !whitelistdutygrant
         role_id = await self.config.guild(guild).whitelist_role()
         has_base_role = False
         if role_id:
@@ -2275,18 +2305,16 @@ class SupportCog(commands.Cog):
 
         is_on_duty = await self.config.member(member).whitelist_on_duty()
         
-        # Prüfe auf Always-Allowed Rolle
+        # Prüfe auf Always-Allowed Rolle (die können IMMER ohne Duty)
         always_allowed_role_id = await self.config.guild(guild).whitelist_always_allowed_role()
         always_allowed_role = guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
         has_always_allowed = always_allowed_role and always_allowed_role in member.roles
-        
-        # Prüfe auf Duty-Grant-Rolle (die berechtigt andere auf Duty zu setzen)
-        duty_grant_role_id = await self.config.guild(guild).whitelist_duty_grant_role()
-        duty_grant_role = guild.get_role(duty_grant_role_id) if duty_grant_role_id else None
-        has_duty_grant = duty_grant_role and duty_grant_role in member.roles
 
-        if not has_base_role and not is_on_duty and not has_always_allowed and not has_duty_grant:
-            error_msg = "❌ Du benötigst die Whitelist-Handler-Rolle, musst im Whitelist-Duty sein, "                       "die 'Always Allowed' Rolle haben oder die Duty-Grant-Berechtigung besitzen!"
+        # Nutzer mit Always-Allowed Rolle brauchen NICHT im Duty zu sein und können IMMER !wl nutzen
+        if has_always_allowed:
+            pass  # Immer erlaubt, keine weitere Prüfung nötig
+        elif not has_base_role and not is_on_duty:
+            error_msg = "❌ Du benötigst die Whitelist-Handler-Rolle oder musst im Whitelist-Duty sein! Die 'Always Allowed' Rolle berechtigt ebenfalls immer."
             await ctx.send(error_msg)
             return
         
@@ -4706,7 +4734,7 @@ class PersistentWhitelistGrantView(discord.ui.View):
     @discord.ui.button(label="Whitelist freischalten", style=discord.ButtonStyle.success, emoji="✅", custom_id="whitelist_grant_role_persistent", row=2)
     async def grant_whitelist(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Öffnet ein Modal zur Eingabe des Spielers der die Rolle erhalten soll"""
-        # Prüfen ob User im Whitelist-Duty ist ODER die always_allowed_role hat
+        # Prüfen ob User im Whitelist-Duty ist ODER die always_allowed_role hat ODER die whitelist_handler_role (via !whitelistdutygrant gegeben)
         is_on_duty = await self.cog.config.member(interaction.user).whitelist_on_duty()
         
         # Prüfen auf always_allowed_role
@@ -4714,8 +4742,16 @@ class PersistentWhitelistGrantView(discord.ui.View):
         always_allowed_role = self.guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
         has_always_allowed = always_allowed_role and always_allowed_role in interaction.user.roles
         
-        if not is_on_duty and not has_always_allowed:
-            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein oder die 'Always Allowed' Rolle haben um Spieler zur Whitelist hinzuzufügen!", ephemeral=True)
+        # Prüfen auf Whitelist-Handler-Rolle (die via !whitelistset role eingestellt wurde - das ist die Basisrolle)
+        whitelist_handler_role_id = await self.cog.config.guild(self.guild).whitelist_role()
+        whitelist_handler_role = self.guild.get_role(whitelist_handler_role_id) if whitelist_handler_role_id else None
+        has_handler_role = whitelist_handler_role and whitelist_handler_role in interaction.user.roles
+        
+        # Nutzer mit Always-Allowed Rolle brauchen NICHT im Duty zu sein und können IMMER den Button nutzen
+        if has_always_allowed:
+            pass  # Immer erlaubt, keine weitere Prüfung nötig
+        elif not is_on_duty and not has_handler_role:
+            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein oder die Whitelist-Handler-Rolle haben (via !whitelistdutygrant gegeben) um Spieler zur Whitelist hinzuzufügen! Die 'Always Allowed' Rolle berechtigt ebenfalls immer.", ephemeral=True)
             return
         
         # Hole die zu vergebende Rolle
