@@ -28,6 +28,7 @@ Installation:
    
    ALLGEMEIN:
    - [p]supportset autoduty <stunden|off>  (Automatische Abmeldung nach X Stunden oder ausschalten)
+   - [p]supportset dutygrantrole @Rolle    (Setzt die Rolle die anderen Support-Duty geben darf)
    - [p]supportset feedbackchannel #channel (Channel für Feedback-Logs)
    - [p]supportset feedbackpanelchannel #channel (Channel NUR für das Feedback-Panel - GETRENNT vom Log!)
    - [p]supportset callchannel #channel     (Channel für Support-Aufrufe)
@@ -37,9 +38,15 @@ Installation:
 BEFEHLE (AUSWAHL):
    SUPPORT & DUTY:
    - [p]supportstats - Zeigt Support-Statistiken an
-   - [p]dutylist - Zeigt alle aktuell im Duty befindlichen Mitglieder
+   - [p]dutylist - Zeigt alle aktuell im Duty befindlichen Mitglieder (Support & Whitelist)
    - [p]staffinfo [@user] - Zeigt Informationen über ein Teammitglied
    - [p]supportinfo - Zeigt Informationen über das Support-System
+   - [p]supportdutygrant @user - Gib einem Nutzer die Support-Duty-Berechtigung (nur mit Grant-Rolle)
+   
+   WHITELIST DUTY:
+   - [p]whitelistset dutygrantrole @Rolle  (Setzt die Rolle die anderen Whitelist-Duty geben darf)
+   - [p]whitelistdutygrant @user - Gib einem Nutzer die Whitelist-Duty-Berechtigung (nur mit Grant-Rolle)
+   - [p]whitelistinfo - Zeigt Informationen über das Whitelist-System
    
    FEEDBACK:
    - [p]feedbackpanel - Erstellt ein Feedback-Panel mit Buttons (Positiv/Negativ/Vorschlag)
@@ -164,6 +171,9 @@ class SupportCog(commands.Cog):
             # STATS & TRACKING
             "track_stats": True,  # Ob Statistiken getrackt werden sollen
             "support_stats_channel": None,  # Channel für Support-Statistiken
+            
+            # DUTY GRANT ROLE SETTINGS
+            "support_duty_grant_role": None,  # Rolle die berechtigt ist anderen die Support-Duty-Rolle zu geben
         }
 
         # Speichert On-Duty Status pro User (für beide Systeme)
@@ -1407,6 +1417,89 @@ class SupportCog(commands.Cog):
             await self.config.guild(ctx.guild).duty_timeout.set(hours)
             await ctx.send(f"✅ Duty wird automatisch nach {hours} Stunden beendet.")
 
+    @supportset.command(name="dutygrantrole")
+    async def supportset_dutygrantrole(self, ctx: commands.Context, role: str = None):
+        """
+        Setze die Rolle die berechtigt ist anderen Nutzern die Support-Duty-Rolle zu geben.
+        
+        Dies ermöglicht es bestimmten Rollen (z.B. "Support Admin"), anderen Nutzern
+        die Berechtigung zu geben, Support-Duty zu machen, ohne dass sie selbst
+        die Support-Basisrolle benötigen.
+        
+        Ohne Rollen-Angabe wird die Einstellung zurückgesetzt.
+        Unterstützt ID oder Mention.
+        """
+        if role is None or role.lower() == "reset":
+            await self.config.guild(ctx.guild).support_duty_grant_role.set(None)
+            await ctx.send("✅ Support-Duty-Grant-Rolle zurückgesetzt.")
+        else:
+            role_id = self._parse_role_id(role)
+            if role_id is None:
+                await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein!")
+                return
+            
+            r = ctx.guild.get_role(role_id)
+            if not r:
+                await ctx.send("❌ Rolle nicht gefunden!")
+                return
+                
+            await self.config.guild(ctx.guild).support_duty_grant_role.set(role_id)
+            await ctx.send(f"✅ {r.mention} kann jetzt anderen Nutzern die Support-Duty-Berechtigung geben.")
+    
+    @commands.command(name="supportdutygrant", aliases=["grantduty", "grantsupportduty"])
+    @commands.guild_only()
+    async def supportdutygrant(self, ctx: commands.Context, target_user: discord.Member):
+        """
+        Gib einem anderen Nutzer die Support-Duty-Berechtigung.
+        
+        Dies setzt den Nutzer direkt auf Support-Duty, auch wenn er keine
+        Support-Basisrolle hat. Erfordert die konfigurierte Grant-Rolle.
+        """
+        guild = ctx.guild
+        author = ctx.author
+        
+        # Prüfe ob Autor die Grant-Rolle hat
+        grant_role_id = await self.config.guild(guild).support_duty_grant_role()
+        has_grant_role = False
+        if grant_role_id:
+            grant_role = guild.get_role(grant_role_id)
+            if grant_role and grant_role in author.roles:
+                has_grant_role = True
+        
+        if not has_grant_role:
+            await ctx.send("❌ Du benötigst die Berechtigung um anderen Nutzern Support-Duty zu geben!")
+            return
+        
+        # Prüfe ob Target bereits auf Duty ist
+        is_on_duty = await self.config.member(target_user).on_duty()
+        if is_on_duty:
+            await ctx.send(f"ℹ️ {target_user.mention} ist bereits im Support-Duty!")
+            return
+        
+        # Setze Target auf Duty
+        await self.config.member(target_user).on_duty.set(True)
+        start_time = datetime.utcnow()
+        await self.config.member(target_user).duty_start.set(start_time.timestamp())
+        
+        # Duty-Rolle hinzufügen
+        await self.update_duty_role(target_user, True, whitelist=False)
+        
+        # Log-Nachricht senden
+        log_channel = await self.get_log_channel(guild)
+        if log_channel:
+            embed = discord.Embed(
+                title="🟢 Support Duty zugewiesen",
+                description=f"{target_user.mention} wurde von {author.mention} auf Duty gesetzt!",
+                color=discord.Color.green(),
+                timestamp=start_time
+            )
+            embed.set_thumbnail(url=target_user.display_avatar.url)
+            embed.add_field(name="👤 Zugewiesen von", value=f"{author.display_name}", inline=True)
+            embed.add_field(name="⏰ Automatische Abmeldung", value="Nach konfigurierter Zeit", inline=True)
+            await log_channel.send(embed=embed)
+        
+        await ctx.send(f"✅ {target_user.mention} ist jetzt im Support-Duty!")
+
     @supportset.command(name="createpanel")
     async def supportset_createpanel(self, ctx: commands.Context):
         """
@@ -2096,6 +2189,10 @@ class SupportCog(commands.Cog):
         log_channel_mention = f"<#{log_channel_id}>" if log_channel_id else "Gleicher wie Whitelist-Channel"
         entries_channel_mention = f"<#{entries_channel_id}>" if entries_channel_id else "Gleicher wie Duty-Log-Channel"
         auto_duty_status = f"✅ Aktiv ({duty_timeout}h)" if auto_duty else "❌ Deaktiviert"
+        
+        # Grant-Rolle anzeigen
+        grant_role_id = guild_data.get("whitelist_duty_grant_role")
+        grant_role_mention = f"<@&{grant_role_id}>" if grant_role_id else "❌ Nicht gesetzt"
 
         # Zähle aktive Duty-User
         duty_count = 0
@@ -2123,6 +2220,7 @@ class SupportCog(commands.Cog):
         )
         embed.add_field(name="🔵 Aktive Duty-Handler", value=f"{duty_count} Handler\n{active_duty_display}", inline=False)
         embed.add_field(name="⏰ Auto-Duty-Ende", value=auto_duty_status, inline=True)
+        embed.add_field(name="🎖️ Duty-Grant-Rolle", value=grant_role_mention, inline=True)
         embed.add_field(name="📝 Whitelist-Channel", value=channel_mention, inline=True)
         embed.add_field(name="🎤 Voice-Warteraum", value=room_mention, inline=True)
         embed.add_field(name="👥 Handler-Rolle", value=role_mention, inline=True)
@@ -3245,56 +3343,81 @@ class SupportCog(commands.Cog):
     @commands.command(name="dutylist", aliases=["activestaff"])
     async def dutylist(self, ctx: commands.Context):
         """
-        Zeigt alle aktuell im Duty befindlichen Teammitglieder an.
+        Zeigt alle aktuell im Duty befindlichen Teammitglieder an (Support & Whitelist).
         """
         guild = ctx.guild
         guild_data = await self.config.guild(guild).all()
         
         duty_role_id = guild_data.get("duty_role")
         base_role_id = guild_data.get("role")
+        wl_duty_role_id = guild_data.get("whitelist_duty_role")
+        wl_role_id = guild_data.get("whitelist_role")
         
-        if not duty_role_id or not base_role_id:
-            await ctx.send("❌ Duty-System ist nicht korrekt konfiguriert!")
-            return
+        # Support Duty
+        support_on_duty = []
+        if duty_role_id and base_role_id:
+            duty_role = guild.get_role(duty_role_id)
+            base_role = guild.get_role(base_role_id)
+            
+            if duty_role and base_role:
+                for member in base_role.members:
+                    if duty_role in member.roles:
+                        is_on_duty = await self.config.member(member).on_duty()
+                        if is_on_duty:
+                            duty_start = await self.config.member(member).duty_start()
+                            if duty_start:
+                                start_time = datetime.fromtimestamp(duty_start)
+                                duration = datetime.utcnow() - start_time
+                                hours = int(duration.total_seconds() // 3600)
+                                minutes = int((duration.total_seconds() % 3600) // 60)
+                                support_on_duty.append((member, f"{hours}h {minutes}m"))
+                            else:
+                                support_on_duty.append((member, "Unbekannt"))
         
-        duty_role = guild.get_role(duty_role_id)
-        base_role = guild.get_role(base_role_id)
+        # Whitelist Duty
+        whitelist_on_duty = []
+        if wl_duty_role_id and wl_role_id:
+            wl_duty_role = guild.get_role(wl_duty_role_id)
+            wl_base_role = guild.get_role(wl_role_id)
+            
+            if wl_duty_role and wl_base_role:
+                for member in wl_base_role.members:
+                    if wl_duty_role in member.roles:
+                        is_on_duty = await self.config.member(member).whitelist_on_duty()
+                        if is_on_duty:
+                            duty_start = await self.config.member(member).whitelist_duty_start()
+                            if duty_start:
+                                start_time = datetime.fromtimestamp(duty_start)
+                                duration = datetime.utcnow() - start_time
+                                hours = int(duration.total_seconds() // 3600)
+                                minutes = int((duration.total_seconds() % 3600) // 60)
+                                whitelist_on_duty.append((member, f"{hours}h {minutes}m"))
+                            else:
+                                whitelist_on_duty.append((member, "Unbekannt"))
         
-        if not duty_role or not base_role:
-            await ctx.send("❌ Duty-Rollen wurden nicht gefunden!")
-            return
-        
-        on_duty_members = []
-        for member in base_role.members:
-            if duty_role in member.roles:
-                is_on_duty = await self.config.member(member).on_duty()
-                if is_on_duty:
-                    duty_start = await self.config.member(member).duty_start()
-                    if duty_start:
-                        start_time = datetime.fromtimestamp(duty_start)
-                        duration = datetime.utcnow() - start_time
-                        hours = int(duration.total_seconds() // 3600)
-                        minutes = int((duration.total_seconds() % 3600) // 60)
-                        on_duty_members.append((member, f"{hours}h {minutes}m"))
-                    else:
-                        on_duty_members.append((member, "Unbekannt"))
-        
-        if not on_duty_members:
-            await ctx.send("🟢 Aktuell ist niemand im Duty!")
+        if not support_on_duty and not whitelist_on_duty:
+            await ctx.send("🟢🔵 Aktuell ist niemand im Duty (weder Support noch Whitelist)!")
             return
         
         embed = discord.Embed(
-            title="🟢 Aktuell im Duty",
-            description=f"**{len(on_duty_members)}** Teammitglieder sind im Einsatz",
-            color=discord.Color.green(),
+            title="👥 Aktuell im Duty",
+            description=f"**{len(support_on_duty) + len(whitelist_on_duty)}** Teammitglieder sind im Einsatz",
+            color=discord.Color.blue(),
             timestamp=datetime.utcnow()
         )
         
-        duty_list = "\n".join([f"• {m.mention} - seit {time}" for m, time in on_duty_members[:15]])
-        if len(on_duty_members) > 15:
-            duty_list += f"\n... und {len(on_duty_members) - 15} weitere"
+        if support_on_duty:
+            support_list = "\n".join([f"• {m.mention} - seit {time}" for m, time in support_on_duty[:10]])
+            if len(support_on_duty) > 10:
+                support_list += f"\n... und {len(support_on_duty) - 10} weitere"
+            embed.add_field(name=f"🟢 Support-Duty ({len(support_on_duty)})", value=support_list, inline=False)
         
-        embed.add_field(name="Active Staff", value=duty_list, inline=False)
+        if whitelist_on_duty:
+            wl_list = "\n".join([f"• {m.mention} - seit {time}" for m, time in whitelist_on_duty[:10]])
+            if len(whitelist_on_duty) > 10:
+                wl_list += f"\n... und {len(whitelist_on_duty) - 10} weitere"
+            embed.add_field(name=f"🔵 Whitelist-Duty ({len(whitelist_on_duty)})", value=wl_list, inline=False)
+        
         embed.set_footer(text=f"Duty Liste • {guild.name}")
         
         await ctx.send(embed=embed)
