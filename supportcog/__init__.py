@@ -89,10 +89,46 @@ Nutzung:
 import discord
 from redbot.core import commands, checks, Config
 from redbot.core.bot import Red
-from datetime import datetime, timedelta
-from typing import Optional
+from redbot.core.i18n import Translator
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Union
 import asyncio
+import hashlib
+import logging
+import re
 import random
+
+_ = Translator("SupportCog", __file__)
+log = logging.getLogger("red.supportcog")
+
+# Stable, deterministic Config identifier (derived from module name).
+# Avoids the magic-number smell of the previous hard-coded literal.
+_CONF_IDENTIFIER = int(hashlib.md5(__name__.encode()).hexdigest()[:12], 16)
+
+# Background-loop intervals
+_DUTY_SWEEP_INTERVAL = 60  # seconds between duty-expiry sweeps
+_TEMP_WL_SWEEP_INTERVAL = 60  # seconds between temp-whitelist sweeps
+
+
+def _now() -> datetime:
+    """Timezone-aware UTC now. Replaces deprecated _now()."""
+    return datetime.now(timezone.utc)
+
+
+def _now_ts() -> int:
+    """Current POSIX timestamp (seconds, UTC-safe)."""
+    return int(_now().timestamp())
+
+
+def _from_ts(ts: float) -> datetime:
+    """Parse a POSIX timestamp into a timezone-aware UTC datetime."""
+    return _from_ts(ts, tz=timezone.utc)
+
+
+def _fmt_h_m(seconds: int) -> str:
+    """Format a duration as 'Xh Ym'."""
+    seconds = int(seconds)
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
 
 class SupportCog(commands.Cog):
@@ -100,7 +136,12 @@ class SupportCog(commands.Cog):
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=12345678901234567890)
+        self.config = Config.get_conf(self, identifier=_CONF_IDENTIFIER)
+
+        # Per-(guild, member) locks to prevent race conditions in duty start/stop
+        self._duty_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        # Background task handles
+        self._duty_expiry_task: Optional[asyncio.Task] = None
 
         default_guild_settings = {
             # SUPPORT SYSTEM SETTINGS
@@ -168,7 +209,22 @@ class SupportCog(commands.Cog):
             "ticket_panel_channel": None,  # Channel für Ticket-Panel
             "ticket_panel_message_id": None,  # Message ID des Ticket-Panels
             "ticket_support_role": None,  # Rolle die Tickets bearbeiten kann
-            
+            "ticket_log_channel": None,  # Channel für Ticket-Erstellungs/Schließungs-Logs
+            "ticket_counter": 0,  # Laufende Nummer für Ticket-Namen (ticket-001, ticket-002, ...)
+
+            # AWAY AUTO-RETURN
+            "away_auto_return_minutes": 15,  # Auto-Revert von "away" zu "available" nach X Min (0 = deaktiviert)
+
+            # SMART ESCALATION
+            "escalation_enabled": True,  # Wenn nach X Min niemand den User holt, Basis-Rolle pingen
+            "escalation_minutes": 5,  # Minuten bis zur Eskalation
+            "pending_support_requests": {},  # {message_id: {"user_id": u, "channel_id": c, "sent_ts": ts, "escalated": bool}}
+            "pending_whitelist_requests": {},  # gleiche Struktur für Whitelist
+
+            # SUPPORT BLOCKLIST
+            "support_blocklist": {},  # {user_id: {"blocked_by": id, "reason": text, "timestamp": ts}}
+            "support_blocklist_role": None,  # Rolle die blocken/entblocken darf (Fallback: manage_guild)
+
             # MODERATION SYSTEM
             "mod_log_channel": None,  # Channel für Moderations-Logs
             "warn_threshold": 3,  # Anzahl Warns vor Auto-Mute
@@ -190,6 +246,7 @@ class SupportCog(commands.Cog):
             "whitelist_duty_start": None,
             "total_duty_time": 0,  # Gesamte Duty-Zeit in Sekunden (Support)
             "total_whitelist_duty_time": 0,  # Gesamte Duty-Zeit in Sekunden (Whitelist)
+            "whitelist_last_added": 0,  # POSIX timestamp of last whitelist grant (for cooldown)
             
             # ERWEITERTE DUTY FUNKTIONEN
             "duty_status": "available",  # available, busy, break, away
@@ -202,25 +259,310 @@ class SupportCog(commands.Cog):
             "duty_break_count": 0,  # Anzahl der Pausen in aktueller Sitzung
             "duty_total_break_time": 0,  # Gesamte Pausenzeit in Sekunden
             "current_break_start": None,  # Startzeit der aktuellen Pause
+            "away_since": None,  # Timestamp wann der User auf "away" gesetzt wurde (für Auto-Return)
+            "cases_handled": 0,  # Anzahl bearbeiteter Support-Cases (für CSV-Export/Leaderboard)
+            "whitelist_cases_handled": 0,  # Anzahl bearbeiteter Whitelist-Cases
         }
 
         self.config.register_guild(**default_guild_settings)
         self.config.register_member(**default_member_settings)
 
-        # Cache für aktive Duty-User (wird bei Bot-Start neu aufgebaut)
-        self.duty_cache = {}
+    def _lock_for(self, guild_id: int, user_id: int) -> asyncio.Lock:
+        """Get (or lazily create) an asyncio.Lock keyed by (guild_id, user_id).
+
+        Used to serialize duty start/stop transitions for the same member to
+        prevent race conditions that double-count sessions or corrupt stats.
+        """
+        key = (guild_id, user_id)
+        if key not in self._duty_locks:
+            self._duty_locks[key] = asyncio.Lock()
+        return self._duty_locks[key]
 
     async def cog_load(self):
         """Wird beim Laden des Cogs aufgerufen - registriert persistente Views"""
         # Registere die persistent Views für Buttons
         self.bot.add_view(DutyButtonView(self))
         self.bot.add_view(WhitelistButtonView(self))
-        self.bot.add_view(FeedbackPanelView())  # Keine cog Referenz für persistente View
+        self.bot.add_view(FeedbackPanelView(self))  # Cog-Referenz mitgeben, vermeidet Reload-Fallback
         self.bot.add_view(SupportCallView(self))
         self.bot.add_view(PersistentWhitelistGrantView(self))  # Persistente View für Whitelist-Rollenvergabe
+        # Ticket-System persistente Views
+        self.bot.add_view(TicketPanelView(self))
+        self.bot.add_view(TicketCloseView(self))
+        # Background loop: auto-expire duty sessions + temp whitelists
+        if self._duty_expiry_task is None or self._duty_expiry_task.done():
+            self._duty_expiry_task = asyncio.create_task(self._background_sweep_loop())
+
+    async def cog_unload(self):
+        """Cleanup beim Entladen - Background-Tasks abbrechen."""
+        if self._duty_expiry_task is not None and not self._duty_expiry_task.done():
+            self._duty_expiry_task.cancel()
+            try:
+                await self._duty_expiry_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Fehler beim Stoppen des Background-Sweep-Loops")
+
+    async def _background_sweep_loop(self):
+        """Background loop that periodically:
+        - auto-removes duty sessions past their configured timeout
+        - expires temporary whitelist entries
+        - auto-reverts "away" status after configurable minutes (Away Auto-Return)
+        - escalates unanswered support/whitelist requests (Smart Escalation)
+        """
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                async for guild in self.bot.fetch_guilds(limit=None):
+                    try:
+                        await self._sweep_expired_duty(guild)
+                        await self._sweep_expired_temp_whitelist(guild)
+                        await self._sweep_away_auto_return(guild)
+                        await self._sweep_pending_requests(guild)
+                    except Exception:
+                        log.exception("Fehler im Sweep für Guild %s", guild.id)
+            except Exception:
+                log.exception("Schwerer Fehler im Background-Sweep-Loop")
+            await asyncio.sleep(_DUTY_SWEEP_INTERVAL)
+
+    async def _sweep_expired_duty(self, guild: discord.Guild):
+        """Auto-end duty sessions that exceeded the configured timeout."""
+        # Support duty sweep
+        cfg = self.config.guild(guild)
+        auto_remove = await cfg.auto_remove_duty()
+        if auto_remove:
+            timeout_hours = await cfg.duty_timeout()
+            if timeout_hours and timeout_hours > 0:
+                cutoff = _now_ts() - timeout_hours * 3600
+                all_members = await self.config.all_members(guild)
+                for uid, data in all_members.items():
+                    if not data.get("on_duty"):
+                        continue
+                    start_ts = data.get("duty_start")
+                    if start_ts and start_ts < cutoff:
+                        member = guild.get_member(uid)
+                        if member is None:
+                            continue
+                        try:
+                            async with self._lock_for(guild.id, uid):
+                                await self._finalize_duty_stop(member, whitelist=False, reason="Auto-Abmeldung (Timeout)")
+                        except Exception:
+                            log.exception("Auto-Abmeldung fehlgeschlagen für User %s", uid)
+        # Whitelist duty sweep
+        wl_auto_remove = await cfg.whitelist_auto_remove_duty()
+        if wl_auto_remove:
+            timeout_hours = await cfg.whitelist_duty_timeout()
+            if timeout_hours and timeout_hours > 0:
+                cutoff = _now_ts() - timeout_hours * 3600
+                all_members = await self.config.all_members(guild)
+                for uid, data in all_members.items():
+                    if not data.get("whitelist_on_duty"):
+                        continue
+                    start_ts = data.get("whitelist_duty_start")
+                    if start_ts and start_ts < cutoff:
+                        member = guild.get_member(uid)
+                        if member is None:
+                            continue
+                        try:
+                            async with self._lock_for(guild.id, uid):
+                                await self._finalize_duty_stop(member, whitelist=True, reason="Auto-Abmeldung (Timeout)")
+                        except Exception:
+                            log.exception("WL Auto-Abmeldung fehlgeschlagen für User %s", uid)
+
+    async def _sweep_expired_temp_whitelist(self, guild: discord.Guild):
+        """Remove expired temporary whitelist entries."""
+        temp_entries = await self.config.guild(guild).whitelist_temp_entries()
+        if not temp_entries:
+            return
+        now = _now_ts()
+        approved_role = await self.get_whitelist_approved_role(guild)
+        changed = False
+        for uid_str, exp_ts in list(temp_entries.items()):
+            if exp_ts > now:
+                continue
+            try:
+                uid = int(uid_str)
+            except (TypeError, ValueError):
+                temp_entries.pop(uid_str, None)
+                changed = True
+                continue
+            member = guild.get_member(uid)
+            if member and approved_role and member.get_role(approved_role.id) is not None:
+                try:
+                    await member.remove_roles(approved_role, reason="Temporäre Whitelist abgelaufen")
+                except discord.HTTPException:
+                    log.warning("Konnte temp. WL-Rolle nicht entfernen für User %s", uid)
+            # Log the auto-removal in the entries channel
+            entries_channel = await self.get_whitelist_entries_channel(guild)
+            if entries_channel:
+                try:
+                    embed = discord.Embed(
+                        title="⌛ Temporärer Whitelist-Eintrag abgelaufen",
+                        description=f"{member.mention if member else f'`{uid}`'} wurde automatisch nach Ablauf entfernt.",
+                        color=discord.Color.dark_grey(),
+                        timestamp=_now(),
+                    )
+                    await entries_channel.send(embed=embed)
+                except discord.HTTPException:
+                    pass
+            temp_entries.pop(uid_str, None)
+            changed = True
+        if changed:
+            await self.config.guild(guild).whitelist_temp_entries.set(temp_entries)
+
+    async def _sweep_away_auto_return(self, guild: discord.Guild):
+        """Reverts duty_status from 'away' to 'available' after the configured timeout.
+
+        This is a quality-of-life feature: staff who forgot to set themselves
+        back to available will be auto-reverted, so they don't miss pings.
+        Set away_auto_return_minutes to 0 to disable.
+        """
+        minutes = await self.config.guild(guild).away_auto_return_minutes() or 0
+        if minutes <= 0:
+            return
+        cutoff = _now_ts() - minutes * 60
+        all_members = await self.config.all_members(guild)
+        for uid, data in all_members.items():
+            if data.get("duty_status") != "away":
+                continue
+            if not data.get("on_duty"):
+                continue
+            away_since = data.get("away_since")
+            if not away_since or int(away_since) > cutoff:
+                continue
+            member = guild.get_member(uid)
+            if member is None:
+                continue
+            try:
+                async with self._lock_for(guild.id, uid):
+                    await self._set_duty_status(member, "available")
+                log.info("Away-Auto-Return für User %s in Guild %s", uid, guild.id)
+            except Exception:
+                log.exception("Away-Auto-Return fehlgeschlagen für User %s", uid)
+
+    async def _sweep_pending_requests(self, guild: discord.Guild):
+        """Smart Escalation: ping the base role if a support/whitelist request
+        hasn't been picked up within `escalation_minutes`.
+
+        Also cleans up stale entries from pending_support_requests /
+        pending_whitelist_requests (older than 1 hour, regardless of escalation).
+        """
+        if not await self.config.guild(guild).escalation_enabled():
+            return
+        esc_minutes = await self.config.guild(guild).escalation_minutes() or 0
+        if esc_minutes <= 0:
+            return
+        esc_cutoff = _now_ts() - esc_minutes * 60
+        cleanup_cutoff = _now_ts() - 3600  # 1 h
+
+        for key, channel_getter, base_role_key, system_name in [
+            ("pending_support_requests", self.get_support_channel, "role", "Support"),
+            ("pending_whitelist_requests", self.get_whitelist_channel, "whitelist_role", "Whitelist"),
+        ]:
+            pending = await self.config.guild(guild).get_attr(key)()
+            if not pending:
+                continue
+            changed = False
+            channel = await channel_getter(guild)
+            base_role_id = await self.config.guild(guild).get_attr(base_role_key)()
+            base_role = guild.get_role(base_role_id) if base_role_id else None
+            for msg_id_str, info in list(pending.items()):
+                sent_ts = info.get("sent_ts", 0)
+                escalated = info.get("escalated", False)
+                # Cleanup stale entries
+                if sent_ts < cleanup_cutoff:
+                    pending.pop(msg_id_str, None)
+                    changed = True
+                    continue
+                # Escalate if not yet escalated and cutoff reached
+                if not escalated and sent_ts < esc_cutoff:
+                    if channel and base_role:
+                        try:
+                            user_id = info.get("user_id")
+                            user_mention = f"<@{user_id}>" if user_id else "Unbekannt"
+                            embed = discord.Embed(
+                                title=f"⚠️ {system_name}-Eskalation",
+                                description=(
+                                    f"{user_mention} wartet seit **{esc_minutes} Minuten** im Warteraum!\n"
+                                    f"Niemand im Duty hat reagiert — Basis-Rolle wird gepingt."
+                                ),
+                                color=discord.Color.red(),
+                                timestamp=_now(),
+                            )
+                            embed.set_footer(text=f"{system_name}-Eskalation • Auto-Ping")
+                            await channel.send(
+                                content=base_role.mention,
+                                embed=embed,
+                                allowed_mentions=discord.AllowedMentions(roles=[base_role]),
+                            )
+                        except discord.HTTPException:
+                            log.warning("Konnte Eskalation nicht senden (Guild %s)", guild.id)
+                    info["escalated"] = True
+                    pending[msg_id_str] = info
+                    changed = True
+            if changed:
+                await self.config.guild(guild).get_attr(key).set(pending)
+
+    async def _finalize_duty_stop(self, member: discord.Member, *, whitelist: bool, reason: str = ""):
+        """Internal helper that performs the actual config/role updates for duty stop.
+        Assumes the caller already holds _lock_for(guild.id, member.id).
+        """
+        guild = member.guild
+        if whitelist:
+            start_ts = await self.config.member(member).whitelist_duty_start()
+            if not start_ts:
+                # Already stopped.
+                return
+            duration = max(0, _now_ts() - int(start_ts))
+            total = await self.config.member(member).total_whitelist_duty_time() or 0
+            await self.config.member(member).total_whitelist_duty_time.set(total + duration)
+            await self.config.member(member).whitelist_on_duty.set(False)
+            await self.config.member(member).whitelist_duty_start.set(None)
+            await self.config.member(member).duty_status.set("available")
+        else:
+            start_ts = await self.config.member(member).duty_start()
+            if not start_ts:
+                return
+            duration = max(0, _now_ts() - int(start_ts))
+            total = await self.config.member(member).total_duty_time() or 0
+            await self.config.member(member).total_duty_time.set(total + duration)
+            await self.config.member(member).on_duty.set(False)
+            await self.config.member(member).duty_start.set(None)
+            await self.config.member(member).duty_status.set("available")
+            await self.config.member(member).last_duty_end.set(_now_ts())
+        # Remove role (ignore forbidden - logged)
+        ok = await self.update_duty_role(member, on_duty=False, whitelist=whitelist)
+        if not ok:
+            log.warning("Konnte Duty-Rolle nicht entfernen für %s in Guild %s", member.id, guild.id)
+        # Refresh panels / status displays
+        try:
+            if whitelist:
+                await self.update_whitelist_panel_display(guild)
+            else:
+                await self.update_panel_display(guild)
+                await self.update_status_display(guild)
+        except Exception:
+            log.exception("Panel-Update nach Duty-Stop fehlgeschlagen")
+        # Send log entry
+        try:
+            log_channel = await (self.get_whitelist_log_channel(guild) if whitelist else self.get_log_channel(guild))
+            if log_channel:
+                system_name = "Whitelist" if whitelist else "Support"
+                embed = discord.Embed(
+                    title=f"⏰ {system_name}-Duty automatisch beendet",
+                    description=f"{member.mention} wurde nach Ablauf des Timeouts automatisch abgemeldet.\nDauer: {_fmt_h_m(duration)}",
+                    color=discord.Color.orange(),
+                    timestamp=_now(),
+                )
+                if reason:
+                    embed.add_field(name="Grund", value=reason, inline=False)
+                await log_channel.send(embed=embed)
+        except Exception:
+            log.exception("Konnte Auto-Duty-Stop Log nicht senden")
 
     async def get_or_create_duty_role(self, guild: discord.Guild, whitelist: bool = False) -> Optional[discord.Role]:
-        """Erstellt oder holt die automatische Duty-Rolle"""
+        """Erstellt oder holt die automatische Duty-Rolle (mit_side_effect: legt sie ggf. an)."""
         if whitelist:
             duty_role_id = await self.config.guild(guild).whitelist_duty_role()
             role_name = "📋 Whitelist Duty"
@@ -242,6 +584,7 @@ class SupportCog(commands.Cog):
             duty_role = await guild.create_role(
                 name=role_name,
                 color=color,
+                permissions=discord.Permissions.none(),  # Pure ping-marker role
                 mentionable=True,
                 reason=reason
             )
@@ -250,26 +593,44 @@ class SupportCog(commands.Cog):
             else:
                 await self.config.guild(guild).duty_role.set(duty_role.id)
             return duty_role
-        except discord.Forbidden:
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("Konnte Duty-Rolle nicht erstellen in Guild %s", guild.id)
             return None
 
-    async def update_duty_role(self, member: discord.Member, on_duty: bool, whitelist: bool = False):
-        """Fügt oder entfernt die Duty-Rolle eines Members"""
+    async def get_duty_role(self, guild: discord.Guild, whitelist: bool = False) -> Optional[discord.Role]:
+        """Read-only lookup of the duty role. Never creates a new role.
+        Use this in display/stats paths; reserve get_or_create_duty_role for duty-start.
+        """
+        duty_role_id = await (self.config.guild(guild).whitelist_duty_role() if whitelist
+                              else self.config.guild(guild).duty_role())
+        if duty_role_id:
+            return guild.get_role(duty_role_id)
+        return None
+
+    async def update_duty_role(self, member: discord.Member, on_duty: bool, whitelist: bool = False) -> bool:
+        """Fügt oder entfernt die Duty-Rolle eines Members.
+        Returns True on success, False if the role couldn't be applied/removed.
+        Caller should roll back Config flags on False.
+        """
         guild = member.guild
         duty_role = await self.get_or_create_duty_role(guild, whitelist=whitelist)
-        
         if not duty_role:
-            return
-        
+            return False
         try:
-            if on_duty and duty_role not in member.roles:
+            has_role = member.get_role(duty_role.id) is not None
+            if on_duty and not has_role:
                 reason = "Whitelist-Duty gestartet" if whitelist else "Support-Duty gestartet"
                 await member.add_roles(duty_role, reason=reason)
-            elif not on_duty and duty_role in member.roles:
+            elif not on_duty and has_role:
                 reason = "Whitelist-Duty beendet" if whitelist else "Support-Duty beendet"
                 await member.remove_roles(duty_role, reason=reason)
+            return True
         except discord.Forbidden:
-            pass
+            log.warning("Fehlende Rechte zum Anpassen der Duty-Rolle in Guild %s", guild.id)
+            return False
+        except discord.HTTPException as e:
+            log.warning("HTTP-Fehler beim Anpassen der Duty-Rolle in Guild %s: %s", guild.id, e)
+            return False
 
     # WHITELIST SYSTEM HELPER METHODS
     async def get_whitelist_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -321,80 +682,103 @@ class SupportCog(commands.Cog):
         return await self.get_whitelist_log_channel(guild)
 
     async def update_whitelist_panel_display(self, guild: discord.Guild):
-        """Updates the whitelist panel message to show current duty members and grant role button"""
+        """Updates the whitelist panel message to show current duty members and grant role button.
+
+        Uses get_duty_role (read-only) so this is safe to call from stats/display paths —
+        it will never spawn a new duty role as a side effect.
+        """
+        panel_message_id = await self.config.guild(guild).whitelist_panel_message_id()
+        if not panel_message_id:
+            return
+        panel_channel = await self.get_whitelist_panel_channel(guild)
+        if not panel_channel:
+            return
         try:
-            panel_message_id = await self.config.guild(guild).whitelist_panel_message_id()
-            if not panel_message_id:
-                return
-            
-            panel_channel = await self.get_whitelist_panel_channel(guild)
-            if not panel_channel:
-                return
-            
             panel_message = await panel_channel.fetch_message(panel_message_id)
-            
-            # Get current duty members
-            duty_count = 0
-            duty_list = []
-            duty_role = await self.get_or_create_duty_role(guild, whitelist=True)
-            role_id = await self.config.guild(guild).whitelist_role()
-            
-            if role_id and duty_role:
-                base_role = guild.get_role(role_id)
-                if base_role:
-                    for m in base_role.members:
-                        if duty_role in m.roles:
-                            is_duty = await self.config.member(m).whitelist_on_duty()
-                            if is_duty:
-                                duty_count += 1
-                                duty_list.append(f"• {m.display_name}")
-            
-            # Check if grant role is configured
-            grant_role_id = await self.config.guild(guild).whitelist_grant_role()
-            has_grant_role = grant_role_id is not None
-            
-            # Create new embed with updated info
-            if duty_count > 0:
-                duty_text = "\n".join(duty_list[:10])
-                if len(duty_list) > 10:
-                    duty_text += f"\n• ...und {duty_count - 10} weitere"
-            else:
-                duty_text = "Niemand"
-            
-            description = (
-                "**Willkommen zum Whitelist-Duty System!**\n\n"
-                "Klicke auf die Buttons unten um dich für den Whitelist-Dienst an- oder abzumelden.\n\n"
-                "🔵 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
-                "🔴 **Duty Beenden** - Du erhältst keine Pings mehr"
-            )
-            
-            if has_grant_role:
-                description += "\n\n✅ **Whitelist freischalten** - Spieler zur Whitelist hinzufügen"
-            
-            new_embed = discord.Embed(
-                title="📋 Whitelist Duty Panel",
-                description=description,
-                color=discord.Color.blue()
-            )
-            new_embed.add_field(
-                name="🔵 Aktuell im Dienst",
-                value=duty_text,
-                inline=False
-            )
-            new_embed.set_footer(text=f"Aktive Handler: {duty_count} • Die 🔵 On Duty Rolle wird automatisch zugewiesen/entfernt")
-            
-            # Re-create view with grant role button if configured
-            new_view = WhitelistButtonView(self, guild)
-            # Füge persistenten Whitelist-Grant Button hinzu wenn Rolle konfiguriert ist
-            if has_grant_role:
-                grant_view = PersistentWhitelistGrantView(self, guild)
-                # Füge den Grant Button zur bestehenden View hinzu
+        except discord.NotFound:
+            # Message was deleted — clear the stale ID so we stop retrying.
+            await self.config.guild(guild).whitelist_panel_message_id.set(None)
+            return
+        except discord.Forbidden:
+            log.warning("Fehlende Rechte zum Abrufen des WL-Panels in Guild %s", guild.id)
+            return
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler beim Abrufen des WL-Panels in Guild %s", guild.id)
+            return
+
+        # Get current duty members (read-only — never create role here)
+        duty_count = 0
+        duty_list = []
+        duty_role = await self.get_duty_role(guild, whitelist=True)
+        role_id = await self.config.guild(guild).whitelist_role()
+
+        if role_id and duty_role:
+            base_role = guild.get_role(role_id)
+            if base_role:
+                # Single Config.all_members call instead of N per-member reads.
+                all_members = await self.config.all_members(guild)
+                for m in base_role.members:
+                    if m.get_role(duty_role.id) is None:
+                        continue
+                    if all_members.get(m.id, {}).get("whitelist_on_duty"):
+                        duty_count += 1
+                        duty_list.append(f"• {m.display_name}")
+
+        # Check if grant role is configured
+        grant_role_id = await self.config.guild(guild).whitelist_grant_role()
+        has_grant_role = grant_role_id is not None
+
+        # Create new embed with updated info
+        if duty_count > 0:
+            duty_text = "\n".join(duty_list[:10])
+            if len(duty_list) > 10:
+                duty_text += f"\n• ...und {duty_count - 10} weitere"
+        else:
+            duty_text = "Niemand"
+
+        description = (
+            "**Willkommen zum Whitelist-Duty System!**\n\n"
+            "Klicke auf die Buttons unten um dich für den Whitelist-Dienst an- oder abzumelden.\n\n"
+            "🔵 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
+            "🔴 **Duty Beenden** - Du erhältst keine Pings mehr"
+        )
+
+        if has_grant_role:
+            description += "\n\n✅ **Whitelist freischalten** - Spieler zur Whitelist hinzufügen"
+
+        new_embed = discord.Embed(
+            title="📋 Whitelist Duty Panel",
+            description=description,
+            color=discord.Color.blue()
+        )
+        new_embed.add_field(
+            name="🔵 Aktuell im Dienst",
+            value=duty_text,
+            inline=False
+        )
+        new_embed.set_footer(text=f"Aktive Handler: {duty_count} • Die 📋 Whitelist Duty Rolle wird automatisch zugewiesen/entfernt")
+
+        # Re-create view with grant role button if configured
+        new_view = WhitelistButtonView(self, guild)
+        if has_grant_role:
+            grant_view = PersistentWhitelistGrantView(self, guild)
+            # Note: re-binding items across View instances relies on undocumented
+            # discord.py internals and is fragile. We keep it for backwards compat
+            # but log if anything looks off.
+            try:
                 for item in grant_view.children:
                     new_view.add_item(item)
-            
+            except Exception:
+                log.exception("Konnte Grant-Button nicht an WL-View anhängen in Guild %s", guild.id)
+
+        try:
             await panel_message.edit(embed=new_embed, view=new_view)
-        except Exception as e:
-            pass  # Ignore errors if panel message was deleted
+        except discord.NotFound:
+            await self.config.guild(guild).whitelist_panel_message_id.set(None)
+        except discord.Forbidden:
+            log.warning("Fehlende Rechte zum Editieren des WL-Panels in Guild %s", guild.id)
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler beim Editieren des WL-Panels in Guild %s", guild.id)
 
     async def get_whitelist_approved_role(self, guild: discord.Guild) -> Optional[discord.Role]:
         """Holt die Whitelist-Approved-Rolle"""
@@ -666,25 +1050,41 @@ class SupportCog(commands.Cog):
         await self._handle_whitelist_voice_update(member, before, after, guild)
 
     async def _handle_support_voice_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState, guild: discord.Guild):
-        """Verarbeitet Voice-Updates für das Support-System"""
-        
+        """Verarbeitet Voice-Updates für das Support-System (JOIN + LEAVE)."""
         room_id = await self.config.guild(guild).room()
         role_id = await self.config.guild(guild).role()
         use_embed = await self.config.guild(guild).use_embed()
 
-        # Prüfen ob alle erforderlichen Einstellungen gesetzt sind
         if not all([room_id, role_id]):
             return
 
-        # Prüfen ob es der konfigurierte Support-Warteraum ist
-        if after.channel is None or after.channel.id != room_id:
+        joined = after.channel is not None and after.channel.id == room_id
+        left = (
+            before.channel is not None
+            and before.channel.id == room_id
+            and (after.channel is None or after.channel.id != room_id)
+        )
+        # If the user just moved within the same room (impossible) — skip.
+        if not joined and not left:
             return
-        if before.channel is not None and before.channel.id == room_id:
-            # User war bereits im Warteraum - keine Aktion
-            return
+        # If both branches hit (e.g. rapid channel swap), prefer JOIN.
+        if joined and left:
+            left = False
 
-        # User hat den Support-Warteraum soeben betreten
+        if joined:
+            await self._notify_support_join(member, after.channel, guild, use_embed, role_id, room_id)
+        elif left:
+            await self._notify_support_leave(member, before.channel, guild, use_embed, role_id)
+
+    async def _notify_support_join(self, member: discord.Member, channel: discord.VoiceChannel, guild: discord.Guild, use_embed: bool, role_id: int, room_id: int):
+        """User hat den Support-Warteraum soeben betreten."""
         try:
+            # Blocklist-Prüfung: blockierte User keine Notification
+            blocklist = await self.config.guild(guild).support_blocklist() or {}
+            if str(member.id) in blocklist:
+                log.info("Blockierter User %s hat Support-Raum betreten (Guild %s) — keine Notification", member.id, guild.id)
+                return
+
             support_channel = await self.get_support_channel(guild)
             if not support_channel:
                 return
@@ -693,122 +1093,151 @@ class SupportCog(commands.Cog):
             if not base_role:
                 return
 
-            # Hole alle On-Duty User MIT DER DUTY ROLLE
+            # Read-only lookup of the duty role — do NOT create one as a side effect here.
+            duty_role = await self.get_duty_role(guild, whitelist=False)
+
+            # Hole alle On-Duty User MIT DER DUTY ROLLE (single Config.all_members call)
             duty_members = []
-            duty_role = await self.get_or_create_duty_role(guild, whitelist=False)
-            
-            for m in base_role.members:
-                # Prüfe ob User die Duty-Rolle hat UND on_duty flag gesetzt ist
-                if duty_role and duty_role in m.roles:
-                    is_on_duty = await self.config.member(m).on_duty()
-                    if is_on_duty:
+            if duty_role:
+                all_members = await self.config.all_members(guild)
+                for m in base_role.members:
+                    if m.get_role(duty_role.id) is None:
+                        continue
+                    if all_members.get(m.id, {}).get("on_duty"):
                         duty_members.append(m)
 
             user_mention = member.mention
             user_avatar = member.display_avatar.url
 
             if use_embed:
-                # Erstelle ein schönes Embed
                 embed = discord.Embed(
                     title="🎧 Neue Support-Anfrage",
                     description=f"{user_mention} hat den Support-Warteraum betreten und wartet auf Hilfe!",
                     color=discord.Color.orange(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
-
                 embed.set_thumbnail(url=user_avatar)
                 embed.add_field(
                     name="👤 Nutzer",
                     value=f"{user_mention}\n(`{member.display_name}`)",
                     inline=True
                 )
-
                 if duty_members:
-                    # Zeige nur On-Duty Teamler an
                     duty_list = "\n".join([f"• {m.display_name}" for m in duty_members[:5]])
                     if len(duty_members) > 5:
                         duty_list += f"\n• ...und {len(duty_members) - 5} weitere"
-                    embed.add_field(
-                        name="🟢 Verfügbare Supporter",
-                        value=duty_list,
-                        inline=True
-                    )
+                    embed.add_field(name="🟢 Verfügbare Supporter", value=duty_list, inline=True)
                 else:
                     embed.add_field(
                         name="🔴 Keine Supporter verfügbar",
-                        value=f"Niemand ist gerade im Dienst!\n*Benutze `/supportset panelchannel` und klicke auf 'Duty Starten'*",
+                        value=f"Niemand ist gerade im Dienst!\n*Benutze `[p]supportset panelchannel` und klicke auf 'Duty Starten'*",
                         inline=True
                     )
-
-                embed.add_field(
-                    name="📍 Channel",
-                    value=f"{after.channel.mention}",
-                    inline=True
-                )
+                embed.add_field(name="📍 Channel", value=channel.mention, inline=True)
                 embed.set_footer(text="Support Warteraum System • On-Duty aktiv")
 
-                # Buttons für Duty-Mitglieder hinzufügen (User im Warteraum zu sich holen)
-                view = discord.ui.View(timeout=None)  # Kein Timeout damit Buttons dauerhaft funktionieren
+                view = discord.ui.View(timeout=None)
                 if duty_members:
-                    # Button nur anzeigen wenn Duty-Mitglieder verfügbar sind
-                    # Button ruft den User zum Teamler (nicht umgekehrt!)
-                    button = discord.ui.Button(label="User zu mir holen", style=discord.ButtonStyle.green, emoji="🎧", custom_id=f"fetch_user_{member.id}")
-                    callback = self.create_fetch_user_callback(member, after.channel)
-                    button.callback = callback
+                    button = discord.ui.Button(
+                        label="User zu mir holen",
+                        style=discord.ButtonStyle.green,
+                        emoji="🎧",
+                        custom_id=f"fetch_user_{member.id}",
+                    )
+                    button.callback = self.create_fetch_user_callback(member, channel)
                     view.add_item(button)
 
-                # Sende das Embed mit Role-Ping IM SUPPORT-CHANNEL (nicht Log!)
-                # WICHTIG: allowed_mentions erzwingt den Ping der Rolle
                 if duty_role and duty_members:
-                    # Nur die Duty-Rolle pingen statt alle Mitglieder einzeln
-                    await support_channel.send(content=duty_role.mention, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
+                    sent_msg = await support_channel.send(
+                        content=duty_role.mention, embed=embed, view=view,
+                        allowed_mentions=discord.AllowedMentions(roles=[duty_role]),
+                    )
                 elif base_role:
-                    # Fallback zur Basis-Rolle wenn niemand Duty hat
-                    await support_channel.send(content=base_role.mention, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
+                    sent_msg = await support_channel.send(
+                        content=base_role.mention, embed=embed, view=view,
+                        allowed_mentions=discord.AllowedMentions(roles=[base_role]),
+                    )
                 else:
-                    await support_channel.send(embed=embed, view=view)
+                    sent_msg = await support_channel.send(embed=embed, view=view)
+
+                # Pending-Request registrieren für Smart-Escalation
+                if sent_msg is not None:
+                    await self._register_pending_request(guild, sent_msg.id, member.id, whitelist=False)
             else:
-                # Einfache Textnachricht (Fallback)
                 if duty_role and duty_members:
-                    # Nur die Duty-Rolle pingen
-                    message = f"🎧 {duty_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})"
+                    message = f"🎧 {duty_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({channel.mention})"
                     await support_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
                 elif base_role:
-                    message = f"🎧 {base_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention}) - Niemand im Duty!"
+                    message = f"🎧 {base_role.mention} | {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({channel.mention}) - Niemand im Duty!"
                     await support_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
                 else:
-                    await support_channel.send(f"🎧 {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({after.channel.mention})")
-
+                    await support_channel.send(f"🎧 {user_mention} (`{member.display_name}`) ist im Support-Warteraum ({channel.mention})")
         except discord.Forbidden as e:
-            # Bot hat keine Berechtigung zum Senden
-            print(f"[SupportCog] Forbidden Fehler beim Senden in Channel: {e}")
-        except Exception as e:
-            # Logge Fehler mit mehr Details
-            import traceback
-            print(f"[SupportCog] Fehler in Support Warteraum: {type(e).__name__}: {e}")
-            print(traceback.format_exc())
+            log.warning("Forbidden beim Senden in Support-Channel (Guild %s): %s", guild.id, e)
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler in Support-Warteraum (Guild %s)", guild.id)
+        except Exception:
+            log.exception("Unerwarteter Fehler in _notify_support_join (Guild %s)", guild.id)
+
+    async def _notify_support_leave(self, member: discord.Member, channel: discord.VoiceChannel, guild: discord.Guild, use_embed: bool, role_id: int):
+        """User hat den Support-Warteraum verlassen."""
+        try:
+            support_channel = await self.get_support_channel(guild)
+            if not support_channel:
+                return
+            if use_embed:
+                embed = discord.Embed(
+                    title="🎧 Support-Warteraum verlassen",
+                    description=f"{member.mention} (`{member.display_name}`) hat den Warteraum verlassen.",
+                    color=discord.Color.light_gray(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="📍 Channel", value=channel.mention, inline=True)
+                embed.set_footer(text="Support Warteraum System")
+                await support_channel.send(embed=embed)
+            else:
+                await support_channel.send(f"🎧 {member.mention} (`{member.display_name}`) hat den Support-Warteraum verlassen.")
+        except discord.Forbidden as e:
+            log.warning("Forbidden beim Senden des Leave-Events (Guild %s): %s", guild.id, e)
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler beim Senden des Leave-Events (Guild %s)", guild.id)
+        except Exception:
+            log.exception("Unerwarteter Fehler in _notify_support_leave (Guild %s)", guild.id)
 
     async def _handle_whitelist_voice_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState, guild: discord.Guild):
-        """Verarbeitet Voice-Updates für das Whitelist-System"""
-        
-        # Hole Whitelist-Konfiguration
+        """Verarbeitet Voice-Updates für das Whitelist-System (JOIN + LEAVE)."""
         room_id = await self.config.guild(guild).whitelist_room()
         role_id = await self.config.guild(guild).whitelist_role()
         use_embed = await self.config.guild(guild).use_embed()
 
-        # Prüfen ob alle erforderlichen Einstellungen gesetzt sind
         if not all([room_id, role_id]):
             return
 
-        # Prüfen ob es der konfigurierte Whitelist-Warteraum ist
-        if after.channel is None or after.channel.id != room_id:
+        joined = after.channel is not None and after.channel.id == room_id
+        left = (
+            before.channel is not None
+            and before.channel.id == room_id
+            and (after.channel is None or after.channel.id != room_id)
+        )
+        if not joined and not left:
             return
-        if before.channel is not None and before.channel.id == room_id:
-            # User war bereits im Warteraum - keine Aktion
-            return
+        if joined and left:
+            left = False
 
-        # User hat den Whitelist-Warteraum soeben betreten
+        if joined:
+            await self._notify_whitelist_join(member, after.channel, guild, use_embed, role_id)
+        elif left:
+            await self._notify_whitelist_leave(member, before.channel, guild, use_embed)
+
+    async def _notify_whitelist_join(self, member: discord.Member, channel: discord.VoiceChannel, guild: discord.Guild, use_embed: bool, role_id: int):
+        """User hat den Whitelist-Warteraum soeben betreten."""
         try:
+            # Blocklist-Prüfung (selbe Liste wie Support)
+            blocklist = await self.config.guild(guild).support_blocklist() or {}
+            if str(member.id) in blocklist:
+                log.info("Blockierter User %s hat WL-Raum betreten (Guild %s) — keine Notification", member.id, guild.id)
+                return
+
             whitelist_channel = await self.get_whitelist_channel(guild)
             if not whitelist_channel:
                 return
@@ -817,131 +1246,182 @@ class SupportCog(commands.Cog):
             if not base_role:
                 return
 
-            # Hole alle On-Duty User MIT DER DUTY ROLLE
+            # Read-only lookup — never create role as side effect of a voice event.
+            duty_role = await self.get_duty_role(guild, whitelist=True)
+
             duty_members = []
-            duty_role = await self.get_or_create_duty_role(guild, whitelist=True)
-            
-            for m in base_role.members:
-                # Prüfe ob User die Duty-Rolle hat UND whitelist_on_duty flag gesetzt ist
-                if duty_role and duty_role in m.roles:
-                    is_on_duty = await self.config.member(m).whitelist_on_duty()
-                    if is_on_duty:
+            if duty_role:
+                all_members = await self.config.all_members(guild)
+                for m in base_role.members:
+                    if m.get_role(duty_role.id) is None:
+                        continue
+                    if all_members.get(m.id, {}).get("whitelist_on_duty"):
                         duty_members.append(m)
 
             user_mention = member.mention
             user_avatar = member.display_avatar.url
 
             if use_embed:
-                # Erstelle ein schönes Embed
                 embed = discord.Embed(
                     title="📋 Neue Whitelist-Anfrage",
                     description=f"{user_mention} hat den Whitelist-Warteraum betreten und wartet auf Bearbeitung!",
                     color=discord.Color.blue(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
-
                 embed.set_thumbnail(url=user_avatar)
                 embed.add_field(
                     name="👤 Nutzer",
                     value=f"{user_mention}\n(`{member.display_name}`)",
                     inline=True
                 )
-
                 if duty_members:
-                    # Zeige nur On-Duty Teamler an
                     duty_list = "\n".join([f"• {m.display_name}" for m in duty_members[:5]])
                     if len(duty_members) > 5:
                         duty_list += f"\n• ...und {len(duty_members) - 5} weitere"
-                    embed.add_field(
-                        name="🔵 Verfügbare Whitelist-Handler",
-                        value=duty_list,
-                        inline=True
-                    )
+                    embed.add_field(name="🔵 Verfügbare Whitelist-Handler", value=duty_list, inline=True)
                 else:
-                    embed.add_field(
-                        name="🔴 Keine Handler verfügbar",
-                        value=f"Niemand ist gerade im Dienst!",
-                        inline=True
-                    )
-
-                embed.add_field(
-                    name="📍 Channel",
-                    value=f"{after.channel.mention}",
-                    inline=True
-                )
+                    embed.add_field(name="🔴 Keine Handler verfügbar", value="Niemand ist gerade im Dienst!", inline=True)
+                embed.add_field(name="📍 Channel", value=channel.mention, inline=True)
                 embed.set_footer(text="Whitelist Warteraum System • On-Duty aktiv")
 
-                # Buttons für Duty-Mitglieder hinzufügen (User im Warteraum zu sich holen)
-                view = discord.ui.View(timeout=None)  # Kein Timeout damit Buttons dauerhaft funktionieren
-                
-                # Button immer anzeigen - die Berechtigung wird im Callback geprüft!
-                # Button ruft den User zum Teamler (nicht umgekehrt!)
-                button = discord.ui.Button(label="User zu mir holen", style=discord.ButtonStyle.green, emoji="📋", custom_id=f"fetch_whitelist_user_{member.id}")
-                callback = self.create_fetch_user_callback(member, after.channel, whitelist=True)
-                button.callback = callback
+                view = discord.ui.View(timeout=None)
+                button = discord.ui.Button(
+                    label="User zu mir holen",
+                    style=discord.ButtonStyle.green,
+                    emoji="📋",
+                    custom_id=f"fetch_whitelist_user_{member.id}",
+                )
+                button.callback = self.create_fetch_user_callback(member, channel, whitelist=True)
                 view.add_item(button)
 
-                # "Whitelist freischalten" Button hinzufügen wenn Rolle konfiguriert ist
                 grant_role_id = await self.config.guild(guild).whitelist_grant_role()
                 if grant_role_id:
-                    # Die User-ID des Antragstellers im custom_id speichern
                     grant_button = GrantWhitelistButton(self, guild, member.id)
                     view.add_item(grant_button)
 
-                # Sende das Embed mit Role-Ping IM WHITELIST-CHANNEL
                 if duty_role and duty_members:
-                    # Nur die Whitelist-Duty-Rolle pingen statt alle Mitglieder einzeln
-                    await whitelist_channel.send(content=duty_role.mention, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
+                    sent_msg = await whitelist_channel.send(
+                        content=duty_role.mention, embed=embed, view=view,
+                        allowed_mentions=discord.AllowedMentions(roles=[duty_role]),
+                    )
                 elif base_role:
-                    await whitelist_channel.send(content=base_role.mention, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
+                    sent_msg = await whitelist_channel.send(
+                        content=base_role.mention, embed=embed, view=view,
+                        allowed_mentions=discord.AllowedMentions(roles=[base_role]),
+                    )
                 else:
-                    await whitelist_channel.send(embed=embed, view=view)
+                    sent_msg = await whitelist_channel.send(embed=embed, view=view)
+
+                # Pending-Request registrieren für Smart-Escalation
+                if sent_msg is not None:
+                    await self._register_pending_request(guild, sent_msg.id, member.id, whitelist=True)
             else:
-                # Einfache Textnachricht (Fallback)
                 if duty_role and duty_members:
-                    # Nur die Whitelist-Duty-Rolle pingen
-                    message = f"📋 {duty_role.mention} | {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({after.channel.mention})"
+                    message = f"📋 {duty_role.mention} | {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({channel.mention})"
                     await whitelist_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
                 elif base_role:
-                    message = f"📋 {base_role.mention} | {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({after.channel.mention}) - Niemand im Duty!"
+                    message = f"📋 {base_role.mention} | {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({channel.mention}) - Niemand im Duty!"
                     await whitelist_channel.send(message, allowed_mentions=discord.AllowedMentions(roles=[base_role]))
                 else:
-                    await whitelist_channel.send(f"📋 {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({after.channel.mention})")
+                    await whitelist_channel.send(f"📋 {user_mention} (`{member.display_name}`) ist im Whitelist-Warteraum ({channel.mention})")
+        except discord.Forbidden as e:
+            log.warning("Forbidden beim Senden in WL-Channel (Guild %s): %s", guild.id, e)
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler in WL-Warteraum (Guild %s)", guild.id)
+        except Exception:
+            log.exception("Unerwarteter Fehler in _notify_whitelist_join (Guild %s)", guild.id)
 
-        except discord.Forbidden:
-            # Bot hat keine Berechtigung zum Senden
-            pass
-        except Exception as e:
-            # Logge Fehler
-            print(f"Fehler in SupportCog (Whitelist): {e}")
+    async def _notify_whitelist_leave(self, member: discord.Member, channel: discord.VoiceChannel, guild: discord.Guild, use_embed: bool):
+        """User hat den Whitelist-Warteraum verlassen."""
+        try:
+            whitelist_channel = await self.get_whitelist_channel(guild)
+            if not whitelist_channel:
+                return
+            if use_embed:
+                embed = discord.Embed(
+                    title="📋 Whitelist-Warteraum verlassen",
+                    description=f"{member.mention} (`{member.display_name}`) hat den Warteraum verlassen.",
+                    color=discord.Color.light_gray(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="📍 Channel", value=channel.mention, inline=True)
+                embed.set_footer(text="Whitelist Warteraum System")
+                await whitelist_channel.send(embed=embed)
+            else:
+                await whitelist_channel.send(f"📋 {member.mention} (`{member.display_name}`) hat den Whitelist-Warteraum verlassen.")
+        except discord.Forbidden as e:
+            log.warning("Forbidden beim Senden des WL-Leave-Events (Guild %s): %s", guild.id, e)
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler beim Senden des WL-Leave-Events (Guild %s)", guild.id)
+        except Exception:
+            log.exception("Unerwarteter Fehler in _notify_whitelist_leave (Guild %s)", guild.id)
 
     # HELPER METHODS - MÜSSEN VOR DEN COMMANDS DEFINIERT WERDEN!
     def _parse_channel_id(self, channel: str) -> Optional[int]:
-        """Parses a channel mention or ID to an integer ID"""
+        """Parse a channel mention or ID to an integer ID.
+
+        Accepts forms like `<#123>`, `123`, or whitespace-padded variants.
+        Returns None on parse failure. NOTE: this is a fallback for legacy
+        callers; new code should prefer `discord.TextChannel` / `discord.VoiceChannel`
+        converters in command signatures.
+        """
+        if channel is None:
+            return None
+        channel = channel.strip()
         if channel.startswith("<#") and channel.endswith(">"):
-            return int(channel[2:-1])
+            inner = channel[2:-1]
+            # Older clients sometimes produce `<#!123>` (nickname-mention form).
+            if inner.startswith("!"):
+                inner = inner[1:]
+            try:
+                return int(inner)
+            except ValueError:
+                return None
         try:
             return int(channel)
         except ValueError:
             return None
 
     def _parse_voice_channel_id(self, channel: str) -> Optional[int]:
-        """Parses a voice channel mention or ID to an integer ID"""
-        if channel.startswith("<#") and channel.endswith(">"):
-            return int(channel[2:-1])
-        try:
-            return int(channel)
-        except ValueError:
-            return None
+        """Same parsing logic as _parse_channel_id (kept as a separate name for
+        readability of call sites that explicitly expect a voice channel)."""
+        return self._parse_channel_id(channel)
 
     def _parse_role_id(self, role: str) -> Optional[int]:
-        """Parses a role mention or ID to an integer ID"""
+        """Parse a role mention or ID to an integer ID. Accepts `<@&123>` and `123`."""
+        if role is None:
+            return None
+        role = role.strip()
         if role.startswith("<@&") and role.endswith(">"):
-            return int(role[3:-1])
+            try:
+                return int(role[3:-1])
+            except ValueError:
+                return None
         try:
             return int(role)
         except ValueError:
             return None
+
+    async def _register_pending_request(self, guild: discord.Guild, message_id: int, user_id: int, *, whitelist: bool):
+        """Registriert eine versendete Support/Whitelist-Anfrage für die Smart-Escalation."""
+        key = "pending_whitelist_requests" if whitelist else "pending_support_requests"
+        pending = await self.config.guild(guild).get_attr(key)() or {}
+        pending[str(message_id)] = {
+            "user_id": user_id,
+            "sent_ts": _now_ts(),
+            "escalated": False,
+        }
+        await self.config.guild(guild).get_attr(key).set(pending)
+
+    async def _unregister_pending_request(self, guild: discord.Guild, message_id: int, *, whitelist: bool):
+        """Entfernt eine Anfrage aus der Pending-Liste (z.B. wenn ein Teamler den User geholt hat)."""
+        key = "pending_whitelist_requests" if whitelist else "pending_support_requests"
+        pending = await self.config.guild(guild).get_attr(key)() or {}
+        if str(message_id) in pending:
+            pending.pop(str(message_id), None)
+            await self.config.guild(guild).get_attr(key).set(pending)
+            return True
+        return False
 
     def create_fetch_user_callback(self, user_to_fetch: discord.Member, target_channel: discord.VoiceChannel, whitelist: bool = False):
         """Erstellt eine Callback-Funktion für den 'User zu mir holen' Button
@@ -1020,7 +1500,24 @@ class SupportCog(commands.Cog):
                 await user_to_fetch.move_to(target_vc)
                 system_name = "Whitelist" if whitelist else "Support"
                 await interaction.response.send_message(f"✅ {user_to_fetch.display_name} wurde zu dir in {target_vc.mention} geholt!", ephemeral=True)
-                
+
+                # Pending-Request aus der Eskalations-Liste entfernen (Anfrage wurde ja bearbeitet)
+                try:
+                    await self._unregister_pending_request(guild, interaction.message.id, whitelist=whitelist)
+                except Exception:
+                    log.exception("Konnte pending_request nicht zu entfernen (msg=%s)", interaction.message.id)
+
+                # cases_handled-Counter für den Teamler hochzählen (für CSV-Export/Leaderboard)
+                try:
+                    if whitelist:
+                        cur = await self.config.member(teamler).whitelist_cases_handled() or 0
+                        await self.config.member(teamler).whitelist_cases_handled.set(cur + 1)
+                    else:
+                        cur = await self.config.member(teamler).cases_handled() or 0
+                        await self.config.member(teamler).cases_handled.set(cur + 1)
+                except Exception:
+                    log.exception("Konnte cases_handled nicht inkrementieren (User %s)", teamler.id)
+
                 # Logge die Aktion
                 log_channel = await self.get_log_channel(guild) if not whitelist else await self.get_whitelist_log_channel(guild)
                 if log_channel:
@@ -1028,7 +1525,7 @@ class SupportCog(commands.Cog):
                         title=f"🎧 User geholt ({system_name})",
                         description=f"{teamler.mention} hat {user_to_fetch.mention} aus dem Warteraum geholt.",
                         color=discord.Color.green(),
-                        timestamp=datetime.utcnow()
+                        timestamp=_now()
                     )
                     embed.add_field(name="Von", value=target_channel.mention, inline=True)
                     embed.add_field(name="Zu", value=target_vc.mention, inline=True)
@@ -1489,7 +1986,7 @@ class SupportCog(commands.Cog):
         
         # Setze Target auf Duty
         await self.config.member(target_user).on_duty.set(True)
-        start_time = datetime.utcnow()
+        start_time = _now()
         await self.config.member(target_user).duty_start.set(start_time.timestamp())
         
         # Duty-Rolle hinzufügen
@@ -1520,8 +2017,8 @@ class SupportCog(commands.Cog):
         Erstellt ein permanentes Duty-Panel mit Buttons.
         Diese Nachricht sollte im Panel-Channel gepinnt werden.
         """
-        await ctx.send("🔄 Erstelle Duty-Panel mit Buttons...")
-        await self.create_panel_message(ctx)
+        async with ctx.typing():
+            await self.create_panel_message(ctx)
         await ctx.send("✅ Duty-Panel wurde erstellt! Du kannst die Buttons jetzt verwenden um dich an-/abzumelden.")
 
     @supportset.command(name="createstatusdisplay")
@@ -1532,26 +2029,31 @@ class SupportCog(commands.Cog):
         """
         guild = ctx.guild
         channel = await self.get_status_display_channel(guild)
-        
+
         if not channel:
-            channel = ctx.channel
-        
+            await ctx.send("❌ Kein Status-Display-Channel konfiguriert. Nutze `[p]supportset statusdisplaychannel`.")
+            return
+
         # Erstelle initiales Embed
         embed = discord.Embed(
             title="📊 Live Duty Status Übersicht",
             description="**Aktueller Status aller Teammitglieder im Dienst**\n\n_Lade Status..._",
             color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.add_field(name="🟢 Verfügbar", value="Keine", inline=True)
         embed.add_field(name="🔵 Beschäftigt", value="Keine", inline=True)
         embed.add_field(name="☕ In Pause", value="Keine", inline=True)
         embed.add_field(name="🟡 Abwesend", value="Keine", inline=False)
         embed.add_field(name="📈 Statistik", value="**0** im Duty", inline=False)
-        
-        message = await channel.send(embed=embed)
+
+        try:
+            message = await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            await ctx.send("❌ Konnte Status-Display nicht in diesem Channel posten.")
+            return
         await self.config.guild(guild).duty_status_display_message_id.set(message.id)
-        
+
         await ctx.send(f"✅ Erweitertes Status-Display wurde in {channel.mention} erstellt!")
 
     @supportset.command(name="refreshpanel")
@@ -1566,9 +2068,14 @@ class SupportCog(commands.Cog):
                 if channel:
                     old_msg = await channel.fetch_message(old_message_id)
                     await old_msg.delete()
-            except:
+            except discord.NotFound:
+                # Old message already gone — fine, we create a new one below.
                 pass
-        
+            except discord.Forbidden:
+                log.warning("Fehlende Rechte beim Löschen des alten Panels (Guild %s)", ctx.guild.id)
+            except discord.HTTPException:
+                log.exception("HTTP-Fehler beim Löschen des alten Panels (Guild %s)", ctx.guild.id)
+
         await self.create_panel_message(ctx)
         await ctx.send("✅ Duty-Panel wurde aktualisiert!")
 
@@ -1788,13 +2295,16 @@ class SupportCog(commands.Cog):
         """
         guild = ctx.guild
         channel = await self.get_team_channel(guild)
-        
+
         if not channel:
             channel = ctx.channel
-        
-        # Erstelle das Team-Panel
-        await self.update_team_panel(channel, guild)
-        await ctx.send("✅ Team-Panel wurde erstellt/aktualisiert!")
+
+        # Erstelle das Team-Panel (shared logic with [p]teampanel)
+        ok = await self.update_team_panel(channel, guild)
+        if ok:
+            await ctx.send(f"✅ Team-Panel in {channel.mention} erstellt/aktualisiert!")
+        else:
+            await ctx.send("❌ Konnte Team-Panel nicht erstellen (fehlende Rechte?).")
 
     # WHITELIST SYSTEM COMMANDS
     @commands.group(name="whitelistset", aliases=["whitelistconfig"])
@@ -2190,7 +2700,7 @@ class SupportCog(commands.Cog):
 
         # Log-Nachricht senden
         log_channel = await self.get_whitelist_log_channel(guild)
-        start_time = datetime.utcnow()
+        start_time = _now()
         if log_channel:
             embed = discord.Embed(
                 title="🔵 Whitelist-Berechtigung zugewiesen",
@@ -2269,7 +2779,7 @@ class SupportCog(commands.Cog):
             title="📋 Whitelist Information",
             description="Aktuelle Konfiguration und Status des Whitelist-Systems",
             color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.add_field(name="🔵 Aktive Duty-Handler", value=f"{duty_count} Handler\n{active_duty_display}", inline=False)
         embed.add_field(name="⏰ Auto-Duty-Ende", value=auto_duty_status, inline=True)
@@ -2368,7 +2878,7 @@ class SupportCog(commands.Cog):
             title="📊 Whitelist Statistiken",
             description=f"Statistiken für {guild.name}",
             color=discord.Color.green(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         
         embed.add_field(name="👥 Whitelisted Spieler", value=f"**{total_whitelisted}**", inline=True)
@@ -2417,7 +2927,7 @@ class SupportCog(commands.Cog):
         embed = discord.Embed(
             title="🔍 Whitelist Status",
             color=discord.Color.green() if is_whitelisted else discord.Color.red(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         
         embed.set_thumbnail(url=user.display_avatar.url)
@@ -2431,19 +2941,24 @@ class SupportCog(commands.Cog):
         temp_entries = await self.config.guild(guild).whitelist_temp_entries()
         if str(user.id) in temp_entries:
             expiry_ts = temp_entries[str(user.id)]
-            expiry_dt = datetime.fromtimestamp(expiry_ts)
-            if expiry_dt > datetime.utcnow():
-                remaining = expiry_dt - datetime.utcnow()
-                hours = remaining.total_seconds() / 3600
+            try:
+                expiry_ts = float(expiry_ts)
+            except (TypeError, ValueError):
+                expiry_ts = 0
+            # Use timezone-aware UTC for the comparison (the sweep loop also uses UTC).
+            now_ts = _now_ts()
+            if expiry_ts > now_ts:
+                remaining_seconds = expiry_ts - now_ts
+                hours = remaining_seconds / 3600
                 embed.add_field(name="⏳ Temporär", value=f"Läuft ab in **{hours:.1f} Stunden**", inline=False)
             else:
                 # Abgelaufen - Rolle entfernen
-                if approved_role in user.roles:
+                if user.get_role(approved_role.id) is not None:
                     try:
                         await user.remove_roles(approved_role, reason="Temporäre Whitelist abgelaufen")
-                    except:
-                        pass
-                temp_entries.pop(str(user.id))
+                    except discord.HTTPException:
+                        log.warning("Konnte abgelaufene temp. WL-Rolle nicht entfernen (User %s)", user.id)
+                temp_entries.pop(str(user.id), None)
                 await self.config.guild(guild).whitelist_temp_entries.set(temp_entries)
                 embed.add_field(name="⏳ Temporär", value="**Abgelaufen** (Rolle entfernt)", inline=False)
         
@@ -2497,7 +3012,7 @@ class SupportCog(commands.Cog):
             embed = discord.Embed(
                 title=f"📝 Notizen zu {user.display_name}",
                 color=discord.Color.blue(),
-                timestamp=datetime.utcnow()
+                timestamp=_now()
             )
             
             for i, entry in enumerate(user_notes[-10:], 1):  # Letzte 10 Notizen
@@ -2524,7 +3039,7 @@ class SupportCog(commands.Cog):
             new_note = {
                 "author_id": ctx.author.id,
                 "note": note,
-                "timestamp": datetime.utcnow().timestamp()
+                "timestamp": _now_ts()
             }
             notes[user_id].append(new_note)
             await self.config.guild(guild).whitelist_notes.set(notes)
@@ -2532,7 +3047,7 @@ class SupportCog(commands.Cog):
             await ctx.send(f"✅ Notiz zu {user.display_name} hinzugefügt!")
     
     @commands.command(name="wldelnote", aliases=["whitelist_delnote", "wl_removenote", "delwlnote"])
-    async def wldelnote(self, ctx: commands.Context, user: discord.Member, note_index: int = None):
+    async def wldelnote(self, ctx: commands.Context, user: discord.Member, note_index: Union[int, str] = None):
         """
         Entfernt eine oder alle Notizen zu einem Spieler.
         
@@ -2574,7 +3089,7 @@ class SupportCog(commands.Cog):
             embed = discord.Embed(
                 title=f"📝 Verfügbare Notizen zu {user.display_name}",
                 color=discord.Color.orange(),
-                timestamp=datetime.utcnow()
+                timestamp=_now()
             )
             
             for i, entry in enumerate(user_notes, 1):
@@ -2687,9 +3202,9 @@ class SupportCog(commands.Cog):
             await ctx.send(f"ℹ️ {user.mention} hat bereits die Whitelist-Rolle!")
             return
         
-        # Berechne Ablaufzeit
-        expiry_dt = datetime.utcnow() + timedelta(minutes=minutes)
-        expiry_ts = expiry_dt.timestamp()
+        # Berechne Ablaufzeit (timezone-aware UTC — naive utcnow().timestamp() is host-TZ-dependent)
+        expiry_dt = _now() + timedelta(minutes=minutes)
+        expiry_ts = int(expiry_dt.timestamp())
         
         # Füge Rolle hinzu
         try:
@@ -2704,7 +3219,7 @@ class SupportCog(commands.Cog):
                 title="⏳ Temporäre Whitelist",
                 description=f"{user.mention} wurde temporär zur Whitelist hinzugefügt!",
                 color=discord.Color.gold(),
-                timestamp=datetime.utcnow()
+                timestamp=_now()
             )
             embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention}", inline=True)
             embed_success.add_field(name="⏰ Dauer", value=f"{hours:.1f} Stunden", inline=True)
@@ -2719,7 +3234,7 @@ class SupportCog(commands.Cog):
                     title="⏳ Temporärer Whitelist Eintrag",
                     description=f"**{user.mention}** wurde temporär whitelisted.",
                     color=discord.Color.gold(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 log_embed.set_thumbnail(url=user.display_avatar.url)
                 log_embed.add_field(name="🔹 Von", value=f"{member.mention}", inline=True)
@@ -2737,41 +3252,57 @@ class SupportCog(commands.Cog):
     async def wllog(self, ctx: commands.Context, limit: int = 10):
         """
         Zeigt die letzten Whitelist-Aktionen an.
-        
-        Verwendung: [p]wllog [Anzahl, Standard: 10]
+
+        Verwendung: [p]wllog [Anzahl, Standard: 10, Maximum: 25]
         """
+        if limit < 1:
+            limit = 10
+        # Cap to a sane upper bound so a user-supplied 100 doesn't fetch + render 100 embeds.
+        limit = min(limit, 25)
         guild = ctx.guild
         entries_channel = await self.get_whitelist_entries_channel(guild)
-        
+
         if not entries_channel:
             await ctx.send("❌ Kein Whitelist-Einträge-Channel konfiguriert!")
             return
-        
-        # Hole letzte Nachrichten
+
+        # Known whitelist-log embed titles — used to filter out unrelated embeds in the channel.
+        whitelist_titles = ("Whitelist Eintrag erstellt", "Whitelist Eintrag entfernt", "Temporärer Whitelist")
+
+        # Fetch more than `limit` because we filter; show only `limit`.
         messages = []
-        async for msg in entries_channel.history(limit=min(limit, 100)):
-            if msg.embeds:
+        async for msg in entries_channel.history(limit=min(limit * 5, 200)):
+            if not msg.embeds:
+                continue
+            emb = msg.embeds[0]
+            if not emb.title:
+                continue
+            if any(t.lower() in emb.title.lower() for t in whitelist_titles):
                 messages.append(msg)
-        
+                if len(messages) >= limit:
+                    break
+
         if not messages:
             await ctx.send("📭 Keine Whitelist-Einträge gefunden.")
             return
-        
+
         embed = discord.Embed(
             title="📋 Letzte Whitelist-Aktionen",
             description=f"Zeige die letzten {len(messages)} Einträge",
             color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
-        
-        for i, msg in enumerate(messages[:10], 1):  # Max 10 anzeigen
-            embed_desc = msg.embeds[0].description if msg.embeds[0].description else "Keine Beschreibung"
+
+        for i, msg in enumerate(messages, 1):
+            emb = msg.embeds[0]
+            # Embeds may legitimately have description=None — guard against TypeError.
+            desc = emb.description or "(keine Beschreibung)"
             embed.add_field(
-                name=f"#{i} - {msg.created_at.strftime('%d.%m %H:%M')}",
-                value=embed_desc[:200],  # Begrenze Länge
+                name=f"#{i} - {msg.created_at.strftime('%d.%m %H:%M')} • {emb.title}",
+                value=desc[:200],
                 inline=False
             )
-        
+
         embed.set_footer(text=f"Quelle: {entries_channel.name}")
         await ctx.send(embed=embed)
     
@@ -2817,64 +3348,96 @@ class SupportCog(commands.Cog):
         if not approved_role:
             await ctx.send("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.")
             return
-        
+
         # Prüfe ob der User bereits die Rolle hat
-        if approved_role in user.roles:
+        if user.get_role(approved_role.id) is not None:
             await ctx.send(f"ℹ️ {user.mention} hat bereits die Whitelist-Rolle!")
             return
+
+        # Cooldown-Prüfung: verhindert schnelles Re-Whitelisten desselben Users
+        cooldown_minutes = await self.config.guild(guild).whitelist_cooldown_minutes() or 0
+        if cooldown_minutes > 0:
+            # Track per-target user; store last-add timestamp in member-config of the target.
+            last_added_ts = await self.config.member(user).whitelist_last_added() or 0
+            if last_added_ts and (_now_ts() - int(last_added_ts)) < cooldown_minutes * 60:
+                remaining = cooldown_minutes * 60 - (_now_ts() - int(last_added_ts))
+                await ctx.send(
+                    f"❌ Cooldown aktiv für {user.mention} — bitte warte noch "
+                    f"**{remaining // 60}min {remaining % 60}s**."
+                )
+                return
         
         # Füge die Approved-Rolle hinzu
         try:
             await user.add_roles(approved_role, reason=f"Whitelist genehmigt von {member.display_name}")
-            
+
+            # Update last_added timestamp (for cooldown enforcement)
+            await self.config.member(user).whitelist_last_added.set(_now_ts())
+
             embed_success = discord.Embed(
                 title="✅ Whitelist genehmigt",
                 description=f"{user.mention} wurde erfolgreich zur Whitelist hinzugefügt!",
                 color=discord.Color.green(),
-                timestamp=datetime.utcnow()
+                timestamp=_now()
             )
             embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention} ({member.display_name})", inline=True)
             embed_success.add_field(name="🎮 Spieler", value=f"{user.display_name}", inline=True)
-            
+
             await ctx.send(embed=embed_success)
-            
+
             # Logge die Aktion im Whitelist-Einträge-Channel (getrennt von Duty-Logs!)
             entries_channel = await self.get_whitelist_entries_channel(guild)
+            log_ts = _now_ts()
             if entries_channel:
                 log_embed = discord.Embed(
                     title="📋 Whitelist Eintrag erstellt",
                     description=f"**{user.mention}** wurde zur Whitelist hinzugefügt.",
                     color=discord.Color.gold(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 log_embed.set_thumbnail(url=user.display_avatar.url)
                 log_embed.add_field(name="🔹 Genehmigt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Spieler", value=f"{user.mention}\n*{user.display_name}* (ID: `{user.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
-                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
+                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{log_ts}:F>\n(<t:{log_ts}:R>)", inline=True)
                 log_embed.set_footer(text="Whitelist-Eintrag • Genehmigt von " + member.display_name)
-                
-                await entries_channel.send(embed=log_embed)
-            
-            # Benachrichtige den Spieler
+
+                try:
+                    await entries_channel.send(embed=log_embed)
+                except discord.HTTPException:
+                    log.warning("Konnte WL-Eintrags-Log nicht senden in Guild %s", guild.id)
+
+            # Benachrichtige den Spieler (mit optional konfigurierbarer Welcome-Message)
             try:
+                welcome_msg = await self.config.guild(guild).whitelist_welcome_message()
+                if welcome_msg:
+                    # Support {user} and {helper} placeholders
+                    try:
+                        welcome_text = welcome_msg.format(user=user.mention, helper=member.mention)
+                    except Exception:
+                        welcome_text = welcome_msg
+                else:
+                    welcome_text = f"Du wurdest von **{member.display_name}** zur Whitelist hinzugefügt!"
                 dm_embed = discord.Embed(
                     title="🎉 Herzlichen Glückwunsch!",
-                    description=f"Du wurdest von **{member.display_name}** zur Whitelist hinzugefügt!",
+                    description=welcome_text,
                     color=discord.Color.green(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{approved_role.name}**", inline=False)
                 dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
                 dm_embed.set_footer(text=f"{guild.name} Whitelist System")
                 await user.send(embed=dm_embed)
             except discord.Forbidden:
-                pass
-            
+                pass  # User has DMs closed — not an error.
+
         except discord.Forbidden:
             await ctx.send("❌ Ich habe keine Berechtigung um diese Rolle zuzuweisen!")
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Ein Fehler ist beim Hinzufügen der Rolle aufgetreten: `{e}`")
         except Exception as e:
-            await ctx.send(f"❌ Ein Fehler ist beim Hinzufügen der Rolle aufgetreten: `{str(e)}`")
+            log.exception("Unerwarteter Fehler in whitelistuser (Guild %s)", guild.id)
+            await ctx.send(f"❌ Unerwarteter Fehler: `{e}`")
     
     @commands.command(name="removewhitelist", aliases=["unwhitelist", "wlremove", "delwhitelist"])
     async def removewhitelist(self, ctx: commands.Context, user: discord.Member):
@@ -2921,7 +3484,7 @@ class SupportCog(commands.Cog):
                 title="❌ Whitelist entfernt",
                 description=f"{user.mention} wurde die Whitelist-Rolle entzogen!",
                 color=discord.Color.red(),
-                timestamp=datetime.utcnow()
+                timestamp=_now()
             )
             embed_success.add_field(name="👤 Entfernt von", value=f"{member.mention} ({member.display_name})", inline=True)
             embed_success.add_field(name="🎮 Spieler", value=f"{user.display_name}", inline=True)
@@ -2935,13 +3498,13 @@ class SupportCog(commands.Cog):
                     title="🗑️ Whitelist Eintrag entfernt",
                     description=f"**{user.mention}** wurde die Whitelist entzogen.",
                     color=discord.Color.dark_red(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 log_embed.set_thumbnail(url=user.display_avatar.url)
                 log_embed.add_field(name="🔹 Entfernt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Spieler", value=f"{user.mention}\n*{user.display_name}* (ID: `{user.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
-                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
+                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(_now_ts())}:F>\n(<t:{int(_now_ts())}:R>)", inline=True)
                 log_embed.set_footer(text="Whitelist-Entfernung • Durchgeführt von " + member.display_name)
                 
                 await entries_channel.send(embed=log_embed)
@@ -2952,7 +3515,7 @@ class SupportCog(commands.Cog):
                     title="⚠️ Whitelist entfernt",
                     description=f"Deine Whitelist wurde von **{member.display_name}** entfernt.",
                     color=discord.Color.orange(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 dm_embed.add_field(name="❌ Rolle entfernt", value=f"{approved_role.mention}", inline=False)
                 dm_embed.set_footer(text=f"{guild.name} Whitelist System")
@@ -2997,64 +3560,83 @@ class SupportCog(commands.Cog):
             return
         
         # Prüfe ob der User die Rolle hat
-        if approved_role not in user.roles:
+        if user.get_role(approved_role.id) is None:
             await ctx.send(f"ℹ️ {user.mention} hat die Whitelist-Rolle nicht!")
             return
-        
+
         # Suche in den Logs nach dem Eintrag
-        log_channel = await self.get_whitelist_log_channel(guild)
+        # WICHTIG: Der Log-Channel für Duty-Logs ist nicht derselbe wie der Entries-Channel.
+        # Der ursprüngliche Code hat hier get_whitelist_log_channel() genutzt — das ist der Duty-Log-Channel.
+        # Tatsächlich stehen die Eintrag-Logs im Entries-Channel. Wir durchsuchen beide.
+        log_channel = await self.get_whitelist_entries_channel(guild)
         if not log_channel:
-            await ctx.send("❌ Kein Whitelist-Log-Channel konfiguriert!")
+            await ctx.send("❌ Kein Whitelist-Einträge-Channel konfiguriert!")
             return
-        
+
         await ctx.send("🔍 Durchsuche Whitelist-Logs...")
-        
+
         found_entry = None
         approver = None
         grant_time = None
-        
+
+        # Pre-compute all mention forms of the user we want to match.
+        user_mention_strs = {f"<@{user.id}>", f"<@!{user.id}>", str(user.id)}
+
         try:
-            # Durchsuche die letzten 1000 Nachrichten im Log-Channel
+            # Durchsuche die letzten 1000 Nachrichten im Entries-Channel
             async for message in log_channel.history(limit=1000):
                 if not message.embeds:
                     continue
-                
+
                 embed = message.embeds[0]
-                
-                # Prüfe ob es ein Whitelist-Eintrag für diesen User ist
-                if embed.title and ("Eintrag erstellt" in embed.title or "hinzugefügt" in embed.description.lower()):
-                    # Prüfe ob der User im Embed erwähnt wird
-                    if user.mention in str(embed.description) or user.id == int(user.id):
-                        # Finde den Genehmiger im Embed
-                        for field in embed.fields:
-                            if "genehmigt von" in field.name.lower() or "von" in field.name.lower():
-                                # Extrahiere den Mention des Genehmigers
-                                mention_parts = field.value.split(">")
-                                if len(mention_parts) > 1:
-                                    approver_mention = mention_parts[0] + ">"
-                                    approver = approver_mention
-                                
-                                if "zeitpunkt" in field.name.lower() or "time" in field.name.lower():
-                                    grant_time = field.value
-                        
-                        found_entry = message
-                        break
-            
+
+                # Skip embeds without a title — we only want whitelist-entry embeds.
+                if not embed.title:
+                    continue
+                title_lower = embed.title.lower()
+                # Only match "Eintrag erstellt" / "Temporärer Whitelist Eintrag" (not "Entfernt").
+                if "eintrag erstellt" not in title_lower and "temporärer whitelist" not in title_lower:
+                    continue
+
+                # Determine if this embed is actually about THIS user.
+                # (Bug-fix: the original `user.id == int(user.id)` was a tautology.)
+                embed_text = str(embed.description or "")
+                for field in embed.fields:
+                    embed_text += f" {field.value}"
+                if not any(s in embed_text for s in user_mention_strs):
+                    continue
+
+                # Finde den Genehmiger + Zeitpunkt im Embed
+                for field in embed.fields:
+                    name_lower = field.name.lower()
+                    # Match "Genehmigt von" only — "von" alone also matches "Entfernt von".
+                    if "genehmigt von" in name_lower or ("von" in name_lower and "entfernt" not in name_lower):
+                        # Robust mention extraction (handles <@123> and <@!123>).
+                        m = re.search(r"<@!?(\d+)>", field.value)
+                        if m:
+                            approver = m.group(0)  # the full mention string
+                    if "zeitpunkt" in name_lower or "time" in name_lower:
+                        grant_time = field.value
+
+                found_entry = message
+                break
+
             if found_entry and approver:
                 # Versuche den Genehmiger als Member zu finden
                 approver_member = None
-                if "<@" in approver:
+                m = re.search(r"<@!?(\d+)>", approver)
+                if m:
                     try:
-                        approver_id = int(approver.replace("<@", "").replace(">", ""))
-                        approver_member = await guild.fetch_member(approver_id)
-                    except:
+                        approver_id = int(m.group(1))
+                        approver_member = guild.get_member(approver_id) or await guild.fetch_member(approver_id)
+                    except (discord.NotFound, discord.HTTPException):
                         pass
-                
+
                 embed_result = discord.Embed(
                     title="📋 Whitelist Information",
                     description=f"Informationen zur Whitelist von {user.mention}",
                     color=discord.Color.blue(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 embed_result.add_field(
                     name="✅ Genehmigt von",
@@ -3077,13 +3659,16 @@ class SupportCog(commands.Cog):
                     inline=True
                 )
                 embed_result.set_footer(text=f"Whitelist-Check • Durchgeführt von {member.display_name}")
-                
+
                 await ctx.send(embed=embed_result)
             else:
                 await ctx.send(f"ℹ️ Kein Whitelist-Eintrag für {user.mention} in den Logs gefunden.\nDie Whitelist wurde möglicherweise vor der Log-Einrichtung oder manuell vergeben.")
-        
+
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ HTTP-Fehler beim Durchsuchen der Logs: `{e}`")
         except Exception as e:
-            await ctx.send(f"❌ Fehler beim Durchsuchen der Logs: `{str(e)}`")
+            log.exception("Unerwarteter Fehler in checkwhitelist (Guild %s)", guild.id)
+            await ctx.send(f"❌ Unerwarteter Fehler: `{e}`")
     
     @commands.command(name="whitelistlogfull", aliases=["fullwllog", "detailed_wllog"])
     async def whitelistlogfull(self, ctx: commands.Context, limit: int = 10):
@@ -3110,62 +3695,79 @@ class SupportCog(commands.Cog):
             await ctx.send("❌ Du benötigst die Whitelist-Handler-Rolle für diesen Befehl!")
             return
         
-        log_channel = await self.get_whitelist_log_channel(guild)
+        log_channel = await self.get_whitelist_entries_channel(guild)
         if not log_channel:
-            await ctx.send("❌ Kein Whitelist-Log-Channel konfiguriert!")
+            await ctx.send("❌ Kein Whitelist-Einträge-Channel konfiguriert!")
             return
-        
+
         # Begrenze auf max 50 Einträge
         limit = min(limit, 50)
-        
+
         entries = []
         try:
-            async for message in log_channel.history(limit=100):
+            async for message in log_channel.history(limit=200):
                 if not message.embeds:
                     continue
-                
+
                 embed = message.embeds[0]
-                if embed.title and ("Eintrag erstellt" in embed.title or "Eintrag entfernt" in embed.title or "hinzugefügt" in embed.title.lower() or "entfernt" in embed.title.lower()):
-                    entries.append({
-                        "title": embed.title,
-                        "description": embed.description,
-                        "color": embed.color,
-                        "timestamp": embed.timestamp if embed.timestamp else message.created_at,
-                        "fields": embed.fields[:2] if embed.fields else []  # Nur erste 2 Felder für Übersicht
-                    })
-                
+                # Skip embeds without a title; only whitelist-entry embeds.
+                if not embed.title:
+                    continue
+                title_lower = embed.title.lower()
+                if not any(k in title_lower for k in ("eintrag erstellt", "eintrag entfernt", "temporärer whitelist")):
+                    continue
+                # Use empty string for None description to avoid NoneType subscript errors later.
+                entries.append({
+                    "title": embed.title,
+                    "description": embed.description or "",
+                    "color": embed.color,
+                    "timestamp": embed.timestamp if embed.timestamp else message.created_at,
+                    "fields": embed.fields[:2] if embed.fields else [],
+                })
+
                 if len(entries) >= limit:
                     break
-            
+
             if not entries:
                 await ctx.send("ℹ️ Keine Whitelist-Einträge in den Logs gefunden.")
                 return
-            
+
             # Erstelle eine übersichtliche Liste
             embed_list = discord.Embed(
                 title="📋 Whitelist Verlauf",
                 description=f"Die letzten {len(entries)} Whitelist-Aktionen",
                 color=discord.Color.blue(),
-                timestamp=datetime.utcnow()
+                timestamp=_now()
             )
-            
+
             for i, entry in enumerate(entries, 1):
-                action_type = "✅" if "erstellt" in entry["title"].lower() or "hinzugefügt" in entry["title"].lower() else "❌"
-                desc_short = entry["description"][:80] + "..." if len(entry["description"]) > 80 else entry["description"]
-                time_str = f"<t:{int(entry['timestamp'].timestamp())}:R>" if entry["timestamp"] else "Unbekannt"
-                
+                title_lower = entry["title"].lower()
+                action_type = "✅" if ("erstellt" in title_lower or "temporärer" in title_lower) else "❌"
+                # description is guaranteed to be a string here.
+                desc = entry["description"]
+                desc_short = (desc[:80] + "...") if len(desc) > 80 else desc
+                if entry["timestamp"]:
+                    # entry["timestamp"] may be datetime (from embed.timestamp) or message.created_at (datetime).
+                    # Both are timezone-aware UTC from discord.py.
+                    time_str = f"<t:{int(entry['timestamp'].timestamp())}:R>"
+                else:
+                    time_str = "Unbekannt"
+
                 embed_list.add_field(
                     name=f"{action_type} Eintrag #{i} • {time_str}",
                     value=desc_short,
                     inline=False
                 )
-            
+
             embed_list.set_footer(text=f"Whitelist-Log • Angezeigt von {member.display_name}")
-            
+
             await ctx.send(embed=embed_list)
-        
+
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ HTTP-Fehler beim Abrufen der Logs: `{e}`")
         except Exception as e:
-            await ctx.send(f"❌ Fehler beim Abrufen der Logs: `{str(e)}`")
+            log.exception("Unerwarteter Fehler in whitelistlogfull (Guild %s)", guild.id)
+            await ctx.send(f"❌ Unerwarteter Fehler: `{e}`")
 
     # ============================================
     # NEUE SUPPORT & MODERATION BEFEHLE
@@ -3212,8 +3814,8 @@ class SupportCog(commands.Cog):
                 for m in base_role.members:
                     duty_start = await self.config.member(m).duty_start()
                     if duty_start:
-                        start_dt = datetime.fromtimestamp(duty_start)
-                        duration = (datetime.utcnow() - start_dt).total_seconds()
+                        start_dt = _from_ts(duty_start)
+                        duration = (_now() - start_dt).total_seconds()
                         total_duty_time += duration
                         members_with_duty += 1
         
@@ -3223,7 +3825,7 @@ class SupportCog(commands.Cog):
             title="📊 Support Statistiken",
             description="Aktuelle Übersicht des Support-Systems",
             color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         
         active_duty_display = "\n".join([f"• {name}" for name in duty_members_list[:10]]) if duty_members_list else "Niemand im Duty"
@@ -3273,6 +3875,79 @@ class SupportCog(commands.Cog):
         
         await ctx.send(f"✅ Feedback-Panel wurde in {channel.mention} erstellt!")
 
+    async def update_team_panel(self, channel: discord.TextChannel, guild: discord.Guild) -> bool:
+        """Erstellt oder aktualisiert das Team-Übersichts-Panel.
+
+        Returns True on success, False on failure.
+        Shared between the `teampanel` command and `supportset createteampanel`.
+        """
+        role_id = await self.config.guild(guild).role()
+        # Read-only — never spawn a duty role as a side effect of a panel refresh.
+        duty_role = await self.get_duty_role(guild)
+
+        team_members = []
+        on_duty_count = 0
+        off_duty_count = 0
+
+        if role_id:
+            base_role = guild.get_role(role_id)
+            if base_role:
+                # Single Config.all_members call instead of N per-member reads.
+                all_members = await self.config.all_members(guild)
+                for m in sorted(base_role.members, key=lambda x: x.display_name.lower()):
+                    is_duty = bool(all_members.get(m.id, {}).get("on_duty")) and (
+                        duty_role is None or m.get_role(duty_role.id) is not None
+                    )
+                    status_emoji = "🟢" if is_duty else "🔴"
+                    if is_duty:
+                        on_duty_count += 1
+                    else:
+                        off_duty_count += 1
+                    team_members.append(f"{status_emoji} {m.display_name}")
+
+        embed = discord.Embed(
+            title="👥 Team Übersicht",
+            description="**Unser Support-Team**\n\nHier siehst du alle Teammitglieder und deren aktuellen Status.",
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+
+        if team_members:
+            embed.add_field(name=f"🟢 Im Dienst ({on_duty_count})", value=f"Insgesamt {len(team_members)} Teammitglieder", inline=False)
+            members_text = "\n".join(team_members[:20])
+            if len(team_members) > 20:
+                members_text += f"\n...und {len(team_members) - 20} weitere"
+            embed.add_field(name="📋 Teammitglieder", value=members_text, inline=False)
+        else:
+            embed.add_field(name="Keine Teammitglieder", value="Es wurden noch keine Teammitglieder mit der Support-Basisrolle ausgestattet.", inline=False)
+
+        embed.set_footer(text=f"On Duty: {on_duty_count} | Off Duty: {off_duty_count}")
+
+        team_panel_message_id = await self.config.guild(guild).team_panel_message_id()
+
+        if team_panel_message_id:
+            try:
+                message = await channel.fetch_message(team_panel_message_id)
+                await message.edit(embed=embed)
+                return True
+            except discord.NotFound:
+                # Stale ID — clear and create new below.
+                await self.config.guild(guild).team_panel_message_id.set(None)
+            except discord.Forbidden:
+                log.warning("Fehlende Rechte beim Editieren des Team-Panels (Guild %s)", guild.id)
+                return False
+            except discord.HTTPException:
+                log.exception("HTTP-Fehler beim Editieren des Team-Panels (Guild %s)", guild.id)
+                return False
+
+        try:
+            message = await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("Konnte Team-Panel nicht in Channel %s senden", channel.id)
+            return False
+        await self.config.guild(guild).team_panel_message_id.set(message.id)
+        return True
+
     @commands.command(name="teampanel", aliases=["teamupdate", "updateteam"])
     async def teampanel(self, ctx: commands.Context):
         """
@@ -3281,61 +3956,692 @@ class SupportCog(commands.Cog):
         """
         guild = ctx.guild
         channel = await self.get_team_channel(guild)
-        
+
         if not channel:
             await ctx.send("❌ Kein Team-Channel konfiguriert!")
             return
-        
-        # Hole View-Klasse und aktualisiere Panel
-        from discord.ui import View
-        
+
+        ok = await self.update_team_panel(channel, guild)
+        if ok:
+            await ctx.send(f"✅ Team-Panel in {channel.mention} aktualisiert!")
+        else:
+            await ctx.send("❌ Konnte Team-Panel nicht aktualisieren (fehlende Rechte?).")
+
+    # ============================================
+    # TICKET SYSTEM
+    # ============================================
+
+    @commands.group(name="ticketset", aliases=["ticketconfig"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def ticketset(self, ctx: commands.Context):
+        """Konfiguriere das Ticket-System."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @ticketset.command(name="category")
+    async def ticketset_category(self, ctx: commands.Context, *, category: str = None):
+        """Setzt die Kategorie, in der Ticket-Channels erstellt werden. 'reset' zum Zurücksetzen."""
+        if category is None or category.lower() == "reset":
+            await self.config.guild(ctx.guild).ticket_category.set(None)
+            await ctx.send("✅ Ticket-Kategorie zurückgesetzt.")
+            return
+        cat_id = self._parse_channel_id(category)
+        if cat_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Kategorie-ID oder Mention ein.")
+            return
+        cat = ctx.guild.get_channel(cat_id)
+        if not cat or not isinstance(cat, discord.CategoryChannel):
+            await ctx.send("❌ Das ist keine Kategorie.")
+            return
+        await self.config.guild(ctx.guild).ticket_category.set(cat_id)
+        await ctx.send(f"✅ Ticket-Kategorie auf **{cat.name}** gesetzt.")
+
+    @ticketset.command(name="panelchannel")
+    async def ticketset_panelchannel(self, ctx: commands.Context, channel: str = None):
+        """Setzt den Channel für das Ticket-Panel. 'reset' zum Zurücksetzen."""
+        if channel is None or channel.lower() == "reset":
+            await self.config.guild(ctx.guild).ticket_panel_channel.set(None)
+            await ctx.send("✅ Ticket-Panel-Channel zurückgesetzt.")
+            return
+        ch_id = self._parse_channel_id(channel)
+        if ch_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein.")
+            return
+        ch = ctx.guild.get_channel(ch_id)
+        if not ch or not isinstance(ch, discord.TextChannel):
+            await ctx.send("❌ Channel nicht gefunden oder kein Text-Channel!")
+            return
+        await self.config.guild(ctx.guild).ticket_panel_channel.set(ch_id)
+        await ctx.send(f"✅ Ticket-Panel-Channel auf {ch.mention} gesetzt.")
+
+    @ticketset.command(name="supportrole")
+    async def ticketset_supportrole(self, ctx: commands.Context, role: str = None):
+        """Setzt die Rolle, die Tickets bearbeiten kann. 'reset' zum Zurücksetzen."""
+        if role is None or role.lower() == "reset":
+            await self.config.guild(ctx.guild).ticket_support_role.set(None)
+            await ctx.send("✅ Ticket-Support-Rolle zurückgesetzt.")
+            return
+        role_id = self._parse_role_id(role)
+        if role_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein.")
+            return
+        r = ctx.guild.get_role(role_id)
+        if not r:
+            await ctx.send("❌ Rolle nicht gefunden!")
+            return
+        await self.config.guild(ctx.guild).ticket_support_role.set(role_id)
+        await ctx.send(f"✅ Ticket-Support-Rolle auf {r.mention} gesetzt.")
+
+    @ticketset.command(name="logchannel")
+    async def ticketset_logchannel(self, ctx: commands.Context, channel: str = None):
+        """Setzt den Channel für Ticket-Logs (Erstellung/Schließung). 'reset' zum Zurücksetzen."""
+        if channel is None or channel.lower() == "reset":
+            await self.config.guild(ctx.guild).ticket_log_channel.set(None)
+            await ctx.send("✅ Ticket-Log-Channel zurückgesetzt.")
+            return
+        ch_id = self._parse_channel_id(channel)
+        if ch_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Channel-ID oder Mention ein.")
+            return
+        ch = ctx.guild.get_channel(ch_id)
+        if not ch or not isinstance(ch, discord.TextChannel):
+            await ctx.send("❌ Channel nicht gefunden oder kein Text-Channel!")
+            return
+        await self.config.guild(ctx.guild).ticket_log_channel.set(ch_id)
+        await ctx.send(f"✅ Ticket-Log-Channel auf {ch.mention} gesetzt.")
+
+    @ticketset.command(name="show")
+    async def ticketset_show(self, ctx: commands.Context):
+        """Zeigt die aktuelle Ticket-Konfiguration."""
+        g = self.config.guild(ctx.guild)
+        cat_id = await g.ticket_category()
+        panel_ch_id = await g.ticket_panel_channel()
+        role_id = await g.ticket_support_role()
+        log_ch_id = await g.ticket_log_channel()
+        counter = await g.ticket_counter()
+
+        cat = ctx.guild.get_channel(cat_id) if cat_id else None
+        panel_ch = ctx.guild.get_channel(panel_ch_id) if panel_ch_id else None
+        role = ctx.guild.get_role(role_id) if role_id else None
+        log_ch = ctx.guild.get_channel(log_ch_id) if log_ch_id else None
+
+        embed = discord.Embed(
+            title="🎫 Ticket-System Konfiguration",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Kategorie", value=cat.name if cat else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Panel-Channel", value=panel_ch.mention if panel_ch else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Support-Rolle", value=role.mention if role else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Log-Channel", value=log_ch.mention if log_ch else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Ticket-Counter", value=str(counter), inline=True)
+        embed.set_footer(text=f"{ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    @ticketset.command(name="createpanel")
+    async def ticketset_createpanel(self, ctx: commands.Context):
+        """Erstellt das Ticket-Panel mit einem 'Ticket erstellen'-Button."""
+        guild = ctx.guild
+        channel = await self.get_ticket_panel_channel(guild)
+        if not channel:
+            await ctx.send("❌ Kein Ticket-Panel-Channel konfiguriert. Nutze `[p]ticketset panelchannel`.")
+            return
+        # Prüfen, dass Kategorie + Support-Rolle gesetzt sind
+        category = await self.get_ticket_category(guild)
+        support_role = await self.get_ticket_support_role(guild)
+        if not category:
+            await ctx.send("❌ Keine Ticket-Kategorie konfiguriert. Nutze `[p]ticketset category`.")
+            return
+        if not support_role:
+            await ctx.send("❌ Keine Ticket-Support-Rolle konfiguriert. Nutze `[p]ticketset supportrole`.")
+            return
+
+        embed = discord.Embed(
+            title="🎫 Ticket erstellen",
+            description=(
+                "Brauchst du Hilfe oder möchtest etwas anfragen?\n\n"
+                "Klicke auf den Button unten und beschreibe dein Anliegen — "
+                "ein privater Ticket-Channel wird für dich erstellt."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Ticket-System • Klicke auf den Button")
+        view = TicketPanelView(self)
+        try:
+            message = await channel.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException):
+            await ctx.send("❌ Konnte das Ticket-Panel nicht in diesem Channel posten.")
+            return
+        # Altes Panel löschen falls vorhanden
+        old_id = await self.config.guild(guild).ticket_panel_message_id()
+        if old_id:
+            try:
+                old_msg = await channel.fetch_message(old_id)
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        await self.config.guild(guild).ticket_panel_message_id.set(message.id)
+        await ctx.send(f"✅ Ticket-Panel in {channel.mention} erstellt!")
+
+    async def _create_ticket(self, interaction: discord.Interaction, subject: str, requester: discord.Member):
+        """Erstellt einen Ticket-Channel für einen User."""
+        guild = interaction.guild
+        category = await self.get_ticket_category(guild)
+        support_role = await self.get_ticket_support_role(guild)
+        if not category or not support_role:
+            await interaction.response.send_message(
+                "❌ Ticket-System ist nicht vollständig konfiguriert. Bitte informiere einen Admin.",
+                ephemeral=True,
+            )
+            return
+
+        # Ticket-Nummer hochzählen
+        counter = await self.config.guild(guild).ticket_counter() or 0
+        counter += 1
+        await self.config.guild(guild).ticket_counter.set(counter)
+        ticket_name = f"ticket-{counter:04d}"
+
+        # Berechtigungen: nur requester + support_role + admins dürfen sehen/schreiben
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            requester: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+            support_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
+        }
+        # Bot-Owner / Admins dürfen auch
+        if guild.me.top_role:
+            overwrites[guild.me.top_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=ticket_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Ticket #{counter} von {requester.display_name}",
+                topic=f"Ticket #{counter} • User: {requester.id} • Betreff: {subject[:200]}",
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ Mir fehlen die Rechte, um einen Ticket-Channel zu erstellen.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"❌ Konnte Ticket-Channel nicht erstellen: `{e}`",
+                ephemeral=True,
+            )
+            return
+
+        # Begrüßungs-Embed im Ticket-Channel
+        embed = discord.Embed(
+            title=f"🎫 Ticket #{counter}",
+            description=(
+                f"Hallo {requester.mention}!\n\n"
+                f"**Betreff:** {subject}\n\n"
+                f"Ein Teammitglied wird sich gleich um dein Anliegen kümmern.\n"
+                f"Bitte beschreibe dein Problem so detailliert wie möglich."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="🎫 Ticket-ID", value=f"#{counter}", inline=True)
+        embed.add_field(name="👤 Erstellt von", value=f"{requester.mention}\n`{requester.id}`", inline=True)
+        embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
+
+        close_view = TicketCloseView(self)
+        try:
+            await ticket_channel.send(
+                content=f"{support_role.mention} {requester.mention}",
+                embed=embed,
+                view=close_view,
+                allowed_mentions=discord.AllowedMentions(roles=[support_role], users=[requester]),
+            )
+        except discord.HTTPException:
+            log.warning("Konnte Begrüßungs-Nachricht im Ticket-Channel nicht senden (Guild %s)", guild.id)
+
+        # Log-Eintrag
+        log_channel_id = await self.config.guild(guild).ticket_log_channel()
+        log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
+        if log_channel:
+            try:
+                log_embed = discord.Embed(
+                    title="🎫 Ticket erstellt",
+                    description=f"Ticket-Channel: {ticket_channel.mention}",
+                    color=discord.Color.green(),
+                    timestamp=_now(),
+                )
+                log_embed.add_field(name="👤 Von", value=f"{requester.mention}\n`{requester.id}`", inline=True)
+                log_embed.add_field(name="🎫 ID", value=f"#{counter}", inline=True)
+                log_embed.add_field(name="📝 Betreff", value=subject[:500], inline=False)
+                await log_channel.send(embed=log_embed)
+            except discord.HTTPException:
+                pass
+
+        await interaction.response.send_message(
+            f"✅ Dein Ticket wurde erstellt: {ticket_channel.mention}",
+            ephemeral=True,
+        )
+
+    async def _close_ticket(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        """Schließt einen Ticket-Channel (mit Bestätigung)."""
+        guild = interaction.guild
+        # Prüfen ob es ein Ticket ist (Name fängt mit "ticket-" an)
+        if not channel.name.startswith("ticket-"):
+            await interaction.response.send_message(
+                "❌ Dieser Channel ist kein Ticket-Channel.",
+                ephemeral=True,
+            )
+            return
+        support_role = await self.get_ticket_support_role(guild)
+        requester_member = interaction.user
+        if not isinstance(requester_member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        # Berechtigung: Support-Rolle oder manage_channels
+        is_support = support_role is not None and requester_member.get_role(support_role.id) is not None
+        is_admin = requester_member.guild_permissions.manage_channels
+        # Ticket-Ersteller darf auch schließen (sofern erkennbar aus dem Topic)
+        is_creator = False
+        if channel.topic and f"User: {requester_member.id}" in channel.topic:
+            is_creator = True
+        if not (is_support or is_admin or is_creator):
+            await interaction.response.send_message(
+                "❌ Du bist nicht berechtigt, dieses Ticket zu schließen.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Log-Eintrag VOR dem Löschen (sonst ist der Channel weg)
+        log_channel_id = await self.config.guild(guild).ticket_log_channel()
+        log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
+        if log_channel:
+            try:
+                # Versuche den Ersteller aus dem Topic zu extrahieren
+                creator_mention = "Unbekannt"
+                if channel.topic:
+                    m = re.search(r"User: (\d+)", channel.topic)
+                    if m:
+                        try:
+                            creator_mention = f"<@{int(m.group(1))}>"
+                        except ValueError:
+                            pass
+                log_embed = discord.Embed(
+                    title="🎫 Ticket geschlossen",
+                    description=f"Ticket-Channel: `{channel.name}` (gelöscht)",
+                    color=discord.Color.red(),
+                    timestamp=_now(),
+                )
+                log_embed.add_field(name="👤 Geschlossen von", value=f"{requester_member.mention}\n`{requester_member.id}`", inline=True)
+                log_embed.add_field(name="🎫 Ersteller", value=creator_mention, inline=True)
+                await log_channel.send(embed=log_embed)
+            except discord.HTTPException:
+                pass
+
+        # Channel löschen
+        try:
+            await channel.delete(reason=f"Ticket geschlossen von {requester_member.display_name}")
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Mir fehlen die Rechte, um den Channel zu löschen.", ephemeral=True)
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"❌ Konnte Channel nicht löschen: `{e}`", ephemeral=True)
+
+    # ============================================
+    # DUTY HANDOVER
+    # ============================================
+
+    @duty_group.command(name="handover", aliases=["transfer"])
+    async def duty_handover(self, ctx: commands.Context, target: discord.Member):
+        """Übergibt deinen aktiven Duty an einen anderen Teamkollegen.
+
+        Du wirst vom Duty abgemeldet, der Ziel-User wird angemeldet.
+        Der Ziel-User muss die Support-Basisrolle haben.
+        """
+        guild = ctx.guild
+        member = ctx.author
+
+        if target.id == member.id:
+            await ctx.send("❌ Du kannst Duty nicht an dich selbst übergeben.")
+            return
+        if target.bot:
+            await ctx.send("❌ Du kannst Duty nicht an einen Bot übergeben.")
+            return
+
         role_id = await self.config.guild(guild).role()
-        duty_role = await self.get_or_create_duty_role(guild)
-        
-        team_members = []
-        on_duty_count = 0
-        off_duty_count = 0
-        
+        if not role_id:
+            await ctx.send("❌ Keine Support-Rolle konfiguriert.")
+            return
+        if target.get_role(role_id) is None:
+            await ctx.send(f"❌ {target.mention} hat nicht die Support-Basisrolle.")
+            return
+
+        is_on_duty = await self.config.member(member).on_duty()
+        if not is_on_duty:
+            await ctx.send("❌ Du bist aktuell nicht im Duty.")
+            return
+        target_on_duty = await self.config.member(target).on_duty()
+        if target_on_duty:
+            await ctx.send(f"❌ {target.mention} ist bereits im Duty.")
+            return
+
+        # Sender abmelden (mit _finalize_duty_stop für saubere Statistik)
+        async with self._lock_for(guild.id, member.id):
+            await self._finalize_duty_stop(member, whitelist=False, reason=f"Duty übergeben an {target.display_name}")
+
+        # Ziel anmelden
+        async with self._lock_for(guild.id, target.id):
+            await self.config.member(target).on_duty.set(True)
+            start_ts = _now_ts()
+            await self.config.member(target).duty_start.set(start_ts)
+            await self.config.member(target).duty_status.set("available")
+            await self.config.member(target).duty_status_message.set(None)
+            current_sessions = await self.config.member(target).duty_session_count() or 0
+            await self.config.member(target).duty_session_count.set(current_sessions + 1)
+            await self.config.member(target).duty_break_count.set(0)
+            await self.config.member(target).duty_total_break_time.set(0)
+            await self.config.member(target).current_break_start.set(None)
+            ok = await self.update_duty_role(target, True)
+            if not ok:
+                # Rollback
+                await self.config.member(target).on_duty.set(False)
+                await self.config.member(target).duty_start.set(None)
+                await self.config.member(target).duty_status.set("off_duty")
+                await self.config.member(target).duty_session_count.set(current_sessions)
+                await ctx.send("❌ Konnte Duty-Rolle für den Ziel-User nicht zuweisen. Übergabe abgebrochen.")
+                return
+
+        # Refresh panels
+        await self.update_panel_display(guild)
+        await self.update_status_display(guild)
+
+        # Log
+        log_channel = await self.get_log_channel(guild)
+        if log_channel:
+            try:
+                embed = discord.Embed(
+                    title="🔄 Duty übergeben",
+                    description=f"{member.mention} hat Duty an {target.mention} übergeben.",
+                    color=discord.Color.gold(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="👤 Von", value=member.display_name, inline=True)
+                embed.add_field(name="👤 An", value=target.display_name, inline=True)
+                await log_channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+        await ctx.send(f"✅ Duty von {member.mention} an {target.mention} übergeben.")
+
+    # ============================================
+    # SUPPORT BLOCKLIST
+    # ============================================
+
+    async def _can_manage_blocklist(self, member: discord.Member, guild: discord.Guild) -> bool:
+        """Prüft, ob ein Member die Blocklist verwalten darf."""
+        if member.guild_permissions.manage_guild:
+            return True
+        role_id = await self.config.guild(guild).support_blocklist_role()
+        if role_id and member.get_role(role_id) is not None:
+            return True
+        # Support-Basisrolle darf auch (für schnelle Troll-Abwehr)
+        base_role_id = await self.config.guild(guild).role()
+        if base_role_id and member.get_role(base_role_id) is not None:
+            return True
+        return False
+
+    @commands.command(name="supportblock", aliases=["sblock", "blocksupport"])
+    @commands.guild_only()
+    async def support_block(self, ctx: commands.Context, user: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Blockiert einen User vom Support-System (keine Notifications bei Warteraum-Betritt)."""
+        guild = ctx.guild
+        if not await self._can_manage_blocklist(ctx.author, guild):
+            await ctx.send("❌ Du bist nicht berechtigt, die Blocklist zu verwalten.")
+            return
+        if user.bot:
+            await ctx.send("❌ Bots können nicht blockiert werden.")
+            return
+        if user == ctx.author:
+            await ctx.send("❌ Du kannst dich nicht selbst blockieren.")
+            return
+        blocklist = await self.config.guild(guild).support_blocklist() or {}
+        if str(user.id) in blocklist:
+            await ctx.send(f"ℹ️ {user.mention} ist bereits blockiert.")
+            return
+        blocklist[str(user.id)] = {
+            "blocked_by": ctx.author.id,
+            "reason": reason[:500],
+            "timestamp": _now_ts(),
+        }
+        await self.config.guild(guild).support_blocklist.set(blocklist)
+        await ctx.send(f"✅ {user.mention} wurde vom Support-System blockiert.\n**Grund:** {reason[:500]}")
+
+    @commands.command(name="supportunblock", aliases=["sunblock", "unblocksupport"])
+    @commands.guild_only()
+    async def support_unblock(self, ctx: commands.Context, user: discord.Member):
+        """Hebt die Blockade eines Users auf."""
+        guild = ctx.guild
+        if not await self._can_manage_blocklist(ctx.author, guild):
+            await ctx.send("❌ Du bist nicht berechtigt, die Blocklist zu verwalten.")
+            return
+        blocklist = await self.config.guild(guild).support_blocklist() or {}
+        if str(user.id) not in blocklist:
+            await ctx.send(f"ℹ️ {user.mention} ist nicht blockiert.")
+            return
+        entry = blocklist.pop(str(user.id))
+        await self.config.guild(guild).support_blocklist.set(blocklist)
+        blocked_by_id = entry.get("blocked_by")
+        blocked_by = guild.get_member(blocked_by_id) if blocked_by_id else None
+        await ctx.send(
+            f"✅ {user.mention} wurde entblockt.\n"
+            f"(Ursprünglich blockiert von {blocked_by.display_name if blocked_by else 'Unbekannt'})"
+        )
+
+    @commands.command(name="supportblocklist", aliases=["sblocklist", "blocklist"])
+    @commands.guild_only()
+    async def support_blocklist(self, ctx: commands.Context):
+        """Zeigt alle blockierten User an."""
+        guild = ctx.guild
+        blocklist = await self.config.guild(guild).support_blocklist() or {}
+        if not blocklist:
+            await ctx.send("📭 Die Support-Blocklist ist leer.")
+            return
+        embed = discord.Embed(
+            title="🚫 Support-Blocklist",
+            description=f"{len(blocklist)} blockierte(r) User",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        for uid_str, info in list(blocklist.items())[:25]:
+            try:
+                uid = int(uid_str)
+            except ValueError:
+                continue
+            user = guild.get_member(uid)
+            name = user.mention if user else f"`{uid}`"
+            blocker = guild.get_member(info.get("blocked_by"))
+            blocker_name = blocker.display_name if blocker else "Unbekannt"
+            reason = info.get("reason", "Kein Grund")[:100]
+            ts = info.get("timestamp", 0)
+            time_str = f"<t:{int(ts)}:R>" if ts else "Unbekannt"
+            embed.add_field(
+                name=f"🚫 {name}",
+                value=f"**Grund:** {reason}\n**Von:** {blocker_name}\n**Wann:** {time_str}",
+                inline=False,
+            )
+        if len(blocklist) > 25:
+            embed.set_footer(text=f"Zeige 25 von {len(blocklist)} Einträgen")
+        await ctx.send(embed=embed)
+
+    @commands.group(name="blockset")
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def blockset(self, ctx: commands.Context):
+        """Konfiguriere die Support-Blocklist."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @blockset.command(name="role")
+    async def blockset_role(self, ctx: commands.Context, role: str = None):
+        """Setzt die Rolle, die die Blocklist verwalten darf. 'reset' zum Zurücksetzen."""
+        if role is None or role.lower() == "reset":
+            await self.config.guild(ctx.guild).support_blocklist_role.set(None)
+            await ctx.send("✅ Blocklist-Verwalter-Rolle zurückgesetzt.")
+            return
+        role_id = self._parse_role_id(role)
+        if role_id is None:
+            await ctx.send("❌ Bitte gib eine gültige Rollen-ID oder Mention ein.")
+            return
+        r = ctx.guild.get_role(role_id)
+        if not r:
+            await ctx.send("❌ Rolle nicht gefunden!")
+            return
+        await self.config.guild(ctx.guild).support_blocklist_role.set(role_id)
+        await ctx.send(f"✅ Blocklist-Verwalter-Rolle auf {r.mention} gesetzt.")
+
+    # ============================================
+    # ESCALATION & AWAY-RETURN SETTINGS
+    # ============================================
+
+    @supportset.command(name="escalation")
+    async def supportset_escalation(self, ctx: commands.Context, minutes: int = None):
+        """Konfiguriert die Smart-Escalation: nach X Min ohne Reaktion wird die Basis-Rolle gepingt.
+
+        Verwendung:
+        - `[p]supportset escalation 5` — Eskalation nach 5 Minuten
+        - `[p]supportset escalation 0` — Eskalation deaktivieren
+        - `[p]supportset escalation` — Status anzeigen
+        """
+        if minutes is None:
+            enabled = await self.config.guild(ctx.guild).escalation_enabled()
+            cur = await self.config.guild(ctx.guild).escalation_minutes()
+            await ctx.send(f"ℹ️ Smart-Escalation ist **{'aktiv' if enabled else 'inaktiv'}** —pingt nach **{cur} Min**.")
+            return
+        if minutes < 0:
+            await ctx.send("❌ Minuten dürfen nicht negativ sein.")
+            return
+        if minutes == 0:
+            await self.config.guild(ctx.guild).escalation_enabled.set(False)
+            await ctx.send("✅ Smart-Escalation deaktiviert.")
+            return
+        await self.config.guild(ctx.guild).escalation_enabled.set(True)
+        await self.config.guild(ctx.guild).escalation_minutes.set(minutes)
+        await ctx.send(f"✅ Smart-Escalation aktiviert — pingt nach **{minutes} Min** ohne Reaktion die Basis-Rolle.")
+
+    @supportset.command(name="awayautoreturn")
+    async def supportset_awayautoreturn(self, ctx: commands.Context, minutes: int = None):
+        """Konfiguriert Away-Auto-Return: 'away'-Status wird nach X Min automatisch auf 'available' zurückgesetzt.
+
+        Verwendung:
+        - `[p]supportset awayautoreturn 15` — nach 15 Minuten
+        - `[p]supportset awayautoreturn 0` — deaktivieren
+        - `[p]supportset awayautoreturn` — Status anzeigen
+        """
+        if minutes is None:
+            cur = await self.config.guild(ctx.guild).away_auto_return_minutes()
+            await ctx.send(f"ℹ️ Away-Auto-Return: **{cur} Min** ({'aktiv' if cur > 0 else 'inaktiv'}).")
+            return
+        if minutes < 0:
+            await ctx.send("❌ Minuten dürfen nicht negativ sein.")
+            return
+        await self.config.guild(ctx.guild).away_auto_return_minutes.set(minutes)
+        if minutes == 0:
+            await ctx.send("✅ Away-Auto-Return deaktiviert.")
+        else:
+            await ctx.send(f"✅ Away-Auto-Return auf **{minutes} Min** gesetzt.")
+
+    # ============================================
+    # CSV STATS EXPORT
+    # ============================================
+
+    @commands.command(name="dutyexport", aliases=["dutycsv", "exportduty"])
+    @commands.guild_only()
+    @commands.mod_or_permissions(manage_guild=True)
+    async def duty_export(self, ctx: commands.Context):
+        """Exportiert Duty-Statistiken aller Teammitglieder als CSV-Datei."""
+        guild = ctx.guild
+        role_id = await self.config.guild(guild).role()
+        wl_role_id = await self.config.guild(guild).whitelist_role()
+
+        # Alle Member-Daten abrufen
+        all_members = await self.config.all_members(guild)
+
+        # Team-Mitglieder sammeln (Support-Basisrolle oder WL-Basisrolle)
+        team_ids = set()
         if role_id:
             base_role = guild.get_role(role_id)
             if base_role:
-                for m in sorted(base_role.members, key=lambda x: x.display_name.lower()):
-                    is_duty = await self.config.member(m).on_duty()
-                    status_emoji = "🟢" if is_duty else "🔴"
-                    if is_duty:
-                        on_duty_count += 1
-                    else:
-                        off_duty_count += 1
-                    team_members.append(f"{status_emoji} {m.display_name}")
-        
-        embed = discord.Embed(
-            title="👥 Team Übersicht",
-            description="**Unser Support-Team**\n\nHier siehst du alle Teammitglieder und deren aktuellen Status.",
-            color=discord.Color.blue()
+                for m in base_role.members:
+                    team_ids.add(m.id)
+        if wl_role_id:
+            wl_base_role = guild.get_role(wl_role_id)
+            if wl_base_role:
+                for m in wl_base_role.members:
+                    team_ids.add(m.id)
+        # Auch Member erfassen, die zwar nicht mehr in der Rolle sind, aber Statistiken haben
+        for uid in all_members.keys():
+            team_ids.add(int(uid))
+
+        if not team_ids:
+            await ctx.send("ℹ️ Keine Teammitglieder oder Statistiken gefunden.")
+            return
+
+        # CSV bauen
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+        # Header
+        writer.writerow([
+            "user_id", "display_name", "username",
+            "on_duty", "duty_start_ts", "duty_status",
+            "total_duty_time_sec", "total_duty_time_h",
+            "wl_on_duty", "wl_duty_start_ts",
+            "total_wl_duty_time_sec", "total_wl_duty_time_h",
+            "cases_handled", "wl_cases_handled",
+            "duty_session_count", "last_duty_end_ts",
+        ])
+
+        for uid in sorted(team_ids):
+            uid_int = int(uid)
+            data = all_members.get(uid_int, {})
+            member = guild.get_member(uid_int)
+            display_name = member.display_name if member else "(ex-Team)"
+            username = member.name if member else ""
+
+            total_sup = data.get("total_duty_time", 0) or 0
+            total_wl = data.get("total_whitelist_duty_time", 0) or 0
+            writer.writerow([
+                uid_int,
+                display_name,
+                username,
+                "yes" if data.get("on_duty") else "no",
+                data.get("duty_start") or "",
+                data.get("duty_status", "available"),
+                total_sup,
+                f"{total_sup / 3600:.2f}",
+                "yes" if data.get("whitelist_on_duty") else "no",
+                data.get("whitelist_duty_start") or "",
+                total_wl,
+                f"{total_wl / 3600:.2f}",
+                data.get("cases_handled", 0) or 0,
+                data.get("whitelist_cases_handled", 0) or 0,
+                data.get("duty_session_count", 0) or 0,
+                data.get("last_duty_end") or "",
+            ])
+
+        # Datei an Discord senden
+        content = output.getvalue().encode("utf-8")
+        # BOM für Excel-Kompatibilität
+        content = b"\xef\xbb\xbf" + content
+        file = discord.File(io.BytesIO(content), filename=f"duty_stats_{guild.id}_{_now().strftime('%Y%m%d_%H%M')}.csv")
+        await ctx.send(
+            content=f"📊 Duty-Statistik-Export für **{guild.name}** ({len(team_ids)} Teammitglieder)",
+            file=file,
         )
-        
-        if team_members:
-            embed.add_field(name=f"🟢 Im Dienst ({on_duty_count})", value=f"Insgesamt {len(team_members)} Teammitglieder", inline=False)
-            embed.add_field(name="📋 Teammitglieder", value="\n".join(team_members[:20]) + (f"\n...und {len(team_members) - 20} weitere" if len(team_members) > 20 else ""), inline=False)
-        else:
-            embed.add_field(name="Keine Teammitglieder", value="Es wurden noch keine Teammitglieder mit der Support-Basisrolle ausgestattet.", inline=False)
-        
-        embed.set_footer(text=f"On Duty: {on_duty_count} | Off Duty: {off_duty_count}")
-        
-        team_panel_message_id = await self.config.guild(guild).team_panel_message_id()
-        
-        if team_panel_message_id:
-            try:
-                message = await channel.fetch_message(team_panel_message_id)
-                await message.edit(embed=embed)
-                await ctx.send(f"✅ Team-Panel aktualisiert!")
-                return
-            except:
-                pass
-        
-        message = await channel.send(embed=embed)
-        await self.config.guild(guild).team_panel_message_id.set(message.id)
-        await ctx.send(f"✅ Team-Panel in {channel.mention} erstellt!")
 
     # ============================================
     # WEITERE NEUE BEFEHLE FÜR SUPPORT & MODERATION
@@ -3390,7 +4696,7 @@ class SupportCog(commands.Cog):
             title="ℹ️ Support System Informationen",
             description="Übersicht über das Support-System dieses Servers",
             color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         
         # Support Channel Info
@@ -3441,6 +4747,225 @@ class SupportCog(commands.Cog):
     # ============================================
     # DUTY COMMANDS - Neue Textbefehle für Duty
     # ============================================
+
+    async def update_panel_display(self, guild: discord.Guild):
+        """Aktualisiert das Support-Duty-Panel mit der aktuellen Liste der Duty-Mitglieder.
+
+        Diese Methode lebt auf der Cog (nicht auf der View!), damit alle
+        `duty *` Text-Befehle und die DutyButtonView sie gemeinsam nutzen können.
+        Verwendet read-only `get_duty_role`, damit ein Panel-Refresh niemals
+        als Side-Effect eine neue Rolle erstellt.
+        """
+        panel_message_id = await self.config.guild(guild).panel_message_id()
+        if not panel_message_id:
+            return
+        panel_channel = await self.get_panel_channel(guild)
+        if not panel_channel:
+            return
+        try:
+            panel_message = await panel_channel.fetch_message(panel_message_id)
+        except discord.NotFound:
+            await self.config.guild(guild).panel_message_id.set(None)
+            return
+        except discord.Forbidden:
+            log.warning("Fehlende Rechte zum Abrufen des Duty-Panels (Guild %s)", guild.id)
+            return
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler beim Abrufen des Duty-Panels (Guild %s)", guild.id)
+            return
+
+        duty_role = await self.get_duty_role(guild)
+        role_id = await self.config.guild(guild).role()
+
+        duty_count = 0
+        duty_list = []
+        if role_id and duty_role:
+            base_role = guild.get_role(role_id)
+            if base_role:
+                # Single Config.all_members call instead of N per-member reads.
+                all_members = await self.config.all_members(guild)
+                for m in base_role.members:
+                    if m.get_role(duty_role.id) is None:
+                        continue
+                    member_data = all_members.get(m.id, {})
+                    if not member_data.get("on_duty"):
+                        continue
+                    duty_count += 1
+                    status = member_data.get("duty_status", "available")
+                    status_emoji = {"available": "🟢", "busy": "🔵", "break": "☕", "away": "🟡"}.get(status, "🟢")
+                    duty_list.append(f"{status_emoji} {m.display_name}")
+
+        if duty_count > 0:
+            duty_text = "\n".join(duty_list[:15])
+            if len(duty_list) > 15:
+                duty_text += f"\n• ...und {duty_count - 15} weitere"
+        else:
+            duty_text = "Niemand"
+
+        new_embed = discord.Embed(
+            title="🎧 Support Duty Panel",
+            description=(
+                "**Willkommen zum Support-Duty System!**\n\n"
+                "Klicke auf die Buttons unten um dich für den Support-Dienst an- oder abzumelden.\n\n"
+                "🟢 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
+                "🔴 **Duty Beenden** - Du erhältst keine Pings mehr\n"
+                "📝 **Status Ändern** - Setze deinen aktuellen Status (Verfügbar/Beschäftigt/Pause)"
+            ),
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+        new_embed.add_field(name=f"🟢 Aktuell im Dienst ({duty_count})", value=duty_text or "Niemand", inline=False)
+        new_embed.set_footer(text="Die 🟢 On Duty Rolle wird automatisch zugewiesen/entfernt")
+
+        try:
+            await panel_message.edit(embed=new_embed)
+        except discord.NotFound:
+            await self.config.guild(guild).panel_message_id.set(None)
+        except discord.Forbidden:
+            log.warning("Fehlende Rechte zum Editieren des Duty-Panels (Guild %s)", guild.id)
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler beim Editieren des Duty-Panels (Guild %s)", guild.id)
+
+    async def update_status_display(self, guild: discord.Guild):
+        """Aktualisiert das erweiterte Duty-Status-Display mit detaillierten Informationen."""
+        status_display_id = await self.config.guild(guild).duty_status_display_message_id()
+        if not status_display_id:
+            return
+        status_channel = await self.get_status_display_channel(guild)
+        if not status_channel:
+            return
+        try:
+            status_message = await status_channel.fetch_message(status_display_id)
+        except discord.NotFound:
+            await self.config.guild(guild).duty_status_display_message_id.set(None)
+            return
+        except discord.Forbidden:
+            log.warning("Fehlende Rechte zum Abrufen des Status-Displays (Guild %s)", guild.id)
+            return
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler beim Abrufen des Status-Displays (Guild %s)", guild.id)
+            return
+
+        duty_role = await self.get_duty_role(guild)
+        role_id = await self.config.guild(guild).role()
+
+        available_list: list[str] = []
+        busy_list: list[str] = []
+        break_list: list[str] = []
+        away_list: list[str] = []
+
+        if role_id and duty_role:
+            base_role = guild.get_role(role_id)
+            if base_role:
+                all_members = await self.config.all_members(guild)
+                for m in base_role.members:
+                    if m.get_role(duty_role.id) is None:
+                        continue
+                    member_data = all_members.get(m.id, {})
+                    if not member_data.get("on_duty"):
+                        continue
+                    status = member_data.get("duty_status", "available")
+                    status_msg = member_data.get("duty_status_message")
+                    entry = f"• {m.display_name}"
+                    if status_msg:
+                        entry += f"\n  └ _{status_msg}_"
+                    if status == "available":
+                        available_list.append(entry)
+                    elif status == "busy":
+                        busy_list.append(entry)
+                    elif status == "break":
+                        break_list.append(entry)
+                    elif status == "away":
+                        away_list.append(entry)
+
+        embed = discord.Embed(
+            title="📊 Live Duty Status Übersicht",
+            description="**Aktueller Status aller Teammitglieder im Dienst**",
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+
+        def _truncate(items: list[str]) -> str:
+            if not items:
+                return "Keine"
+            text = "\n".join(items[:10])
+            if len(items) > 10:
+                text += f"\n_...und {len(items) - 10} weitere_"
+            return text
+
+        embed.add_field(name="🟢 Verfügbar", value=_truncate(available_list), inline=True)
+        embed.add_field(name="🔵 Beschäftigt", value=_truncate(busy_list), inline=True)
+        embed.add_field(name="☕ In Pause", value=_truncate(break_list), inline=True)
+        embed.add_field(name="🟡 Abwesend", value=_truncate(away_list), inline=False)
+
+        total = len(available_list) + len(busy_list) + len(break_list) + len(away_list)
+        embed.add_field(
+            name="📈 Statistik",
+            value=(
+                f"**{total}** im Duty | 🟢 {len(available_list)} frei | "
+                f"🔵 {len(busy_list)} beschäftigt | ☕ {len(break_list)} Pause"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Zuletzt aktualisiert")
+
+        try:
+            await status_message.edit(embed=embed)
+        except discord.NotFound:
+            await self.config.guild(guild).duty_status_display_message_id.set(None)
+        except discord.Forbidden:
+            log.warning("Fehlende Rechte zum Editieren des Status-Displays (Guild %s)", guild.id)
+        except discord.HTTPException:
+            log.exception("HTTP-Fehler beim Editieren des Status-Displays (Guild %s)", guild.id)
+
+    async def _set_duty_status(self, member: discord.Member, status: str, *, message: str = None):
+        """Setzt den Duty-Status eines Members und finalisiert ggf. eine Pause.
+
+        Verwendet von: duty pause, duty resume, duty busy, duty away,
+        duty setmessage, duty clearmessage und StatusSelectView.
+
+        Wenn der User aktuell im Pause-Status ist und auf einen anderen
+        Status wechselt, wird die Pause abgerechnet (current_break_start
+        auf duty_total_break_time addiert) und current_break_start
+        zurückgesetzt — das verhindert, dass Pausenzeiten verloren gehen.
+        """
+        guild = member.guild
+        mcfg = self.config.member(member)
+        cur_status = await mcfg.duty_status()
+
+        # Wenn wir aus einer Pause herauswechseln: Pause abrechnen
+        if cur_status == "break" and status != "break":
+            break_start = await mcfg.current_break_start()
+            if break_start:
+                delta = max(0, _now_ts() - int(break_start))
+                total_break = await mcfg.duty_total_break_time() or 0
+                await mcfg.duty_total_break_time.set(total_break + delta)
+            await mcfg.current_break_start.set(None)
+
+        # Wenn wir IN eine Pause wechseln: Startzeit setzen
+        if status == "break" and cur_status != "break":
+            await mcfg.current_break_start.set(_now_ts())
+            # Pausen-Counter erhöhen
+            break_count = await mcfg.duty_break_count() or 0
+            await mcfg.duty_break_count.set(break_count + 1)
+
+        await mcfg.duty_status.set(status)
+        if message is not None:
+            await mcfg.duty_status_message.set(message or None)
+
+        # away_since pflegen (für Away-Auto-Return im Background-Sweep)
+        if status == "away":
+            await mcfg.away_since.set(_now_ts())
+        else:
+            await mcfg.away_since.set(None)
+
+        # Live-Displays aktualisieren (best-effort, Fehler werden geloggt)
+        try:
+            await self.update_status_display(guild)
+            await self.update_panel_display(guild)
+        except Exception:
+            log.exception("Panel/Status-Update fehlgeschlagen in _set_duty_status")
+
     
     @commands.group(name="duty")
     @commands.guild_only()
@@ -3456,206 +4981,202 @@ class SupportCog(commands.Cog):
     async def duty_start_command(self, ctx: commands.Context):
         """
         Startet deinen Duty-Dienst.
-        
+
         Du wirst bei neuen Support-Anfragen gepingt.
         """
         guild = ctx.guild
         member = ctx.author
-        
+
         role_id = await self.config.guild(guild).role()
-        
+
         if not role_id:
             await ctx.send("❌ Es wurde keine Support-Rolle konfiguriert! Bitte wende dich an einen Admin.")
             return
-        
+
         base_role = guild.get_role(role_id)
         if not base_role:
             await ctx.send("❌ Die konfigurierte Support-Rolle existiert nicht mehr!")
             return
-        
-        if base_role not in member.roles:
+
+        if member.get_role(role_id) is None:
             await ctx.send(f"❌ Du benötigst die {base_role.mention} Rolle um dich auf Duty setzen zu können!")
             return
-        
-        # Prüfen ob bereits auf Duty
-        is_on_duty = await self.config.member(member).on_duty()
-        if is_on_duty:
-            status = await self.config.member(member).duty_status()
-            status_emoji = {"available": "🟢", "busy": "🔵", "break": "☕", "away": "⚪", "off_duty": "⚪"}.get(status, "🟢")
-            await ctx.send(f"⚠️ Du bist bereits im Duty-Modus! Status: {status_emoji}")
-            return
-        
-        # Duty aktivieren und Rolle geben
-        await self.config.member(member).on_duty.set(True)
-        start_time = datetime.utcnow()
-        await self.config.member(member).duty_start.set(start_time.timestamp())
-        
-        # Duty-Status auf "available" setzen
-        await self.config.member(member).duty_status.set("available")
-        await self.config.member(member).duty_status_message.set(None)
-        
-        # Session-Count erhöhen
-        current_sessions = await self.config.member(member).duty_session_count()
-        await self.config.member(member).duty_session_count.set(current_sessions + 1)
-        
-        # Pausen-Zähler zurücksetzen
-        await self.config.member(member).duty_break_count.set(0)
-        await self.config.member(member).duty_total_break_time.set(0)
-        
-        # Duty-Rolle hinzufügen
-        await self.update_duty_role(member, True)
-        
+
+        # Race-condition-safe duty start: serialize per-(guild, member).
+        async with self._lock_for(guild.id, member.id):
+            is_on_duty = await self.config.member(member).on_duty()
+            if is_on_duty:
+                status = await self.config.member(member).duty_status()
+                status_emoji = {"available": "🟢", "busy": "🔵", "break": "☕", "away": "⚪", "off_duty": "⚪"}.get(status, "🟢")
+                await ctx.send(f"⚠️ Du bist bereits im Duty-Modus! Status: {status_emoji}")
+                return
+
+            # Duty aktivieren und Rolle geben
+            await self.config.member(member).on_duty.set(True)
+            start_ts = _now_ts()
+            await self.config.member(member).duty_start.set(start_ts)
+
+            # Duty-Status auf "available" setzen
+            await self.config.member(member).duty_status.set("available")
+            await self.config.member(member).duty_status_message.set(None)
+
+            # Session-Count erhöhen
+            current_sessions = await self.config.member(member).duty_session_count() or 0
+            await self.config.member(member).duty_session_count.set(current_sessions + 1)
+
+            # Pausen-Zähler zurücksetzen
+            await self.config.member(member).duty_break_count.set(0)
+            await self.config.member(member).duty_total_break_time.set(0)
+            await self.config.member(member).current_break_start.set(None)
+
+            # Duty-Rolle hinzufügen — roll back Config on failure so panel/stats stay consistent
+            ok = await self.update_duty_role(member, True)
+            if not ok:
+                await self.config.member(member).on_duty.set(False)
+                await self.config.member(member).duty_start.set(None)
+                await self.config.member(member).duty_status.set("off_duty")
+                await self.config.member(member).duty_session_count.set(current_sessions)
+                await ctx.send("❌ Konnte die Duty-Rolle nicht zuweisen (fehlende Rechte?). Duty-Start abgebrochen.")
+                return
+
         # Nachricht im Log-Channel senden
         log_channel = await self.get_log_channel(guild)
-        
+        start_dt = _from_ts(start_ts)
+
+        # Read the auto-duty-timeout so we can warn the user about it.
+        auto_remove = await self.config.guild(guild).auto_remove_duty()
+        duty_timeout = await self.config.guild(guild).duty_timeout()
+
         embed = discord.Embed(
             title="🟢 Duty Gestartet",
             description=f"{member.mention} hat sich für den Support-Dienst angemeldet!",
             color=discord.Color.green(),
-            timestamp=start_time
+            timestamp=start_dt
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
-        
-        session_count = await self.config.member(member).duty_session_count()
+        session_count = current_sessions + 1
         embed.add_field(name="📊 Sessions", value=f"Session #{session_count}", inline=True)
-        
-        # Zähle alle aktiven Duty-User
+        if auto_remove and duty_timeout:
+            embed.add_field(name="⏰ Auto-Abmeldung", value=f"Nach **{duty_timeout}h** automatisch", inline=True)
+
+        # Count active duty users (single Config.all_members call).
         duty_count = 0
-        duty_role = await self.get_or_create_duty_role(guild)
+        duty_role = await self.get_duty_role(guild)
         if duty_role:
+            all_members = await self.config.all_members(guild)
             for m in duty_role.members:
-                is_duty = await self.config.member(m).on_duty()
-                if is_duty:
+                if all_members.get(m.id, {}).get("on_duty"):
                     duty_count += 1
-        
         embed.add_field(name="📊 Aktive Supporter", value=f"🟢 {duty_count} Teammitglieder im Dienst", inline=True)
-        embed.set_footer(text=f"Duty Start • {start_time.strftime('%d.%m.%Y %H:%M')}")
-        
+        embed.set_footer(text=f"Duty Start • {start_dt.strftime('%d.%m.%Y %H:%M')} UTC")
+
         if log_channel:
-            await log_channel.send(embed=embed)
-        
+            try:
+                await log_channel.send(embed=embed)
+            except discord.HTTPException:
+                log.warning("Konnte Duty-Start-Log nicht senden (Guild %s)", guild.id)
+
         # Update Displays
         await self.update_panel_display(guild)
         await self.update_status_display(guild)
-        
+
         await ctx.send("✅ Du bist jetzt im Duty-Modus! Du wirst bei neuen Support-Anfragen gepingt.")
-    
+
     @duty_group.command(name="stop", aliases=["off", "end"])
     async def duty_stop_command(self, ctx: commands.Context):
         """
         Beendet deinen Duty-Dienst.
-        
+
         Deine gesammelte Zeit wird zur Statistik hinzugefügt.
         """
         member = ctx.author
+        guild = ctx.guild
         is_on_duty = await self.config.member(member).on_duty()
-        
+
         if not is_on_duty:
             await ctx.send("ℹ️ Du bist aktuell nicht im Duty-Modus.")
             return
-        
-        # Hole Startzeit für Statistik
+
+        # Capture duration before _finalize_duty_stop zeroes duty_start.
         start_time_ts = await self.config.member(member).duty_start()
         duration = "Unbekannt"
         duration_seconds = 0
         if start_time_ts:
-            start_dt = datetime.fromtimestamp(start_time_ts)
-            delta = datetime.utcnow() - start_dt
-            hours = int(delta.total_seconds() // 3600)
-            minutes = int((delta.total_seconds() % 3600) // 60)
-            duration = f"{hours}h {minutes}min"
-            duration_seconds = int(delta.total_seconds())
-        
-        # Gesamte Duty-Zeit aktualisieren
-        total_time = await self.config.member(member).total_duty_time()
-        await self.config.member(member).total_duty_time.set(total_time + duration_seconds)
-        
-        # Duty deaktivieren
-        await self.config.member(member).on_duty.set(False)
-        await self.config.member(member).duty_start.set(None)
-        await self.config.member(member).last_duty_end.set(datetime.utcnow().timestamp())
-        await self.config.member(member).duty_status.set("off_duty")
-        await self.config.member(member).duty_status_message.set(None)
-        
-        # Duty-Rolle entfernen
-        await self.update_duty_role(member, False)
-        
+            duration_seconds = max(0, _now_ts() - int(start_time_ts))
+            duration = _fmt_h_m(duration_seconds)
+
+        # Race-condition-safe duty stop.
+        async with self._lock_for(guild.id, member.id):
+            await self._finalize_duty_stop(member, whitelist=False, reason="Manuell beendet")
+
         # Nachricht im Log-Channel senden
-        guild = ctx.guild
         log_channel = await self.get_log_channel(guild)
-        
+
         embed = discord.Embed(
             title="🔴 Duty Beendet",
             description=f"{member.mention} hat sich vom Support-Dienst abgemeldet.",
             color=discord.Color.red(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
         embed.add_field(name="⏱️ Dauer", value=duration, inline=True)
-        
+
         # Pausen-Info
-        break_count = await self.config.member(member).duty_break_count()
-        total_break_time = await self.config.member(member).duty_total_break_time()
+        break_count = await self.config.member(member).duty_break_count() or 0
+        total_break_time = await self.config.member(member).duty_total_break_time() or 0
         break_minutes = total_break_time // 60
         if break_count > 0:
             embed.add_field(name="☕ Pausen", value=f"{break_count} Pausen ({break_minutes} min)", inline=True)
-        
-        # Zähle verbleibende aktive Duty-User
+
+        # Count remaining active duty users.
         duty_count = 0
-        duty_role = await self.get_or_create_duty_role(guild)
+        duty_role = await self.get_duty_role(guild)
         if duty_role:
+            all_members = await self.config.all_members(guild)
             for m in duty_role.members:
-                is_duty = await self.config.member(m).on_duty()
-                if is_duty:
+                if all_members.get(m.id, {}).get("on_duty"):
                     duty_count += 1
-        
         embed.add_field(name="📊 Verbleibende Supporter", value=f"🟢 {duty_count} Teammitglieder im Dienst", inline=True)
-        embed.set_footer(text=f"Duty Ende • {datetime.utcnow().strftime('%d.%m.%Y %H:%M')}")
-        
+        embed.set_footer(text=f"Duty Ende • {_now().strftime('%d.%m.%Y %H:%M')} UTC")
+
         if log_channel:
-            await log_channel.send(embed=embed)
-        
-        # Update Displays
+            try:
+                await log_channel.send(embed=embed)
+            except discord.HTTPException:
+                log.warning("Konnte Duty-Stop-Log nicht senden (Guild %s)", guild.id)
+
+        # _finalize_duty_stop already refreshed the displays, but doing it again
+        # is idempotent and ensures we reflect the post-stop count.
         await self.update_panel_display(guild)
         await self.update_status_display(guild)
-        
-        await ctx.send(f"✅ Du hast den Duty-Modus verlassen. Gesamte Zeit: {duration}")
-    
+
+        await ctx.send(f"✅ Du hast den Duty-Modus verlassen. Gesammelte Zeit: {duration}")
+
     @duty_group.command(name="pause", aliases=["break", "coffee"])
     async def duty_pause_command(self, ctx: commands.Context):
         """
         Setzt deinen Status auf Pause.
-        
+
         Nützlich für kurze Pausen während des Duty.
         """
         member = ctx.author
         is_on_duty = await self.config.member(member).on_duty()
-        
+
         if not is_on_duty:
             await ctx.send("❌ Du musst im Duty sein um eine Pause zu machen!")
             return
-        
+
         current_status = await self.config.member(member).duty_status()
         if current_status == "break":
             await ctx.send("☕ Du bist bereits in Pause!")
             return
-        
-        # Pausen-Startzeit speichern
-        await self.config.member(member).current_break_start.set(datetime.utcnow().timestamp())
-        break_count = await self.config.member(member).duty_break_count()
-        await self.config.member(member).duty_break_count.set(break_count + 1)
-        
-        # Status setzen
-        await self.config.member(member).duty_status.set("break")
-        
-        # Status-Display aktualisieren
-        guild = ctx.guild
-        await self.update_status_display(guild)
-        
+
+        # _set_duty_status handles break-start accounting (current_break_start, break_count).
+        await self._set_duty_status(member, "break")
         await ctx.send("☕ Du bist jetzt in Pause! Vergiss nicht `duty resume` zu verwenden wenn du zurückkommst.")
-    
+
     @duty_group.command(name="resume", aliases=["continue", "back"])
     async def duty_resume_command(self, ctx: commands.Context):
         """
@@ -3663,55 +5184,38 @@ class SupportCog(commands.Cog):
         """
         member = ctx.author
         is_on_duty = await self.config.member(member).on_duty()
-        
+
         if not is_on_duty:
             await ctx.send("❌ Du bist nicht im Duty!")
             return
-        
+
         current_status = await self.config.member(member).duty_status()
         if current_status != "break":
             await ctx.send(f"ℹ️ Du bist nicht in Pause. Dein aktueller Status: {current_status}")
             return
-        
-        # Pausenzeit berechnen und speichern
-        break_start = await self.config.member(member).current_break_start()
-        if break_start:
-            break_duration = int(datetime.utcnow().timestamp() - break_start)
-            total_break = await self.config.member(member).duty_total_break_time()
-            await self.config.member(member).duty_total_break_time.set(total_break + break_duration)
-            await self.config.member(member).current_break_start.set(None)
-        
-        # Status setzen
-        await self.config.member(member).duty_status.set("available")
-        
-        # Status-Display aktualisieren
-        guild = ctx.guild
-        await self.update_status_display(guild)
-        
+
+        # _set_duty_status finalizes the break (adds to total_break_time, clears current_break_start).
+        await self._set_duty_status(member, "available")
         await ctx.send("✅ Willkommen zurück! Du bist jetzt wieder verfügbar.")
-    
+
     @duty_group.command(name="busy", aliases=["occupied"])
     async def duty_busy_command(self, ctx: commands.Context):
         """
         Setzt deinen Status auf Beschäftigt.
-        
+
         Zeigt an dass du gerade ein Ticket bearbeitest.
         """
         member = ctx.author
         is_on_duty = await self.config.member(member).on_duty()
-        
+
         if not is_on_duty:
             await ctx.send("❌ Du musst im Duty sein um deinen Status zu ändern!")
             return
-        
-        await self.config.member(member).duty_status.set("busy")
-        
-        # Status-Display aktualisieren
-        guild = ctx.guild
-        await self.update_status_display(guild)
-        
+
+        # _set_duty_status will finalize any ongoing break before switching to "busy".
+        await self._set_duty_status(member, "busy")
         await ctx.send("🔵 Du bist jetzt als beschäftigt markiert.")
-    
+
     @duty_group.command(name="away", aliases=["afk"])
     async def duty_away_command(self, ctx: commands.Context):
         """
@@ -3719,19 +5223,14 @@ class SupportCog(commands.Cog):
         """
         member = ctx.author
         is_on_duty = await self.config.member(member).on_duty()
-        
+
         if not is_on_duty:
             await ctx.send("❌ Du musst im Duty sein um deinen Status zu ändern!")
             return
-        
-        await self.config.member(member).duty_status.set("away")
-        
-        # Status-Display aktualisieren
-        guild = ctx.guild
-        await self.update_status_display(guild)
-        
-        await ctx.send("⚪ Du bist jetzt als abwesend markiert.")
-    
+
+        await self._set_duty_status(member, "away")
+        await ctx.send("🟡 Du bist jetzt als abwesend markiert.")
+
     @duty_group.command(name="status", aliases=["me", "current"])
     async def duty_status_command(self, ctx: commands.Context):
         """
@@ -3761,8 +5260,8 @@ class SupportCog(commands.Cog):
         start_time_ts = await self.config.member(member).duty_start()
         session_time = "Unbekannt"
         if start_time_ts:
-            start_dt = datetime.fromtimestamp(start_time_ts)
-            delta = datetime.utcnow() - start_dt
+            start_dt = _from_ts(start_time_ts)
+            delta = _now() - start_dt
             hours = int(delta.total_seconds() // 3600)
             minutes = int((delta.total_seconds() % 3600) // 60)
             session_time = f"{hours}h {minutes}m"
@@ -3836,7 +5335,7 @@ class SupportCog(commands.Cog):
         if is_on_duty:
             start_time_ts = await self.config.member(member).duty_start()
             if start_time_ts:
-                start_dt = datetime.fromtimestamp(start_time_ts)
+                start_dt = _from_ts(start_time_ts)
                 embed.add_field(name="🕐 Session Start", value=start_dt.strftime("%d.%m.%Y %H:%M"), inline=True)
         
         embed.set_footer(text=f"Duty Today • {ctx.guild.name}")
@@ -3918,8 +5417,8 @@ class SupportCog(commands.Cog):
                         if is_on_duty:
                             duty_start = await self.config.member(member).duty_start()
                             if duty_start:
-                                start_time = datetime.fromtimestamp(duty_start)
-                                duration = datetime.utcnow() - start_time
+                                start_time = _from_ts(duty_start)
+                                duration = _now() - start_time
                                 hours = int(duration.total_seconds() // 3600)
                                 minutes = int((duration.total_seconds() % 3600) // 60)
                                 support_on_duty.append((member, f"{hours}h {minutes}m"))
@@ -3939,8 +5438,8 @@ class SupportCog(commands.Cog):
                         if is_on_duty:
                             duty_start = await self.config.member(member).whitelist_duty_start()
                             if duty_start:
-                                start_time = datetime.fromtimestamp(duty_start)
-                                duration = datetime.utcnow() - start_time
+                                start_time = _from_ts(duty_start)
+                                duration = _now() - start_time
                                 hours = int(duration.total_seconds() // 3600)
                                 minutes = int((duration.total_seconds() % 3600) // 60)
                                 whitelist_on_duty.append((member, f"{hours}h {minutes}m"))
@@ -3955,7 +5454,7 @@ class SupportCog(commands.Cog):
             title="👥 Aktuell im Duty",
             description=f"**{len(support_on_duty) + len(whitelist_on_duty)}** Teammitglieder sind im Einsatz",
             color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         
         if support_on_duty:
@@ -4000,7 +5499,7 @@ class SupportCog(commands.Cog):
         embed = discord.Embed(
             title=f"👤 {member.display_name}",
             color=member.color,
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         
@@ -4020,8 +5519,8 @@ class SupportCog(commands.Cog):
         if is_on_duty:
             duty_start = await self.config.member(member).duty_start()
             if duty_start:
-                start_time = datetime.fromtimestamp(duty_start)
-                duration = datetime.utcnow() - start_time
+                start_time = _from_ts(duty_start)
+                duration = _now() - start_time
                 hours = int(duration.total_seconds() // 3600)
                 minutes = int((duration.total_seconds() % 3600) // 60)
                 embed.add_field(name="Duty Dauer", value=f"{hours}h {minutes}m", inline=True)
@@ -4058,7 +5557,7 @@ class SupportCog(commands.Cog):
         embed = discord.Embed(
             title=f"⏱️ Duty-Zeit von {member.display_name}",
             color=member.color,
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         
@@ -4158,7 +5657,7 @@ class SupportCog(commands.Cog):
             title="🏆 Duty Leaderboard",
             description="Die aktivsten Staff-Mitglieder nach gesamter Duty-Zeit\n\n" + "\n\n".join(leaderboard_entries),
             color=discord.Color.gold(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.set_footer(text=f"Duty Ranking • {len(duty_times)} Mitglieder mit Duty-Zeit • {guild.name}")
         
@@ -4179,57 +5678,66 @@ class DutyButtonView(discord.ui.View):
     
     @discord.ui.button(label="Duty Starten", style=discord.ButtonStyle.green, emoji="🟢", custom_id="duty_start")
     async def start_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Startet den Duty-Modus mit erweitertem Status-System"""
+        """Startet den Duty-Modus (race-condition-safe via cog._lock_for)."""
         guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ Dieser Button funktioniert nur auf Servern.", ephemeral=True)
+            return
         member = interaction.user
-        
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder können Duty starten.", ephemeral=True)
+            return
+
         role_id = await self.cog.config.guild(guild).role()
-        
+
         if not role_id:
             await interaction.response.send_message("❌ Es wurde keine Support-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
             return
-        
+
         base_role = guild.get_role(role_id)
         if not base_role:
             await interaction.response.send_message("❌ Die konfigurierte Support-Rolle existiert nicht mehr!", ephemeral=True)
             return
-        
-        if base_role not in member.roles:
+
+        if member.get_role(role_id) is None:
             await interaction.response.send_message(f"❌ Du benötigst die {base_role.mention} Rolle um dich auf Duty setzen zu können!", ephemeral=True)
             return
-        
-        # Prüfen ob bereits auf Duty
-        is_on_duty = await self.cog.config.member(member).on_duty()
-        if is_on_duty:
-            await interaction.response.send_message("⚠️ Du bist bereits im Duty-Modus!", ephemeral=True)
-            return
-        
-        # Duty aktivieren und Rolle geben
-        await self.cog.config.member(member).on_duty.set(True)
-        start_time = datetime.utcnow()
-        await self.cog.config.member(member).duty_start.set(start_time.timestamp())
-        
-        # Duty-Status auf "available" setzen
-        await self.cog.config.member(member).duty_status.set("available")
-        await self.cog.config.member(member).duty_status_message.set(None)
-        
-        # Session-Count erhöhen
-        current_sessions = await self.cog.config.member(member).duty_session_count()
-        await self.cog.config.member(member).duty_session_count.set(current_sessions + 1)
-        
-        # Pausen-Zähler zurücksetzen
-        await self.cog.config.member(member).duty_break_count.set(0)
-        
-        # Duty-Rolle hinzufügen (wichtig: erst Rolle, dann Log)
-        await self.cog.update_duty_role(member, True)
-        
-        # Auto-Duty Timer starten falls aktiviert
+
+        # Serialize per-(guild, member) to prevent double-click races.
+        async with self.cog._lock_for(guild.id, member.id):
+            is_on_duty = await self.cog.config.member(member).on_duty()
+            if is_on_duty:
+                await interaction.response.send_message("⚠️ Du bist bereits im Duty-Modus!", ephemeral=True)
+                return
+
+            # Duty aktivieren und Rolle geben
+            await self.cog.config.member(member).on_duty.set(True)
+            start_ts = _now_ts()
+            await self.cog.config.member(member).duty_start.set(start_ts)
+            await self.cog.config.member(member).duty_status.set("available")
+            await self.cog.config.member(member).duty_status_message.set(None)
+
+            current_sessions = await self.cog.config.member(member).duty_session_count() or 0
+            await self.cog.config.member(member).duty_session_count.set(current_sessions + 1)
+            await self.cog.config.member(member).duty_break_count.set(0)
+            await self.cog.config.member(member).duty_total_break_time.set(0)
+            await self.cog.config.member(member).current_break_start.set(None)
+
+            # Duty-Rolle hinzufügen — roll back Config on failure.
+            ok = await self.cog.update_duty_role(member, True)
+            if not ok:
+                await self.cog.config.member(member).on_duty.set(False)
+                await self.cog.config.member(member).duty_start.set(None)
+                await self.cog.config.member(member).duty_status.set("off_duty")
+                await self.cog.config.member(member).duty_session_count.set(current_sessions)
+                await interaction.response.send_message("❌ Konnte die Duty-Rolle nicht zuweisen (fehlende Rechte?). Duty-Start abgebrochen.", ephemeral=True)
+                return
+
+        start_time = _from_ts(start_ts)
         auto_duty = await self.cog.config.guild(guild).auto_remove_duty()
         duty_timeout = await self.cog.config.guild(guild).duty_timeout()
-        
-        # Nachricht im LOG-Channel senden (separat vom Support-Ping!)
+
         log_channel = await self.cog.get_log_channel(guild)
-        
         embed = discord.Embed(
             title="🟢 Duty Gestartet",
             description=f"{member.mention} hat sich für den Support-Dienst angemeldet!",
@@ -4238,113 +5746,102 @@ class DutyButtonView(discord.ui.View):
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
-        
-        session_count = await self.cog.config.member(member).duty_session_count()
-        embed.add_field(name="📊 Sessions", value=f"Session #{session_count}", inline=True)
-        
-        if auto_duty:
+        embed.add_field(name="📊 Sessions", value=f"Session #{current_sessions + 1}", inline=True)
+        if auto_duty and duty_timeout:
             end_time = start_time + timedelta(hours=duty_timeout)
             embed.add_field(name="⏰ Automatische Abmeldung", value=f"Nach {duty_timeout} Stunden\n(<t:{int(end_time.timestamp())}:R>)", inline=True)
-        
-        # Zähle alle aktiven Duty-User
+
+        # Count active duty users (read-only — never spawn a duty role here).
         duty_count = 0
-        duty_role = await self.cog.get_or_create_duty_role(guild)
+        duty_role = await self.cog.get_duty_role(guild)
         if duty_role:
+            all_members = await self.cog.config.all_members(guild)
             for m in duty_role.members:
-                is_duty = await self.cog.config.member(m).on_duty()
-                if is_duty:
+                if all_members.get(m.id, {}).get("on_duty"):
                     duty_count += 1
-        
         embed.add_field(name="📊 Aktive Supporter", value=f"🟢 {duty_count} Teammitglieder im Dienst", inline=True)
-        embed.set_footer(text=f"Duty Start • {start_time.strftime('%d.%m.%Y %H:%M')}")
-        
+        embed.set_footer(text=f"Duty Start • {start_time.strftime('%d.%m.%Y %H:%M')} UTC")
+
         if log_channel:
-            await log_channel.send(embed=embed)
-        
-        # Update the panel message to show current duty count
-        await self.update_panel_display(guild)
-        await self.update_status_display(guild)
-        
+            try:
+                await log_channel.send(embed=embed)
+            except discord.HTTPException:
+                log.warning("Konnte Duty-Start-Log nicht senden (Guild %s)", guild.id)
+
+        # Update panels (delegate to cog).
+        await self.cog.update_panel_display(guild)
+        await self.cog.update_status_display(guild)
+
         await interaction.response.send_message("✅ Du bist jetzt im Duty-Modus! Du wirst bei neuen Support-Anfragen gepingt.", ephemeral=True)
-    
+
     @discord.ui.button(label="Duty Beenden", style=discord.ButtonStyle.red, emoji="🔴", custom_id="duty_stop")
     async def stop_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Beendet den Duty-Modus mit erweiterter Statistik"""
+        """Beendet den Duty-Modus (race-condition-safe via cog._lock_for + _finalize_duty_stop)."""
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ Dieser Button funktioniert nur auf Servern.", ephemeral=True)
+            return
         member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder können Duty beenden.", ephemeral=True)
+            return
+
         is_on_duty = await self.cog.config.member(member).on_duty()
-        
         if not is_on_duty:
             await interaction.response.send_message("ℹ️ Du bist aktuell nicht im Duty-Modus.", ephemeral=True)
             return
-        
-        # Hole Startzeit für Statistik
+
+        # Capture duration before _finalize_duty_stop zeroes duty_start.
         start_time_ts = await self.cog.config.member(member).duty_start()
         duration = "Unbekannt"
-        duration_seconds = 0
         if start_time_ts:
-            start_dt = datetime.fromtimestamp(start_time_ts)
-            delta = datetime.utcnow() - start_dt
-            hours = int(delta.total_seconds() // 3600)
-            minutes = int((delta.total_seconds() % 3600) // 60)
-            duration = f"{hours}h {minutes}min"
-            duration_seconds = int(delta.total_seconds())
-        
-        # Gesamte Duty-Zeit aktualisieren (Statistik)
-        total_time = await self.cog.config.member(member).total_duty_time()
-        await self.cog.config.member(member).total_duty_time.set(total_time + duration_seconds)
-        
-        # Duty deaktivieren und Rolle entfernen
-        await self.cog.config.member(member).on_duty.set(False)
-        await self.cog.config.member(member).duty_start.set(None)
-        await self.cog.config.member(member).last_duty_end.set(datetime.utcnow().timestamp())
-        await self.cog.config.member(member).duty_status.set("off_duty")
-        await self.cog.config.member(member).duty_status_message.set(None)
-        
-        # Duty-Rolle entfernen
-        await self.cog.update_duty_role(member, False)
-        
-        # Nachricht im Log-Channel senden
-        guild = interaction.guild
+            duration_seconds = max(0, _now_ts() - int(start_time_ts))
+            duration = _fmt_h_m(duration_seconds)
+
+        # Race-condition-safe stop.
+        async with self.cog._lock_for(guild.id, member.id):
+            await self.cog._finalize_duty_stop(member, whitelist=False, reason="Manuell beendet (Button)")
+
         log_channel = await self.cog.get_log_channel(guild)
-        
         embed = discord.Embed(
             title="🔴 Duty Beendet",
             description=f"{member.mention} hat sich vom Support-Dienst abgemeldet.",
             color=discord.Color.red(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
         embed.add_field(name="⏱️ Dauer", value=duration, inline=True)
-        
-        # Pausen-Info anzeigen
-        break_count = await self.cog.config.member(member).duty_break_count()
-        total_break_time = await self.cog.config.member(member).duty_total_break_time()
+
+        break_count = await self.cog.config.member(member).duty_break_count() or 0
+        total_break_time = await self.cog.config.member(member).duty_total_break_time() or 0
         break_minutes = total_break_time // 60
         if break_count > 0:
             embed.add_field(name="☕ Pausen", value=f"{break_count} Pausen ({break_minutes} min)", inline=True)
-        
-        # Zähle verbleibende aktive Duty-User
+
+        # Count remaining active duty users (read-only).
         duty_count = 0
-        duty_role = await self.cog.get_or_create_duty_role(guild)
+        duty_role = await self.cog.get_duty_role(guild)
         if duty_role:
+            all_members = await self.cog.config.all_members(guild)
             for m in duty_role.members:
-                is_duty = await self.cog.config.member(m).on_duty()
-                if is_duty:
+                if all_members.get(m.id, {}).get("on_duty"):
                     duty_count += 1
-        
         embed.add_field(name="📊 Verbleibende Supporter", value=f"🟢 {duty_count} Teammitglieder im Dienst", inline=True)
-        embed.set_footer(text=f"Duty Ende • {datetime.utcnow().strftime('%d.%m.%Y %H:%M')}")
-        
+        embed.set_footer(text=f"Duty Ende • {_now().strftime('%d.%m.%Y %H:%M')} UTC")
+
         if log_channel:
-            await log_channel.send(embed=embed)
-        
-        # Update the panel message to show current duty count
-        await self.update_panel_display(guild)
-        await self.update_status_display(guild)
-        
+            try:
+                await log_channel.send(embed=embed)
+            except discord.HTTPException:
+                log.warning("Konnte Duty-Stop-Log nicht senden (Guild %s)", guild.id)
+
+        # _finalize_duty_stop already refreshed displays, but re-refresh to be safe.
+        await self.cog.update_panel_display(guild)
+        await self.cog.update_status_display(guild)
+
         await interaction.response.send_message("✅ Du hast den Duty-Modus verlassen.", ephemeral=True)
-    
+
     @discord.ui.button(label="Status Ändern", style=discord.ButtonStyle.secondary, emoji="📝", custom_id="duty_status")
     async def change_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Zeigt ein Modal zum Ändern des Duty-Status an"""
@@ -4363,151 +5860,18 @@ class DutyButtonView(discord.ui.View):
         )
     
     async def update_panel_display(self, guild: discord.Guild):
-        """Updates the panel message to show current duty members"""
-        try:
-            panel_message_id = await self.cog.config.guild(guild).panel_message_id()
-            if not panel_message_id:
-                return
-            
-            panel_channel = await self.cog.get_panel_channel(guild)
-            if not panel_channel:
-                return
-            
-            panel_message = await panel_channel.fetch_message(panel_message_id)
-            
-            # Get current duty members with their status
-            duty_count = 0
-            duty_list = []
-            duty_role = await self.cog.get_or_create_duty_role(guild)
-            role_id = await self.cog.config.guild(guild).role()
-            
-            if role_id and duty_role:
-                base_role = guild.get_role(role_id)
-                if base_role:
-                    for m in base_role.members:
-                        if duty_role in m.roles:
-                            is_duty = await self.cog.config.member(m).on_duty()
-                            if is_duty:
-                                duty_count += 1
-                                # Status-Emoji holen
-                                status = await self.cog.config.member(m).duty_status()
-                                status_emoji = {"available": "🟢", "busy": "🔵", "break": "☕", "away": "🟡"}.get(status, "🟢")
-                                duty_list.append(f"{status_emoji} {m.display_name}")
-            
-            # Create new embed with updated info
-            if duty_count > 0:
-                duty_text = "\n".join(duty_list[:15])
-                if len(duty_list) > 15:
-                    duty_text += f"\n• ...und {duty_count - 15} weitere"
-            else:
-                duty_text = "Niemand"
-            
-            new_embed = discord.Embed(
-                title="🎧 Support Duty Panel",
-                description=(
-                    "**Willkommen zum Support-Duty System!**\n\n"
-                    "Klicke auf die Buttons unten um dich für den Support-Dienst an- oder abzumelden.\n\n"
-                    "🟢 **Duty Starten** - Du wirst bei neuen Anfragen gepingt\n"
-                    "🔴 **Duty Beenden** - Du erhältst keine Pings mehr\n"
-                    "📝 **Status Ändern** - Setze deinen aktuellen Status (Verfügbar/Beschäftigt/Pause)"
-                ),
-                color=discord.Color.blue()
-            )
-            new_embed.add_field(name=f"🟢 Aktuell im Dienst ({duty_count})", value=duty_text or "Niemand", inline=False)
-            new_embed.set_footer(text="Die 🟢 On Duty Rolle wird automatisch zugewiesen/entfernt")
-            
-            await panel_message.edit(embed=new_embed)
-        except Exception as e:
-            print(f"Fehler beim Aktualisieren des Duty-Panels: {e}")
-    
+        """Delegates to the cog-level method.
+
+        Kept for backwards compat with code that calls
+        DutyButtonView.update_panel_display. The actual implementation
+        lives on SupportCog so all `duty *` text commands and this View
+        share the same code path.
+        """
+        await self.cog.update_panel_display(guild)
+
     async def update_status_display(self, guild: discord.Guild):
-        """Aktualisiert das erweiterte Duty-Status-Display mit detaillierten Informationen"""
-        try:
-            status_display_id = await self.cog.config.guild(guild).duty_status_display_message_id()
-            if not status_display_id:
-                return
-            
-            status_channel = await self.cog.get_status_display_channel(guild)
-            if not status_channel:
-                return
-            
-            status_message = await status_channel.fetch_message(status_display_id)
-            
-            # Sammle alle Duty-Mitglieder mit ihren Details
-            duty_role = await self.cog.get_or_create_duty_role(guild)
-            role_id = await self.cog.config.guild(guild).role()
-            
-            available_list = []
-            busy_list = []
-            break_list = []
-            away_list = []
-            
-            if role_id and duty_role:
-                base_role = guild.get_role(role_id)
-                if base_role:
-                    for m in base_role.members:
-                        if duty_role in m.roles:
-                            is_duty = await self.cog.config.member(m).on_duty()
-                            if is_duty:
-                                status = await self.cog.config.member(m).duty_status()
-                                status_msg = await self.cog.config.member(m).duty_status_message()
-                                
-                                entry = f"• {m.display_name}"
-                                if status_msg:
-                                    entry += f"\n  └ _{status_msg}_"
-                                
-                                if status == "available":
-                                    available_list.append(entry)
-                                elif status == "busy":
-                                    busy_list.append(entry)
-                                elif status == "break":
-                                    break_list.append(entry)
-                                elif status == "away":
-                                    away_list.append(entry)
-            
-            # Erstelle detailliertes Embed
-            embed = discord.Embed(
-                title="📊 Live Duty Status Übersicht",
-                description="**Aktueller Status aller Teammitglieder im Dienst**",
-                color=discord.Color.blue(),
-                timestamp=datetime.utcnow()
-            )
-            
-            # Verfügbarkeit anzeigen
-            avail_text = "\n".join(available_list[:10]) if available_list else "Keine"
-            if len(available_list) > 10:
-                avail_text += f"\n_...und {len(available_list) - 10} weitere_"
-            embed.add_field(name="🟢 Verfügbar", value=avail_text, inline=True)
-            
-            busy_text = "\n".join(busy_list[:10]) if busy_list else "Keine"
-            if len(busy_list) > 10:
-                busy_text += f"\n_...und {len(busy_list) - 10} weitere_"
-            embed.add_field(name="🔵 Beschäftigt", value=busy_text, inline=True)
-            
-            break_text = "\n".join(break_list[:10]) if break_list else "Keine"
-            if len(break_list) > 10:
-                break_text += f"\n_...und {len(break_list) - 10} weitere_"
-            embed.add_field(name="☕ In Pause", value=break_text, inline=True)
-            
-            away_text = "\n".join(away_list[:10]) if away_list else "Keine"
-            if len(away_list) > 10:
-                away_text += f"\n_...und {len(away_list) - 10} weitere_"
-            embed.add_field(name="🟡 Abwesend", value=away_text, inline=False)
-            
-            # Gesamtstatistik
-            total = len(available_list) + len(busy_list) + len(break_list) + len(away_list)
-            embed.add_field(
-                name="📈 Statistik",
-                value=f"**{total}** im Duty | 🟢 {len(available_list)} frei | 🔵 {len(busy_list)} beschäftigt | ☕ {len(break_list)} Pause",
-                inline=False
-            )
-            
-            embed.set_footer(text=f"Zuletzt aktualisiert")
-            embed.timestamp = datetime.utcnow()
-            
-            await status_message.edit(embed=embed)
-        except Exception as e:
-            print(f"Fehler beim Aktualisieren des Status-Displays: {e}")
+        """Delegates to the cog-level method (see update_panel_display)."""
+        await self.cog.update_status_display(guild)
 
 
 class StatusSelectView(discord.ui.View):
@@ -4528,11 +5892,12 @@ class StatusSelectView(discord.ui.View):
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="☕")
     async def set_break(self, interaction: discord.Interaction, button: discord.ui.Button):
         member = interaction.user
-        # Pausen-Startzeit speichern
-        await self.cog.config.member(member).current_break_start.set(datetime.utcnow().timestamp())
-        break_count = await self.cog.config.member(member).duty_break_count()
-        await self.cog.config.member(member).duty_break_count.set(break_count + 1)
-        await self._set_status(interaction, "break", "Du bist jetzt in Pause.")
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        # cog._set_duty_status handles break-start accounting (current_break_start, break_count).
+        await self.cog._set_duty_status(member, "break")
+        await interaction.response.send_message("☕ Du bist jetzt in Pause.", ephemeral=True)
     
     @discord.ui.button(label="Abwesend", style=discord.ButtonStyle.secondary, emoji="⚪")
     async def set_away(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4540,13 +5905,13 @@ class StatusSelectView(discord.ui.View):
     
     async def _set_status(self, interaction: discord.Interaction, status: str, message: str):
         member = interaction.user
-        await self.cog.config.member(member).duty_status.set(status)
-        
-        # Status-Display aktualisieren
-        guild = interaction.guild
-        await self.cog.update_status_display(guild)
-        
-        await interaction.response.edit_message(content=f"✅ {message}", view=None)
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("\u274c Nur Server-Mitglieder.", ephemeral=True)
+            return
+        # Delegate to cog._set_duty_status which handles break transitions
+        # (start/end break accounting) and refreshes the panels.
+        await self.cog._set_duty_status(member, status)
+        await interaction.response.edit_message(content=f"\u2705 {message}", view=None)
 
 
 class WhitelistButtonView(discord.ui.View):
@@ -4561,46 +5926,54 @@ class WhitelistButtonView(discord.ui.View):
     
     @discord.ui.button(label="Duty Starten", style=discord.ButtonStyle.green, emoji="🔵", custom_id="whitelist_duty_start")
     async def start_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Startet den Whitelist-Duty-Modus"""
+        """Startet den Whitelist-Duty-Modus (race-condition-safe via cog._lock_for)."""
         guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ Dieser Button funktioniert nur auf Servern.", ephemeral=True)
+            return
         member = interaction.user
-        
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder können Duty starten.", ephemeral=True)
+            return
+
         role_id = await self.cog.config.guild(guild).whitelist_role()
-        
+
         if not role_id:
             await interaction.response.send_message("❌ Es wurde keine Whitelist-Handler-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
             return
-        
+
         base_role = guild.get_role(role_id)
         if not base_role:
             await interaction.response.send_message("❌ Die konfigurierte Whitelist-Rolle existiert nicht mehr!", ephemeral=True)
             return
-        
-        if base_role not in member.roles:
+
+        if member.get_role(role_id) is None:
             await interaction.response.send_message(f"❌ Du benötigst die {base_role.mention} Rolle um dich auf Duty setzen zu können!", ephemeral=True)
             return
-        
-        # Prüfen ob bereits auf Duty
-        is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
-        if is_on_duty:
-            await interaction.response.send_message("⚠️ Du bist bereits im Whitelist-Duty-Modus!", ephemeral=True)
-            return
-        
-        # Duty aktivieren und Rolle geben
-        await self.cog.config.member(member).whitelist_on_duty.set(True)
-        start_time = datetime.utcnow()
-        await self.cog.config.member(member).whitelist_duty_start.set(start_time.timestamp())
-        
-        # Duty-Rolle hinzufügen
-        await self.cog.update_duty_role(member, True, whitelist=True)
-        
-        # Auto-Duty Timer starten falls aktiviert
+
+        async with self.cog._lock_for(guild.id, member.id):
+            is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
+            if is_on_duty:
+                await interaction.response.send_message("⚠️ Du bist bereits im Whitelist-Duty-Modus!", ephemeral=True)
+                return
+
+            await self.cog.config.member(member).whitelist_on_duty.set(True)
+            start_ts = _now_ts()
+            await self.cog.config.member(member).whitelist_duty_start.set(start_ts)
+
+            # Duty-Rolle hinzufügen — roll back Config on failure.
+            ok = await self.cog.update_duty_role(member, True, whitelist=True)
+            if not ok:
+                await self.cog.config.member(member).whitelist_on_duty.set(False)
+                await self.cog.config.member(member).whitelist_duty_start.set(None)
+                await interaction.response.send_message("❌ Konnte die Whitelist-Duty-Rolle nicht zuweisen (fehlende Rechte?).", ephemeral=True)
+                return
+
+        start_time = _from_ts(start_ts)
         auto_duty = await self.cog.config.guild(guild).whitelist_auto_remove_duty()
         duty_timeout = await self.cog.config.guild(guild).whitelist_duty_timeout()
-        
-        # Nachricht im LOG-Channel senden
+
         log_channel = await self.cog.get_whitelist_log_channel(guild)
-        
         embed = discord.Embed(
             title="🔵 Whitelist Duty Gestartet",
             description=f"{member.mention} hat sich für den Whitelist-Dienst angemeldet!",
@@ -4609,411 +5982,86 @@ class WhitelistButtonView(discord.ui.View):
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
-        
-        if auto_duty:
+        if auto_duty and duty_timeout:
             end_time = start_time + timedelta(hours=duty_timeout)
             embed.add_field(name="⏰ Automatische Abmeldung", value=f"Nach {duty_timeout} Stunden\n(<t:{int(end_time.timestamp())}:R>)", inline=True)
-        
-        # Zähle alle aktiven Duty-User
+
+        # Read-only count — never spawn a duty role as side effect.
         duty_count = 0
-        duty_role = await self.cog.get_or_create_duty_role(guild, whitelist=True)
+        duty_role = await self.cog.get_duty_role(guild, whitelist=True)
         if duty_role:
+            all_members = await self.cog.config.all_members(guild)
             for m in duty_role.members:
-                is_duty = await self.cog.config.member(m).whitelist_on_duty()
-                if is_duty:
+                if all_members.get(m.id, {}).get("whitelist_on_duty"):
                     duty_count += 1
-        
         embed.add_field(name="📊 Aktive Handler", value=f"🔵 {duty_count} Teammitglieder im Dienst", inline=True)
-        embed.set_footer(text=f"Duty Start • {start_time.strftime('%d.%m.%Y %H:%M')}")
-        
+        embed.set_footer(text=f"Duty Start • {start_time.strftime('%d.%m.%Y %H:%M')} UTC")
+
         if log_channel:
-            await log_channel.send(embed=embed)
-        
-        # Update the panel message to show current duty count
+            try:
+                await log_channel.send(embed=embed)
+            except discord.HTTPException:
+                log.warning("Konnte WL-Duty-Start-Log nicht senden (Guild %s)", guild.id)
+
         await self.cog.update_whitelist_panel_display(guild)
-        
         await interaction.response.send_message("✅ Du bist jetzt im Whitelist-Duty-Modus! Du wirst bei neuen Anfragen gepingt.", ephemeral=True)
-    
+
     @discord.ui.button(label="Duty Beenden", style=discord.ButtonStyle.red, emoji="🔴", custom_id="whitelist_duty_stop")
     async def stop_duty(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Beendet den Whitelist-Duty-Modus"""
+        """Beendet den Whitelist-Duty-Modus (race-condition-safe via cog._lock_for + _finalize_duty_stop)."""
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ Dieser Button funktioniert nur auf Servern.", ephemeral=True)
+            return
         member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder können Duty beenden.", ephemeral=True)
+            return
+
         is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
-        
         if not is_on_duty:
             await interaction.response.send_message("ℹ️ Du bist aktuell nicht im Whitelist-Duty-Modus.", ephemeral=True)
             return
-        
-        # Hole Startzeit für Statistik
+
+        # Capture duration before _finalize_duty_stop zeroes the start.
         start_time_ts = await self.cog.config.member(member).whitelist_duty_start()
         duration = "Unbekannt"
-        duration_seconds = 0
         if start_time_ts:
-            start_dt = datetime.fromtimestamp(start_time_ts)
-            delta = datetime.utcnow() - start_dt
-            hours = int(delta.total_seconds() // 3600)
-            minutes = int((delta.total_seconds() % 3600) // 60)
-            duration = f"{hours}h {minutes}min"
-            duration_seconds = int(delta.total_seconds())
-        
-        # Gesamte Duty-Zeit aktualisieren (Statistik)
-        total_time = await self.cog.config.member(member).total_whitelist_duty_time()
-        await self.cog.config.member(member).total_whitelist_duty_time.set(total_time + duration_seconds)
-        
-        # Duty deaktivieren und Rolle entfernen
-        await self.cog.config.member(member).whitelist_on_duty.set(False)
-        await self.cog.config.member(member).whitelist_duty_start.set(None)
-        
-        # Duty-Rolle entfernen
-        await self.cog.update_duty_role(member, False, whitelist=True)
-        
-        # Nachricht im Log-Channel senden
-        guild = interaction.guild
+            duration_seconds = max(0, _now_ts() - int(start_time_ts))
+            duration = _fmt_h_m(duration_seconds)
+
+        async with self.cog._lock_for(guild.id, member.id):
+            await self.cog._finalize_duty_stop(member, whitelist=True, reason="Manuell beendet (Button)")
+
         log_channel = await self.cog.get_whitelist_log_channel(guild)
-        
         embed = discord.Embed(
             title="🔴 Whitelist Duty Beendet",
             description=f"{member.mention} hat sich vom Whitelist-Dienst abgemeldet.",
             color=discord.Color.red(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="👤 Mitarbeiter", value=f"{member.display_name}", inline=True)
         embed.add_field(name="⏱️ Dauer", value=duration, inline=True)
-        
-        # Zähle verbleibende aktive Duty-User
+
         duty_count = 0
-        duty_role = await self.cog.get_or_create_duty_role(guild, whitelist=True)
+        duty_role = await self.cog.get_duty_role(guild, whitelist=True)
         if duty_role:
+            all_members = await self.cog.config.all_members(guild)
             for m in duty_role.members:
-                is_duty = await self.cog.config.member(m).whitelist_on_duty()
-                if is_duty:
+                if all_members.get(m.id, {}).get("whitelist_on_duty"):
                     duty_count += 1
-        
         embed.add_field(name="📊 Verbleibende Handler", value=f"🔵 {duty_count} Teammitglieder im Dienst", inline=True)
-        embed.set_footer(text=f"Duty Ende • {datetime.utcnow().strftime('%d.%m.%Y %H:%M')}")
-        
+        embed.set_footer(text=f"Duty Ende • {_now().strftime('%d.%m.%Y %H:%M')} UTC")
+
         if log_channel:
-            await log_channel.send(embed=embed)
-        
-        # Update the panel message to show current duty count
+            try:
+                await log_channel.send(embed=embed)
+            except discord.HTTPException:
+                log.warning("Konnte WL-Duty-Stop-Log nicht senden (Guild %s)", guild.id)
+
         await self.cog.update_whitelist_panel_display(guild)
-        
         await interaction.response.send_message("✅ Du hast den Whitelist-Duty-Modus verlassen.", ephemeral=True)
-
-
-class WhitelistPlayerSelect(discord.ui.Select):
-    """Dropdown-Menü zum Auswählen von Spielern für Whitelist - Mit Suchfunktion"""
-    
-    def __init__(self, cog: SupportCog, guild: discord.Guild, search_query: str = ""):
-        self.cog = cog
-        self.guild = guild
-        self.search_query = search_query.lower().strip() if search_query else ""
-        
-        # Sammle alle Mitglieder für die Dropdown-Optionen
-        options = []
-        for member in guild.members:
-            # Überspringe Bots
-            if member.bot:
-                continue
-            
-            # Filtere nach Suchbegriff falls vorhanden
-            if self.search_query:
-                if (self.search_query not in member.name.lower() and 
-                    self.search_query not in member.display_name.lower() and 
-                    self.search_query not in str(member.id)):
-                    continue
-            
-            # Kürze den Namen falls zu lang (max 100 Zeichen für Label)
-            display_name = member.display_name[:90] + "..." if len(member.display_name) > 93 else member.display_name
-            
-            # Füge Avatar-Emoji hinzu wenn möglich
-            emoji = "👤"
-            if member.avatar:
-                emoji = "✅" if any(role.name.lower() in ["whitelist", "approved", "verified"] for role in member.roles) else "👤"
-            
-            options.append(
-                discord.SelectOption(
-                    label=display_name,
-                    description=f"{member.name} | ID: {member.id}",
-                    value=f"user_{member.id}",
-                    emoji=emoji
-                )
-            )
-        
-        # Begrenze auf max 25 Optionen (Discord Limit) - zeige die ersten 25 Treffer
-        if len(options) > 25:
-            options = options[:25]
-        
-        # Falls keine Spieler verfügbar sind oder keine Treffer bei Suche
-        if not options:
-            if self.search_query:
-                options.append(
-                    discord.SelectOption(
-                        label=f"Keine Treffer für '{search_query}'",
-                        description="Versuche einen anderen Suchbegriff",
-                        value="no_results",
-                        emoji="❌"
-                    )
-                )
-            else:
-                options.append(
-                    discord.SelectOption(
-                        label="Keine Spieler verfügbar",
-                        description="Keine Mitglieder gefunden",
-                        value="none",
-                        emoji="ℹ️"
-                    )
-                )
-        
-        placeholder = "Spieler suchen & auswählen..." if not self.search_query else f"Treffer für '{search_query}'..."
-        
-        super().__init__(
-            placeholder=placeholder,
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="whitelist_player_select"
-        )
-    
-    async def callback(self, interaction: discord.Interaction):
-        """Wird ausgelöst wenn ein Spieler ausgewählt wird"""
-        await interaction.response.defer(ephemeral=True)
-        
-        guild = interaction.guild
-        member = interaction.user  # Der Handler der die Aktion durchführt
-        
-        # Prüfe ob User Whitelist-Duty hat
-        is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
-        if not is_on_duty:
-            await interaction.followup.send("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
-            return
-        
-        # Hole die Approved-Rolle
-        approved_role = await self.cog.get_whitelist_approved_role(guild)
-        if not approved_role:
-            await interaction.followup.send("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
-            return
-        
-        # Hole den ausgewählten User (gespeichert in der value als User-ID)
-        selected_value = self.values[0]
-        
-        if selected_value in ["none", "no_results"]:
-            await interaction.followup.send("ℹ️ Kein Spieler ausgewählt oder keine Treffer!", ephemeral=True)
-            return
-        
-        if selected_value.startswith("user_"):
-            user_id = int(selected_value.split("_")[1])
-            try:
-                target_user = await guild.fetch_member(user_id)
-                
-                # Prüfe ob der Spieler bereits die Approved-Rolle hat
-                if approved_role not in target_user.roles:
-                    await target_user.add_roles(approved_role, reason=f"Whitelist genehmigt von {member.display_name}")
-                    
-                    # Sende Bestätigung dem Handler
-                    embed_success = discord.Embed(
-                        title="✅ Whitelist genehmigt",
-                        description=f"{target_user.mention} wurde erfolgreich zur Whitelist hinzugefügt!",
-                        color=discord.Color.green(),
-                        timestamp=datetime.utcnow()
-                    )
-                    embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention} ({member.display_name})", inline=True)
-                    embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
-                    
-                    # Logge die Aktion im Log-Channel
-                    log_channel = await self.cog.get_whitelist_log_channel(guild)
-                    if log_channel:
-                        # Detailliertes Log für den Log-Channel
-                        log_embed = discord.Embed(
-                            title="📋 Whitelist Eintrag erstellt",
-                            description=f"**{target_user.mention}** wurde zur Whitelist hinzugefügt.",
-                            color=discord.Color.blue(),
-                            timestamp=datetime.utcnow()
-                        )
-                        log_embed.set_thumbnail(url=target_user.display_avatar.url)
-                        log_embed.add_field(name="🔹 Genehmigt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
-                        log_embed.add_field(name="🔹 Spieler", value=f"{target_user.mention}\n*{target_user.display_name}* (ID: `{target_user.id}`)", inline=True)
-                        log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
-                        log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
-                        log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {member.display_name}")
-                        
-                        await log_channel.send(embed=log_embed)
-                    
-                    # Benachrichtige den Spieler privat falls möglich
-                    try:
-                        dm_embed = discord.Embed(
-                            title="🎉 Herzlichen Glückwunsch!",
-                            description=f"Du wurdest von **{member.display_name}** zur Whitelist hinzugefügt!",
-                            color=discord.Color.green(),
-                            timestamp=datetime.utcnow()
-                        )
-                        dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{approved_role.name}**", inline=False)
-                        dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
-                        dm_embed.set_footer(text=f"{guild.name} Whitelist System")
-                        await target_user.send(embed=dm_embed)
-                    except discord.Forbidden:
-                        pass  # DMs deaktiviert
-                    
-                    await interaction.followup.send(f"✅ {target_user.mention} hat die Whitelist-Rolle erhalten!\n📝 Die Aktion wurde im Log-Channel protokolliert.", ephemeral=True)
-                else:
-                    await interaction.followup.send(f"ℹ️ {target_user.mention} hat bereits die Whitelist-Rolle!", ephemeral=True)
-                    
-            except discord.NotFound:
-                await interaction.followup.send("❌ Der ausgewählte Spieler wurde nicht gefunden!", ephemeral=True)
-            except Exception as e:
-                await interaction.followup.send(f"❌ Fehler beim Hinzufügen: {e}", ephemeral=True)
-
-
-class WhitelistInputModal(discord.ui.Modal):
-    """Modal zum direkten Eingeben der Spieler-ID oder des Benutzernamens für Whitelist"""
-    
-    def __init__(self, cog: SupportCog, guild: discord.Guild):
-        self.cog = cog
-        self.guild = guild
-        
-        super().__init__(title="🎮 Spieler whitelisten")
-        
-        self.player_input = discord.ui.TextInput(
-            label="Spielername oder ID",
-            style=discord.TextStyle.short,
-            placeholder="Gib den Discord-Namen oder die User-ID ein...",
-            min_length=1,
-            max_length=50,
-            required=True,
-            custom_id="whitelist_player_input"
-        )
-    
-    async def callback(self, interaction: discord.Interaction):
-        """Wird ausgelöst wenn das Modal abgesendet wird"""
-        await interaction.response.defer(ephemeral=True)
-        
-        guild = interaction.guild
-        member = interaction.user  # Der Handler der die Aktion durchführt
-        search_query = self.player_input.value.strip()
-        
-        # Prüfe ob User Whitelist-Duty hat (bereits im Button geprüft, aber sicherheitshalber)
-        is_on_duty = await self.cog.config.member(member).whitelist_on_duty()
-        if not is_on_duty:
-            await interaction.followup.send("❌ Du musst im Whitelist-Duty sein um Spieler hinzuzufügen!", ephemeral=True)
-            return
-        
-        # Hole die Approved-Rolle
-        approved_role = await self.cog.get_whitelist_approved_role(guild)
-        if not approved_role:
-            await interaction.followup.send("❌ Keine Whitelist-Approved-Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
-            return
-        
-        # Versuche den Spieler zu finden
-        target_user = None
-        
-        # Versuch 1: Als User-ID parsen
-        try:
-            user_id = int(search_query)
-            target_user = await guild.fetch_member(user_id)
-        except (ValueError, discord.NotFound):
-            pass
-        
-        # Versuch 2: Nach Namen suchen (mit Discriminator oder neuem Namenssystem)
-        if not target_user:
-            for m in guild.members:
-                if m.bot:
-                    continue
-                # Prüfe Name, Display-Name und ID als String
-                if (search_query.lower() == m.name.lower() or 
-                    search_query.lower() == m.display_name.lower() or
-                    search_query == str(m.id)):
-                    target_user = m
-                    break
-            
-            # Wenn nicht exakt gefunden, suche nach Teilübereinstimmung
-            if not target_user:
-                for m in guild.members:
-                    if m.bot:
-                        continue
-                    if (search_query.lower() in m.name.lower() or 
-                        search_query.lower() in m.display_name.lower()):
-                        target_user = m
-                        break
-        
-        if not target_user:
-            await interaction.followup.send(
-                f"❌ Kein Spieler gefunden für '**{search_query}**'!\n"
-                "Bitte überprüfe die Schreibweise oder verwende die User-ID.",
-                ephemeral=True
-            )
-            return
-        
-        # Prüfe ob der Spieler bereits die Approved-Rolle hat
-        if approved_role in target_user.roles:
-            await interaction.followup.send(
-                f"ℹ️ {target_user.mention} hat bereits die Whitelist-Rolle!",
-                ephemeral=True
-            )
-            return
-        
-        # Füge die Approved-Rolle hinzu
-        try:
-            await target_user.add_roles(approved_role, reason=f"Whitelist genehmigt von {member.display_name}")
-            
-            # Sende Bestätigung dem Handler
-            embed_success = discord.Embed(
-                title="✅ Whitelist genehmigt",
-                description=f"{target_user.mention} wurde erfolgreich zur Whitelist hinzugefügt!",
-                color=discord.Color.green(),
-                timestamp=datetime.utcnow()
-            )
-            embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention} ({member.display_name})", inline=True)
-            embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
-            
-            await interaction.followup.send(embed=embed_success, ephemeral=True)
-            
-            # Logge die Aktion im Log-Channel
-            log_channel = await self.cog.get_whitelist_log_channel(guild)
-            if log_channel:
-                log_embed = discord.Embed(
-                    title="📋 Whitelist Eintrag erstellt",
-                    description=f"**{target_user.mention}** wurde zur Whitelist hinzugefügt.",
-                    color=discord.Color.blue(),
-                    timestamp=datetime.utcnow()
-                )
-                log_embed.set_thumbnail(url=target_user.display_avatar.url)
-                log_embed.add_field(name="🔹 Genehmigt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
-                log_embed.add_field(name="🔹 Spieler", value=f"{target_user.mention}\n*{target_user.display_name}* (ID: `{target_user.id}`)", inline=True)
-                log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
-                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
-                log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {member.display_name}")
-                
-                await log_channel.send(embed=log_embed)
-            
-            # Benachrichtige den Spieler privat falls möglich
-            try:
-                dm_embed = discord.Embed(
-                    title="🎉 Herzlichen Glückwunsch!",
-                    description=(
-                        f"**{target_user.display_name}**, deine Whitelist-Anfrage wurde genehmigt!\n\n"
-                        f"Du hast jetzt Zugriff auf alle Bereiche des Servers.\n"
-                        f"Genehmigt von: **{member.display_name}**"
-                    ),
-                    color=discord.Color.green(),
-                    timestamp=datetime.utcnow()
-                )
-                dm_embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-                await target_user.send(embed=dm_embed)
-            except discord.Forbidden:
-                pass  # DMs deaktiviert
-            
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "❌ Ich habe keine Berechtigung um diese Rolle zuzuweisen!",
-                ephemeral=True
-            )
-        except Exception as e:
-            await interaction.followup.send(
-                f"❌ Ein Fehler ist aufgetreten: `{str(e)}`",
-                ephemeral=True
-            )
-
 
 class WhitelistSearchModal(discord.ui.Modal):
     """Modal zum Suchen von Spielern für die Whitelist - Verarbeitet direkt die Whitelist"""
@@ -5137,7 +6185,7 @@ class WhitelistSearchModal(discord.ui.Modal):
                     title="✅ Whitelist genehmigt" if not self.grant_role_mode else "✅ Whitelist-Rolle vergeben",
                     description=f"{target_user.mention} wurde erfolgreich {'zur Whitelist hinzugefügt' if not self.grant_role_mode else 'die Whitelist-Rolle zugewiesen'}!",
                     color=discord.Color.green(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 embed_success.add_field(name="👤 Genehmigt von", value=f"{member.mention} ({member.display_name})", inline=True)
                 embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
@@ -5151,13 +6199,13 @@ class WhitelistSearchModal(discord.ui.Modal):
                         title="📋 Whitelist Eintrag erstellt" if not self.grant_role_mode else "📋 Whitelist-Rolle vergeben",
                         description=f"**{target_user.mention}** wurde {'zur Whitelist hinzugefügt' if not self.grant_role_mode else 'die Whitelist-Rolle zugewiesen'}.",
                         color=discord.Color.blue(),
-                        timestamp=datetime.utcnow()
+                        timestamp=_now()
                     )
                     log_embed.set_thumbnail(url=target_user.display_avatar.url)
                     log_embed.add_field(name="🔹 Genehmigt von", value=f"{member.mention}\n*{member.display_name}* (ID: `{member.id}`)", inline=True)
                     log_embed.add_field(name="🔹 Spieler", value=f"{target_user.mention}\n*{target_user.display_name}* (ID: `{target_user.id}`)", inline=True)
                     log_embed.add_field(name="🔹 Rolle", value=f"{approved_role.mention}", inline=False)
-                    log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
+                    log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(_now_ts())}:F>\n(<t:{int(_now_ts())}:R>)", inline=True)
                     log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {member.display_name}")
                     
                     await log_channel.send(embed=log_embed)
@@ -5168,7 +6216,7 @@ class WhitelistSearchModal(discord.ui.Modal):
                         title="🎉 Herzlichen Glückwunsch!" if not self.grant_role_mode else "✅ Whitelist-Rolle erhalten",
                         description=f"Du wurdest von **{member.display_name}** {'zur Whitelist hinzugefügt' if not self.grant_role_mode else 'die Whitelist-Rolle zugewiesen'}!",
                         color=discord.Color.green(),
-                        timestamp=datetime.utcnow()
+                        timestamp=_now()
                     )
                     dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{approved_role.name}**", inline=False)
                     dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen." if not self.grant_role_mode else "Deine Whitelist wurde aktiviert.", inline=False)
@@ -5193,75 +6241,80 @@ class WhitelistSearchModal(discord.ui.Modal):
             error_msg = f"❌ Ein unerwarteter Fehler ist aufgetreten: `{type(e).__name__}: {str(e)}`"
             try:
                 await interaction.followup.send(error_msg, ephemeral=True)
-            except:
+            except discord.HTTPException:
                 pass
 
 
-class WhitelistDutyView(discord.ui.View):
-    """Button-View für Whitelist-Duty - Nur für interne Suche (nicht im Panel verwendet)"""
-    
-    def __init__(self, cog: SupportCog, guild: discord.Guild = None, search_query: str = ""):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.guild = guild
-        self.search_query = search_query
-    
-    @discord.ui.button(label="🔍 Spieler suchen", style=discord.ButtonStyle.secondary, emoji="🔎", custom_id="whitelist_search_player", row=1)
-    async def search_player(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Öffnet ein Modal zur Spielersuche"""
-        is_on_duty = await self.cog.config.member(interaction.user).whitelist_on_duty()
-        if not is_on_duty:
-            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein um Spieler zu suchen!", ephemeral=True)
-            return
-        
-        modal = WhitelistSearchModal(self.cog, interaction.guild)
-        await interaction.response.send_modal(modal)
-
-
 class PersistentWhitelistGrantView(discord.ui.View):
-    """Persistente View für Whitelist-Rollenvergabe im Panel - OHNE Ziel-User Bindung"""
-    
+    """Persistente View für Whitelist-Rollenvergabe im Panel - OHNE Ziel-User Bindung.
+
+    WICHTIG: Diese View wird in `cog_load` mit `guild=None` registriert, damit
+    sie als PERSISTENTE View für ALLE Panel-Nachrichten einer Guild funktioniert
+    (auch nach Bot-Neustart). Daher MUSS der Callback `interaction.guild` nutzen
+    statt `self.guild` — sonst crasht jeder Klick nach einem Neustart mit
+    AttributeError: 'NoneType' object has no attribute 'id'.
+    """
+
     def __init__(self, cog: SupportCog, guild: discord.Guild = None):
         super().__init__(timeout=None)
         self.cog = cog
+        # `guild` ist nur ein Hint für nicht-persistente Instanzen; der Callback
+        # sollte IMMER interaction.guild nutzen, da persistente Views keinen
+        # zuverlässigen Guild-Kontext haben.
         self.guild = guild
-    
+
     @discord.ui.button(label="Whitelist freischalten", style=discord.ButtonStyle.success, emoji="✅", custom_id="whitelist_grant_role_persistent", row=2)
     async def grant_whitelist(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Öffnet ein Modal zur Eingabe des Spielers der die Rolle erhalten soll"""
-        # Prüfen ob User im Whitelist-Duty ist ODER die always_allowed_role hat ODER die whitelist_handler_role (via !whitelistdutygrant gegeben)
-        is_on_duty = await self.cog.config.member(interaction.user).whitelist_on_duty()
-        
+        # ALWAYS use interaction.guild — self.guild may be None for persistent views.
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ Dieser Button kann nur auf einem Server verwendet werden.", ephemeral=True)
+            return
+
+        # In guild contexts interaction.user is always a Member, but be defensive.
+        user = interaction.user
+        if not isinstance(user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder können diesen Button nutzen.", ephemeral=True)
+            return
+
+        # Prüfen ob User im Whitelist-Duty ist ODER die always_allowed_role hat ODER die whitelist_handler_role
+        is_on_duty = await self.cog.config.member(user).whitelist_on_duty()
+
         # Prüfen auf always_allowed_role
-        always_allowed_role_id = await self.cog.config.guild(self.guild).whitelist_always_allowed_role()
-        always_allowed_role = self.guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
-        has_always_allowed = always_allowed_role and always_allowed_role in interaction.user.roles
-        
-        # Prüfen auf Whitelist-Handler-Rolle (die via !whitelistset role eingestellt wurde - das ist die Basisrolle)
-        whitelist_handler_role_id = await self.cog.config.guild(self.guild).whitelist_role()
-        whitelist_handler_role = self.guild.get_role(whitelist_handler_role_id) if whitelist_handler_role_id else None
-        has_handler_role = whitelist_handler_role and whitelist_handler_role in interaction.user.roles
-        
+        always_allowed_role_id = await self.cog.config.guild(guild).whitelist_always_allowed_role()
+        always_allowed_role = guild.get_role(always_allowed_role_id) if always_allowed_role_id else None
+        has_always_allowed = always_allowed_role is not None and user.get_role(always_allowed_role.id) is not None
+
+        # Prüfen auf Whitelist-Handler-Rolle
+        whitelist_handler_role_id = await self.cog.config.guild(guild).whitelist_role()
+        whitelist_handler_role = guild.get_role(whitelist_handler_role_id) if whitelist_handler_role_id else None
+        has_handler_role = whitelist_handler_role is not None and user.get_role(whitelist_handler_role.id) is not None
+
         # Nutzer mit Always-Allowed Rolle brauchen NICHT im Duty zu sein und können IMMER den Button nutzen
         if has_always_allowed:
-            pass  # Immer erlaubt, keine weitere Prüfung nötig
+            pass
         elif not is_on_duty and not has_handler_role:
-            await interaction.response.send_message("❌ Du musst im Whitelist-Duty sein oder die Whitelist-Handler-Rolle haben (via !whitelistdutygrant gegeben) um Spieler zur Whitelist hinzuzufügen! Die 'Always Allowed' Rolle berechtigt ebenfalls immer.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Du musst im Whitelist-Duty sein oder die Whitelist-Handler-Rolle haben "
+                "um Spieler zur Whitelist hinzuzufügen! Die 'Always Allowed' Rolle berechtigt ebenfalls immer.",
+                ephemeral=True,
+            )
             return
-        
+
         # Hole die zu vergebende Rolle
-        grant_role_id = await self.cog.config.guild(self.guild).whitelist_grant_role()
+        grant_role_id = await self.cog.config.guild(guild).whitelist_grant_role()
         if not grant_role_id:
             await interaction.response.send_message("❌ Keine 'Whitelist freischalten' Rolle konfiguriert! Bitte wende dich an einen Admin.", ephemeral=True)
             return
-        
-        grant_role = self.guild.get_role(grant_role_id)
+
+        grant_role = guild.get_role(grant_role_id)
         if not grant_role:
             await interaction.response.send_message("❌ Die konfigurierte 'Whitelist freischalten' Rolle existiert nicht mehr!", ephemeral=True)
             return
-        
+
         # Öffne Modal zur Eingabe des Ziel-Users (ID, Mention oder Name)
-        modal = WhitelistGrantRoleModal(self.cog, self.guild, grant_role)
+        modal = WhitelistGrantRoleModal(self.cog, guild, grant_role)
         await interaction.response.send_modal(modal)
 
 
@@ -5307,13 +6360,37 @@ class WhitelistGrantRoleModal(discord.ui.Modal):
                 except (discord.NotFound, discord.HTTPException):
                     pass
         
-        # Versuch 3: Als Username/Nickname suchen
+        # Versuch 3: Als Username/Nickname suchen.
+        # WICHTIG: Zuerst EXAKTEN Match versuchen, danach erst Substring-Match.
+        # Sonst vergibt "max" die Rolle an "maxmustermann" statt "Max Power".
         if not target_user:
+            query_lower = player_query.lower()
+            # 3a: Exakter Match auf name oder display_name
             for member in self.guild.members:
-                if (player_query.lower() in member.name.lower() or 
-                    player_query.lower() in member.display_name.lower()):
+                if member.name.lower() == query_lower or member.display_name.lower() == query_lower:
                     target_user = member
                     break
+            # 3b: Substring-Match (nur wenn kein exakter Treffer)
+            if not target_user:
+                substring_matches = []
+                for member in self.guild.members:
+                    if (query_lower in member.name.lower() or
+                        query_lower in member.display_name.lower()):
+                        substring_matches.append(member)
+                if len(substring_matches) == 1:
+                    target_user = substring_matches[0]
+                elif len(substring_matches) > 1:
+                    # Mehrdeutig — Liste der Kandidaten anzeigen, damit der Handler
+                    # gezielt nochmal mit ID/Mention anfragen kann.
+                    candidates = ", ".join(f"{m.mention} (`{m.id}`)" for m in substring_matches[:10])
+                    if len(substring_matches) > 10:
+                        candidates += f"\n...und {len(substring_matches) - 10} weitere"
+                    await interaction.response.send_message(
+                        f"⚠️ Mehrere Spieler gefunden für '{player_query}':\n{candidates}\n"
+                        f"Bitte wiederhole mit der exakten ID oder Mention.",
+                        ephemeral=True,
+                    )
+                    return
         
         if not target_user:
             await interaction.response.send_message(f"❌ Kein Benutzer mit '{player_query}' gefunden!", ephemeral=True)
@@ -5332,7 +6409,7 @@ class WhitelistGrantRoleModal(discord.ui.Modal):
                 title="✅ Whitelist-Rolle vergeben",
                 description=f"{target_user.mention} wurde erfolgreich die Whitelist-Rolle zugewiesen!",
                 color=discord.Color.green(),
-                timestamp=datetime.utcnow()
+                timestamp=_now()
             )
             embed_success.add_field(name="👤 Genehmigt von", value=f"{interaction.user.mention} ({interaction.user.display_name})", inline=True)
             embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
@@ -5346,13 +6423,13 @@ class WhitelistGrantRoleModal(discord.ui.Modal):
                     title="📋 Whitelist-Rolle vergeben",
                     description=f"**{target_user.mention}** wurde die Whitelist-Rolle zugewiesen.",
                     color=discord.Color.blue(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 log_embed.set_thumbnail(url=target_user.display_avatar.url)
                 log_embed.add_field(name="🔹 Genehmigt von", value=f"{interaction.user.mention}\n*{interaction.user.display_name}* (ID: `{interaction.user.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Spieler", value=f"{target_user.mention}\n*{target_user.display_name}* (ID: `{target_user.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Rolle", value=f"{self.grant_role.mention}", inline=False)
-                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
+                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(_now_ts())}:F>\n(<t:{int(_now_ts())}:R>)", inline=True)
                 log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {interaction.user.display_name}")
                 
                 await log_channel.send(embed=log_embed)
@@ -5363,7 +6440,7 @@ class WhitelistGrantRoleModal(discord.ui.Modal):
                     title="🎉 Herzlichen Glückwunsch!",
                     description=f"Du wurdest von **{interaction.user.display_name}** zur Whitelist hinzugefügt!",
                     color=discord.Color.green(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{self.grant_role.name}**", inline=False)
                 dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
@@ -5438,7 +6515,7 @@ class GrantWhitelistButton(discord.ui.Button):
                 title="✅ Whitelist-Rolle vergeben",
                 description=f"{target_user.mention} wurde erfolgreich die Whitelist-Rolle zugewiesen!",
                 color=discord.Color.green(),
-                timestamp=datetime.utcnow()
+                timestamp=_now()
             )
             embed_success.add_field(name="👤 Genehmigt von", value=f"{interaction.user.mention} ({interaction.user.display_name})", inline=True)
             embed_success.add_field(name="🎮 Spieler", value=f"{target_user.display_name}", inline=True)
@@ -5452,13 +6529,13 @@ class GrantWhitelistButton(discord.ui.Button):
                     title="📋 Whitelist-Rolle vergeben",
                     description=f"**{target_user.mention}** wurde die Whitelist-Rolle zugewiesen.",
                     color=discord.Color.blue(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 log_embed.set_thumbnail(url=target_user.display_avatar.url)
                 log_embed.add_field(name="🔹 Genehmigt von", value=f"{interaction.user.mention}\n*{interaction.user.display_name}* (ID: `{interaction.user.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Spieler", value=f"{target_user.mention}\n*{target_user.display_name}* (ID: `{target_user.id}`)", inline=True)
                 log_embed.add_field(name="🔹 Rolle", value=f"{grant_role.mention}", inline=False)
-                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(datetime.utcnow().timestamp())}:F>\n(<t:{int(datetime.utcnow().timestamp())}:R>)", inline=True)
+                log_embed.add_field(name="⏰ Zeitpunkt", value=f"<t:{int(_now_ts())}:F>\n(<t:{int(_now_ts())}:R>)", inline=True)
                 log_embed.set_footer(text=f"Whitelist-Log • Eintrag von {interaction.user.display_name}")
                 
                 await log_channel.send(embed=log_embed)
@@ -5469,7 +6546,7 @@ class GrantWhitelistButton(discord.ui.Button):
                     title="🎉 Herzlichen Glückwunsch!",
                     description=f"Du wurdest von **{interaction.user.display_name}** zur Whitelist hinzugefügt!",
                     color=discord.Color.green(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 dm_embed.add_field(name="✅ Rolle erhalten", value=f"**{grant_role.name}**", inline=False)
                 dm_embed.add_field(name="📝 Hinweis", value="Du kannst jetzt auf unserem Server spielen.", inline=False)
@@ -5593,7 +6670,7 @@ class FeedbackModal(discord.ui.Modal):
             title=f"{type_emojis[self.feedback_type]} {type_names[self.feedback_type]}",
             description=feedback_content,
             color=discord.Color.green() if self.feedback_type == "positive" else (discord.Color.red() if self.feedback_type == "negative" else discord.Color.blurple()),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
         embed.add_field(name="👤 Nutzer", value=f"{member.mention}\n(`{member.id}`)", inline=True)
@@ -5608,9 +6685,16 @@ class FeedbackModal(discord.ui.Modal):
         )
     
     async def on_error(self, interaction: discord.Interaction, error: Exception):
-        """Fehlerbehandlung"""
-        await interaction.response.send_message("❌ Ein Fehler ist aufgetreten. Bitte versuche es später erneut.", ephemeral=True)
-        print(f"Fehler im Feedback-Modal: {error}")
+        """Fehlerbehandlung — robust gegenüber bereits beantworteten Interactions."""
+        msg = "❌ Ein Fehler ist aufgetreten. Bitte versuche es später erneut."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im Feedback-Modal", exc_info=error)
 
 
 class SupportCallView(discord.ui.View):
@@ -5622,87 +6706,206 @@ class SupportCallView(discord.ui.View):
     
     @discord.ui.button(label="Support rufen", style=discord.ButtonStyle.red, emoji="📞", custom_id="support_call")
     async def call_support(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Ruft einen Supporter"""
+        """Ruft einen Supporter.
+
+       Dieser Callback macht mehrere Config-Reads + Rollen-Iterationen
+        und kann deshalb die 3-Sekunden-Antwort-Grenze von Discord
+        überschreiten. Wir defer(ephemeral=True) zuerst, dann folgt die
+        eigentliche Arbeit, und am Ende senden wir das Ergebnis via
+        interaction.followup.send().
+        """
         guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ Dieser Button funktioniert nur auf Servern.", ephemeral=True)
+            return
         member = interaction.user
-        
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder können Support rufen.", ephemeral=True)
+            return
+
+        # Defer FIRST so we have up to 15 min instead of 3 sec to do the work.
+        await interaction.response.defer(ephemeral=True)
+
         # Hole Duty-Rolle und Duty-Mitglieder
         role_id = await self.cog.config.guild(guild).role()
         if not role_id:
-            await interaction.response.send_message("❌ Keine Support-Rolle konfiguriert!", ephemeral=True)
+            await interaction.followup.send("❌ Keine Support-Rolle konfiguriert!", ephemeral=True)
             return
-        
+
         base_role = guild.get_role(role_id)
         if not base_role:
-            await interaction.response.send_message("❌ Support-Rolle nicht gefunden!", ephemeral=True)
+            await interaction.followup.send("❌ Support-Rolle nicht gefunden!", ephemeral=True)
             return
-        
-        # Hole Duty-Mitglieder
+
+        # Read-only lookup — never create a duty role as side effect of a call button.
+        duty_role = await self.cog.get_duty_role(guild)
+
+        # Hole Duty-Mitglieder (single Config.all_members call)
         duty_members = []
-        duty_role = await self.cog.get_or_create_duty_role(guild)
         if duty_role:
+            all_members = await self.cog.config.all_members(guild)
             for m in base_role.members:
-                if duty_role in m.roles:
-                    is_on_duty = await self.cog.config.member(m).on_duty()
-                    if is_on_duty:
-                        duty_members.append(m)
-        
+                if m.get_role(duty_role.id) is None:
+                    continue
+                if all_members.get(m.id, {}).get("on_duty"):
+                    duty_members.append(m)
+
+        # Channel-mention safe auch wenn interaction.channel None ist
+        channel_mention = interaction.channel.mention if interaction.channel else (f"<#{interaction.channel_id}>" if interaction.channel_id else "Unbekannt")
+
         if not duty_members:
             # Fallback zur Basis-Rolle wenn niemand Duty hat
-            await interaction.response.send_message(
-                f"🔴 Aktuell ist kein Supporter im Dienst! Die {base_role.mention} wurde benachrichtigt.",
-                ephemeral=True
-            )
-            # Trotzdem Benachrichtigung senden
             call_channel = await self.cog.get_support_call_channel(guild)
             if call_channel:
                 embed = discord.Embed(
                     title="📞 Support-Anfrage",
                     description=f"{member.mention} benötigt Support!",
                     color=discord.Color.orange(),
-                    timestamp=datetime.utcnow()
+                    timestamp=_now()
                 )
                 embed.add_field(name="👤 Anfragender", value=f"{member.display_name}\n(`{member.id}`)", inline=True)
-                embed.add_field(name="📍 Ursprungs-Channel", value=interaction.channel.mention, inline=True)
+                embed.add_field(name="📍 Ursprungs-Channel", value=channel_mention, inline=True)
                 embed.set_footer(text="🔴 Niemand im Duty - Basis-Rolle wird gepingt")
-                
-                await call_channel.send(content=base_role.mention, embed=embed, 
-                                       allowed_mentions=discord.AllowedMentions(roles=[base_role]))
+                try:
+                    await call_channel.send(content=base_role.mention, embed=embed,
+                                            allowed_mentions=discord.AllowedMentions(roles=[base_role]))
+                except discord.HTTPException:
+                    log.warning("Konnte Support-Call-Benachrichtigung nicht senden (Guild %s)", guild.id)
+            await interaction.followup.send(
+                f"🔴 Aktuell ist kein Supporter im Dienst! Die {base_role.mention} wurde benachrichtigt.",
+                ephemeral=True
+            )
             return
-        
-        # ALLE Duty-Supporter pingen (nicht nur einen zufälligen!)
-        # Hole Call-Room
+
+        # ALLE Duty-Supporter pingen
         call_room = await self.cog.get_call_room(guild)
         call_room_mention = call_room.mention if call_room else "einem Voice-Channel"
-        
-        # Sende Benachrichtigung im Call-Channel
         call_channel = await self.cog.get_support_call_channel(guild)
-        
+
         embed = discord.Embed(
             title="📞 Support-Aufruf",
             description=f"{member.mention} ruft nach Support!",
             color=discord.Color.orange(),
-            timestamp=datetime.utcnow()
+            timestamp=_now()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="👤 Anfragender", value=f"{member.display_name}\n(`{member.id}`)", inline=True)
-        embed.add_field(name="📍 Ursprungs-Channel", value=interaction.channel.mention, inline=True)
+        embed.add_field(name="📍 Ursprungs-Channel", value=channel_mention, inline=True)
         embed.add_field(name="🎤 Treffpunkt", value=f"Bitte begib dich zu {call_room_mention}", inline=True)
-        embed.set_footer(text=f"Support-System • {datetime.utcnow().strftime('%d.%m.%Y %H:%M')}")
-        
-        if call_channel:
-            # Nur die Duty-Rolle pingen statt alle Mitglieder einzeln
-            await call_channel.send(content=duty_role.mention, embed=embed,
-                                   allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
-        
+        embed.set_footer(text=f"Support-System • {_now().strftime('%d.%m.%Y %H:%M')} UTC")
+
+        if call_channel and duty_role:
+            try:
+                await call_channel.send(content=duty_role.mention, embed=embed,
+                                        allowed_mentions=discord.AllowedMentions(roles=[duty_role]))
+            except discord.HTTPException:
+                log.warning("Konnte Support-Call nicht senden (Guild %s)", guild.id)
+
         supporter_names = ", ".join([m.display_name for m in duty_members[:5]])
         if len(duty_members) > 5:
             supporter_names += f" und {len(duty_members) - 5} weitere"
-        
-        await interaction.response.send_message(
-            f"✅ {supporter_names} wurden gerufen! Bitte warte kurz, die Supporter werden sich bei dir melden oder du sollst dich in einem bestimmten Channel einfinden.",
+
+        await interaction.followup.send(
+            f"✅ {supporter_names} wurden gerufen! Bitte warte kurz, die Supporter werden sich bei dir melden.",
             ephemeral=True
         )
+
+
+class TicketPanelView(discord.ui.View):
+    """Persistente View für das Ticket-Panel — ein einziger Button öffnet das Modal."""
+
+    def __init__(self, cog: SupportCog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="Ticket erstellen",
+        style=discord.ButtonStyle.primary,
+        emoji="🎫",
+        custom_id="ticket_create",
+    )
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder können Tickets erstellen.", ephemeral=True)
+            return
+        # Blocklist-Check (selbe Liste wie Support)
+        blocklist = await self.cog.config.guild(interaction.guild).support_blocklist() or {}
+        if str(member.id) in blocklist:
+            await interaction.response.send_message(
+                "❌ Du bist aktuell vom Support-System blockiert und kannst keine Tickets erstellen.",
+                ephemeral=True,
+            )
+            return
+        modal = TicketModal(self.cog)
+        await interaction.response.send_modal(modal)
+
+
+class TicketModal(discord.ui.Modal):
+    """Modal zur Eingabe des Ticket-Betreffs."""
+
+    def __init__(self, cog: SupportCog):
+        super().__init__(title="🎫 Ticket erstellen", timeout=600)
+        self.cog = cog
+        self.subject_input = discord.ui.TextInput(
+            label="Worum geht es?",
+            placeholder="Kurze Beschreibung deines Anliegens...",
+            min_length=3,
+            max_length=200,
+            required=True,
+            custom_id="ticket_subject",
+        )
+        self.add_item(self.subject_input)
+        self.detail_input = discord.ui.TextInput(
+            label="Details (optional)",
+            placeholder="Ausführlichere Beschreibung...",
+            required=False,
+            max_length=1500,
+            style=discord.TextStyle.paragraph,
+            custom_id="ticket_details",
+        )
+        self.add_item(self.detail_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        subject = self.subject_input.value.strip()
+        details = self.detail_input.value.strip() if self.detail_input.value else ""
+        full_subject = subject if not details else f"{subject}\n\n{details}"
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        await self.cog._create_ticket(interaction, full_subject, member)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        msg = "❌ Ein Fehler ist beim Erstellen des Tickets aufgetreten."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im TicketModal", exc_info=error)
+
+
+class TicketCloseView(discord.ui.View):
+    """Persistente View mit 'Ticket schließen'-Button, die in jedem Ticket-Channel gesendet wird."""
+
+    def __init__(self, cog: SupportCog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="Ticket schließen",
+        style=discord.ButtonStyle.danger,
+        emoji="🔒",
+        custom_id="ticket_close",
+    )
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.channel is None:
+            await interaction.response.send_message("❌ Dieser Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+            return
+        await self.cog._close_ticket(interaction, interaction.channel)
 
 
 async def setup(bot: Red):
