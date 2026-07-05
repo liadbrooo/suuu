@@ -86,6 +86,8 @@ Nutzung:
 - ALLE Duty-Mitglieder werden INDIVIDUELL gepingt für garantierte Benachrichtigung!
 """
 
+from __future__ import annotations
+
 import discord
 from redbot.core import commands, checks, Config
 from redbot.core.bot import Red
