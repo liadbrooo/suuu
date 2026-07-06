@@ -15068,7 +15068,7 @@ class EmbedBuilderStartView(discord.ui.View):
         self.send_channel = send_channel
         self.force_send = force_send
 
-    @discord.ui.button(label="Embed erstellen/bearbeiten", style=discord.ButtonStyle.primary, emoji="📝")
+    @discord.ui.button(label="Embed erstellen/bearbeiten", style=discord.ButtonStyle.primary)
     async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             if not isinstance(interaction.user, discord.Member):
@@ -15149,9 +15149,16 @@ class EmbedBuilderMainModal(discord.ui.Modal):
                    "field3_name", "field3_value"]:
             if self.existing_data.get(k):
                 data[k] = self.existing_data[k]
-        # Modal 2 öffnen — NICHT defer(), sondern direkt send_modal()
-        modal2 = EmbedBuilderImagesModal(self.cog, self.key, data, self.send_channel, self.force_send)
-        await interaction.response.send_modal(modal2)
+        # Nach Modal-Submit kann man NICHT send_modal() aufrufen.
+        # Stattdessen: Nachricht mit Button für nächsten Schritt senden
+        embed = discord.Embed(
+            title=f"2/3 Bilder & Icons: {self.key}",
+            description="Teil 1 gespeichert! Klicke auf den Button um Bilder und Icons hinzuzufügen.\nOder klicke 'Überspringen' um direkt zu den Fields zu kommen.",
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+        view = EmbedBuilderNextView(self.cog, self.key, data, self.send_channel, self.force_send, step=2)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         try:
@@ -15220,9 +15227,16 @@ class EmbedBuilderImagesModal(discord.ui.Modal):
             else:
                 self.data["field1_name"] = "Info"
                 self.data["field1_value"] = parts[0].strip()[:1024]
-        # Modal 3 öffnen — NICHT defer(), direkt send_modal()
-        modal3 = EmbedBuilderFieldsModal(self.cog, self.key, self.data, self.send_channel, self.force_send)
-        await interaction.response.send_modal(modal3)
+        # Nach Modal-Submit kann man NICHT send_modal() aufrufen.
+        # Stattdessen: Nachricht mit Button für nächsten Schritt
+        embed = discord.Embed(
+            title=f"3/3 Fields: {self.key}",
+            description="Teil 2 gespeichert! Klicke auf den Button um Fields hinzuzufügen.\nOder klicke 'Fertig' um das Embed zu speichern.",
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+        view = EmbedBuilderNextView(self.cog, self.key, self.data, self.send_channel, self.force_send, step=3)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         try:
@@ -15285,6 +15299,76 @@ class EmbedBuilderFieldsModal(discord.ui.Modal):
         except discord.HTTPException:
             pass
         log.exception("Fehler im EmbedBuilderFieldsModal", exc_info=error)
+
+
+class EmbedBuilderNextView(discord.ui.View):
+    """View mit Buttons für den nächsten Schritt im 3-stufigen Embed Builder."""
+
+    def __init__(self, cog, key: str, data: dict, send_channel=None, force_send=False, step=2):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.key = key
+        self.data = data
+        self.send_channel = send_channel
+        self.force_send = force_send
+        self.step = step
+
+    @discord.ui.button(label="Weiter", style=discord.ButtonStyle.primary)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            if not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+                return
+            if self.step == 2:
+                modal = EmbedBuilderImagesModal(self.cog, self.key, self.data, self.send_channel, self.force_send)
+            elif self.step == 3:
+                modal = EmbedBuilderFieldsModal(self.cog, self.key, self.data, self.send_channel, self.force_send)
+            else:
+                await interaction.response.send_message("❌ Unbekannter Schritt.", ephemeral=True)
+                return
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            log.exception("Fehler beim Öffnen des nächsten Modals")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Überspringen / Fertig", style=discord.ButtonStyle.success)
+    async def skip_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            if self.step == 2:
+                # Von Schritt 2 überspringen → direkt zu Schritt 3
+                embed = discord.Embed(
+                    title=f"3/3 Fields: {self.key}",
+                    description="Bilder übersprungen! Klicke auf den Button um Fields hinzuzufügen.\nOder klicke 'Fertig' um das Embed zu speichern.",
+                    color=discord.Color.blue(),
+                    timestamp=_now(),
+                )
+                view = EmbedBuilderNextView(self.cog, self.key, self.data, self.send_channel, self.force_send, step=3)
+                await interaction.response.edit_message(embed=embed, view=view)
+            else:
+                # Schritt 3 überspringen → direkt speichern
+                await interaction.response.defer(ephemeral=True)
+                await self.cog._embed_builder_save_and_send(interaction, self.key, self.data, self.send_channel, self.force_send)
+        except Exception as e:
+            log.exception("Fehler beim Überspringen")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
 
 
 async def setup(bot: Red):
