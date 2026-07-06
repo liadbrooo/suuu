@@ -198,6 +198,7 @@ class SupportCog(commands.Cog):
             "duty_timeout": 4,  # Stunden nach denen Duty automatisch entfernt wird
             "panel_message_id": None,  # Message ID der permanenten Panel-Nachricht
             "team_panel_message_id": None,  # Message ID des Team-Panels
+            "team_panel_roles": [],  # Liste von Rollen-IDs die im Team-Panel angezeigt werden
             "support_always_allowed_role": None,  # Rolle die immer User holen darf (ohne Duty-Pflicht)
             
             # ERWEITERTE DUTY FUNKTIONEN
@@ -4180,115 +4181,71 @@ class SupportCog(commands.Cog):
     def _get_discord_status_emoji(self, member: discord.Member) -> str:
         """Gibt das Emoji für den Discord-Status eines Members zurück."""
         status = str(member.status) if member.status else "offline"
-        status_map = {
-            "online": "🟢",
-            "idle": "🟡",
-            "dnd": "🔴",
-            "offline": "⚫",
-        }
-        return status_map.get(status, "⚫")
-
-    def _get_discord_status_text(self, member: discord.Member) -> str:
-        """Gibt den Text für den Discord-Status zurück."""
-        status = str(member.status) if member.status else "offline"
-        status_map = {
-            "online": "Online",
-            "idle": "Abwesend",
-            "dnd": "Nicht stören",
-            "offline": "Offline",
-        }
-        return status_map.get(status, "Offline")
+        return {"online": "🟢", "idle": "🟡", "dnd": "🔴", "offline": "⚫"}.get(status, "⚫")
 
     async def update_team_panel(self, channel: discord.TextChannel, guild: discord.Guild) -> bool:
         """Erstellt oder aktualisiert das Team-Übersichts-Panel.
-
-        Zeigt alle Teammitglieder nach Rollen-Hierarchie sortiert, mit Discord-Status,
-        Duty-Status und schöner Formatierung.
-
-        Returns True on success, False on failure.
-        """
-        role_id = await self.config.guild(guild).role()
+        Verwendet die konfigurierten team_panel_roles für die Gruppierung."""
         duty_role = await self.get_duty_role(guild)
-        wl_role_id = await self.config.guild(guild).whitelist_role()
-
-        # Sammle alle Teammitglieder aus Basis-Rolle + Whitelist-Rolle
-        all_team_members = set()
-        base_role = None
-        if role_id:
-            base_role = guild.get_role(role_id)
-            if base_role:
-                all_team_members.update(base_role.members)
-        wl_role = None
-        if wl_role_id:
-            wl_role = guild.get_role(wl_role_id)
-            if wl_role:
-                all_team_members.update(wl_role.members)
-
-        # Duty-Daten laden
         all_members_data = await self.config.all_members(guild)
-        on_duty_count = 0
+        # Konfigurierte Rollen laden
+        panel_role_ids = await self.config.guild(guild).team_panel_roles() or []
+        # Falls keine konfiguriert: Fallback auf Support-Rolle + Whitelist-Rolle
+        if not panel_role_ids:
+            role_id = await self.config.guild(guild).role()
+            wl_role_id = await self.config.guild(guild).whitelist_role()
+            if role_id:
+                panel_role_ids.append(role_id)
+            if wl_role_id:
+                panel_role_ids.append(wl_role_id)
+        if not panel_role_ids:
+            # Letzter Fallback: keine Rollen → leeres Panel
+            embed = discord.Embed(
+                title="👥 Team Übersicht",
+                description="❌ Keine Rollen konfiguriert.\nNutze `[p]teampanel roles @Rolle1 @Rolle2 ...` um Rollen festzulegen.",
+                color=discord.Color.red(),
+                timestamp=_now(),
+            )
+            try:
+                await self._team_panel_send_or_edit(channel, guild, embed)
+            except Exception:
+                return False
+            return True
+
+        # Rollen-Objekte laden und nach Hierarchie sortieren (höchste zuerst)
+        panel_roles = []
+        for rid in panel_role_ids:
+            role = guild.get_role(rid)
+            if role and not role.is_default() and not role.is_bot_managed():
+                panel_roles.append(role)
+        panel_roles.sort(key=lambda r: r.position, reverse=True)
+
+        # Alle Teammitglieder sammeln (Union aller Rollen-Mitglieder)
+        all_team_members = set()
+        for role in panel_roles:
+            all_team_members.update(role.members)
         total_members = len(all_team_members)
 
-        # Mitglieder nach Rollen-Hierarchie gruppieren
-        # Wir sammeln alle Rollen die Teammitglieder haben und sortieren nach Position
-        role_groups = {}  # {role_id: [members]}
-        ungrouped = []  # Mitglieder ohne spezifische Team-Rolle
-
-        # Sammle alle relevanten Rollen (Support-Rolle, Whitelist-Rolle, + Admin/Mod Rollen)
-        relevant_roles = []
-        if base_role:
-            relevant_roles.append(base_role)
-        if wl_role:
-            relevant_roles.append(wl_role)
-        # Auch Rollen mit Manage Guild/Ban/Kick als Team-Rollen erkennen
-        for role in guild.roles:
-            if role.id in [r.id for r in relevant_roles]:
-                continue
-            if role.is_default() or role.is_bot_managed() or role.is_integration():
-                continue
-            perms = role.permissions
-            if perms.administrator or perms.manage_guild or perms.ban_members or perms.kick_members or perms.moderate_members:
-                if any(role in m.roles for m in all_team_members):
-                    relevant_roles.append(role)
-
-        # Sortiere relevante Rollen nach Hierarchie (höchste zuerst)
-        relevant_roles.sort(key=lambda r: r.position, reverse=True)
-
-        # Weise Mitglieder zu Rollen zu (jeder Member kommt nur in seine höchste Rolle)
+        # Mitglieder zu Rollen zuweisen (jeder Member in seine höchste konfigurierte Rolle)
+        role_groups = []
         assigned = set()
-        for role in relevant_roles:
-            role_members = []
-            for m in all_team_members:
-                if m.id in assigned:
-                    continue
-                if role in m.roles:
-                    role_members.append(m)
-                    assigned.add(m.id)
+        for role in panel_roles:
+            role_members = [m for m in role.members if m.id not in assigned and not m.bot]
+            for m in role_members:
+                assigned.add(m.id)
             if role_members:
-                # Sortiere innerhalb der Rolle nach Display-Name, aber Online-Status zuerst
                 role_members.sort(key=lambda x: (
                     0 if str(x.status) == "online" else (1 if str(x.status) == "idle" else (2 if str(x.status) == "dnd" else 3)),
                     x.display_name.lower()
                 ))
-                role_groups[role.id] = (role, role_members)
+                role_groups.append((role, role_members))
 
-        # Unassigned Mitglieder
-        for m in all_team_members:
-            if m.id not in assigned:
-                ungrouped.append(m)
-        if ungrouped:
-            ungrouped.sort(key=lambda x: (
-                0 if str(x.status) == "online" else (1 if str(x.status) == "idle" else (2 if str(x.status) == "dnd" else 3)),
-                x.display_name.lower()
-            ))
-
-        # Embed bauen
+        # Stats berechnen
         online_count = sum(1 for m in all_team_members if str(m.status) == "online")
         idle_count = sum(1 for m in all_team_members if str(m.status) == "idle")
         dnd_count = sum(1 for m in all_team_members if str(m.status) == "dnd")
         offline_count = sum(1 for m in all_team_members if str(m.status) == "offline")
-
-        # On-Duty zählen
+        on_duty_count = 0
         for m in all_team_members:
             is_duty = bool(all_members_data.get(m.id, {}).get("on_duty")) and (
                 duty_role is None or m.get_role(duty_role.id) is not None
@@ -4296,88 +4253,51 @@ class SupportCog(commands.Cog):
             if is_duty:
                 on_duty_count += 1
 
+        # Embed bauen
         embed = discord.Embed(
             title="👥 Team Übersicht",
-            description=(
-                f"**Unser Team** • {total_members} Mitglieder\n\n"
-                f"📊 **Status-Übersicht:**\n"
-                f"🟢 Online: **{online_count}** | 🟡 Abwesend: **{idle_count}** | 🔴 DND: **{dnd_count}** | ⚫ Offline: **{offline_count}**\n"
-                f"🟢 Im Dienst: **{on_duty_count}** | 🔴 Nicht im Dienst: **{total_members - on_duty_count}**"
-            ),
             color=discord.Color.blue(),
             timestamp=_now(),
         )
+        embed.description = (
+            f"**Unser Team** — {total_members} Mitglieder\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 Online: **{online_count}**  •  🟡 Abwesend: **{idle_count}**\n"
+            f"🔴 DND: **{dnd_count}**  •  ⚫ Offline: **{offline_count}**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 Im Dienst: **{on_duty_count}** / {total_members}"
+        )
 
-        # Mitglieder nach Rollen gruppieren und als Fields hinzufügen
+        # Pro Rolle ein Field
         field_count = 0
-        max_fields = 25  # Discord Embed Limit
-
-        for role_id, (role, members) in role_groups.items():
-            if field_count >= max_fields:
+        for role, members in role_groups:
+            if field_count >= 22:
                 break
-            if not members:
-                continue
-            # Mitglieder-Liste bauen
-            member_lines = []
+            lines = []
             for m in members:
                 status_emoji = self._get_discord_status_emoji(m)
-                # Duty-Status
                 is_duty = bool(all_members_data.get(m.id, {}).get("on_duty")) and (
                     duty_role is None or m.get_role(duty_role.id) is not None
                 )
-                duty_label = " • 🟢 Im Dienst" if is_duty else ""
-                # Custom Status (falls vorhanden)
-                custom_status = ""
-                if hasattr(m, "activities") and m.activities:
-                    for activity in m.activities:
-                        if isinstance(activity, discord.CustomActivity):
-                            custom_status = f" • *{activity.name[:50]}*" if activity.name else ""
-                            break
-                member_lines.append(f"{status_emoji} **{m.display_name}**{duty_label}{custom_status}")
-                if len(member_lines) >= 20:  # Max 20 pro Field
-                    if len(members) > 20:
-                        member_lines.append(f"... und {len(members) - 20} weitere")
-                    break
-            embed.add_field(
-                name=f"━━━ {role.name} ({len(members)}) ━━━",
-                value="\n".join(member_lines),
-                inline=False,
-            )
+                duty_tag = " 🟦" if is_duty else ""
+                lines.append(f"{status_emoji} {m.display_name}{duty_tag}")
+            field_name = f"{role.name} ({len(members)})"
+            # Field value auf 1024 Zeichen begrenzen
+            value_text = "\n".join(lines)
+            if len(value_text) > 1024:
+                value_text = value_text[:1020] + "\n..."
+            embed.add_field(name=field_name, value=value_text or "—", inline=False)
             field_count += 1
 
-        # Unassigned Mitglieder
-        if ungrouped and field_count < max_fields:
-            member_lines = []
-            for m in ungrouped:
-                status_emoji = self._get_discord_status_emoji(m)
-                is_duty = bool(all_members_data.get(m.id, {}).get("on_duty")) and (
-                    duty_role is None or m.get_role(duty_role.id) is not None
-                )
-                duty_label = " • 🟢 Im Dienst" if is_duty else ""
-                custom_status = ""
-                if hasattr(m, "activities") and m.activities:
-                    for activity in m.activities:
-                        if isinstance(activity, discord.CustomActivity):
-                            custom_status = f" • *{activity.name[:50]}*" if activity.name else ""
-                            break
-                member_lines.append(f"{status_emoji} **{m.display_name}**{duty_label}{custom_status}")
-                if len(member_lines) >= 20:
-                    if len(ungrouped) > 20:
-                        member_lines.append(f"... und {len(ungrouped) - 20} weitere")
-                    break
-            embed.add_field(
-                name=f"━━━ Weitere Teammitglieder ({len(ungrouped)}) ━━━",
-                value="\n".join(member_lines),
-                inline=False,
-            )
-
         if total_members == 0:
-            embed.add_field(name="❌ Keine Teammitglieder", value="Es wurden keine Teammitglieder gefunden. Konfiguriere eine Support-Rolle mit `[p]supportset role`.", inline=False)
+            embed.add_field(name="❌ Keine Teammitglieder", value="Niemand hat eine der konfigurierten Rollen.", inline=False)
 
-        # Legende im Footer
-        embed.set_footer(text=f"🟢 Online 🟡 Abwesend 🔴 DND ⚫ Offline • Im Dienst: {on_duty_count}/{total_members} • {_fmt_berlin_full(_now())} (MEZ/MESZ)")
+        embed.set_footer(text=f"🟢=Online 🟡=Abwesend 🔴=DND ⚫=Offline 🟦=Im Dienst | {on_duty_count}/{total_members} im Dienst | {_fmt_berlin_full(_now())} (MEZ/MESZ)")
 
-        # Nachricht aktualisieren oder neu erstellen
+        return await self._team_panel_send_or_edit(channel, guild, embed)
+
+    async def _team_panel_send_or_edit(self, channel: discord.TextChannel, guild: discord.Guild, embed: discord.Embed) -> bool:
+        """Sendet oder aktualisiert das Team-Panel."""
         team_panel_message_id = await self.config.guild(guild).team_panel_message_id()
         if team_panel_message_id:
             try:
@@ -4392,7 +4312,6 @@ class SupportCog(commands.Cog):
             except discord.HTTPException:
                 log.exception("HTTP-Fehler beim Editieren des Team-Panels (Guild %s)", guild.id)
                 return False
-
         try:
             message = await channel.send(embed=embed)
         except (discord.Forbidden, discord.HTTPException):
@@ -4401,33 +4320,69 @@ class SupportCog(commands.Cog):
         await self.config.guild(guild).team_panel_message_id.set(message.id)
         return True
 
-    @commands.command(name="teampanel", aliases=["teamupdate", "updateteam"])
+    @commands.group(name="teampanel", aliases=["teamupdate", "updateteam", "tpset"])
     @commands.guild_only()
     async def teampanel(self, ctx: commands.Context):
-        """
-        Aktualisiert oder erstellt das Team-Übersichts-Panel.
-        Zeigt alle Teammitglieder und deren Duty-Status.
-        """
-        guild = ctx.guild
-        channel = await self.get_team_channel(guild)
+        """Aktualisiert oder konfiguriert das Team-Übersichts-Panel.
+        Ohne Subcommand: erstellt/aktualisiert das Panel.
+        Mit `roles`: setzt welche Rollen angezeigt werden."""
+        if ctx.invoked_subcommand is None:
+            guild = ctx.guild
+            channel = await self.get_team_channel(guild)
+            if not channel:
+                if not isinstance(ctx.channel, discord.TextChannel):
+                    await ctx.send("❌ Kein Team-Channel konfiguriert und aktueller Channel ist kein Text-Channel!")
+                    return
+                channel = ctx.channel
+            ok = await self.update_team_panel(channel, guild)
+            if ok:
+                await ctx.send(f"✅ Team-Panel in {channel.mention} aktualisiert!")
+            else:
+                await ctx.send("❌ Konnte Team-Panel nicht aktualisieren (fehlende Rechte?).")
 
-        # If no team channel is configured (and no panel/log channel as fallback),
-        # use the channel the command was invoked in. Mirrors supportset createteampanel.
-        if not channel:
-            if not isinstance(ctx.channel, discord.TextChannel):
-                await ctx.send("❌ Kein Team-Channel konfiguriert und aktueller Channel ist kein Text-Channel!")
+    @teampanel.command(name="roles")
+    async def teampanel_roles(self, ctx: commands.Context, *roles: discord.Role):
+        """Setzt welche Rollen im Team-Panel angezeigt werden.
+        Beispiel: `[p]teampanel roles @Admin @Moderator @Support`
+        Ohne Angabe werden die aktuellen Rollen angezeigt."""
+        if not roles:
+            current_ids = await self.config.guild(ctx.guild).team_panel_roles() or []
+            if not current_ids:
+                await ctx.send(
+                    "ℹ️ Keine Rollen konfiguriert. Das Panel verwendet automatisch die Support-Rolle und Whitelist-Rolle.\n"
+                    "Setze Rollen mit: `[p]teampanel roles @Rolle1 @Rolle2 ...`"
+                )
                 return
-            channel = ctx.channel
-            await ctx.send(
-                "ℹ️ Kein Team-Channel konfiguriert — verwende aktuellen Channel. "
-                "Setze einen permanenten Channel mit `[p]supportset teamchannel`."
+            role_lines = []
+            for rid in current_ids:
+                role = ctx.guild.get_role(rid)
+                if role:
+                    role_lines.append(f"• {role.mention} — {role.name} (Position: {role.position})")
+                else:
+                    role_lines.append(f"• ❌ Rolle `{rid}` nicht mehr vorhanden")
+            embed = discord.Embed(
+                title="👥 Team-Panel Rollen",
+                description=f"{len(current_ids)} Rolle(n) konfiguriert:\n\n" + "\n".join(role_lines),
+                color=discord.Color.blue(),
+                timestamp=_now(),
             )
+            embed.set_footer(text="Ändern mit: [p]teampanel roles @Rolle1 @Rolle2 ...")
+            await ctx.send(embed=embed)
+            return
+        # Rollen setzen
+        role_ids = [r.id for r in roles]
+        await self.config.guild(ctx.guild).team_panel_roles.set(role_ids)
+        role_names = ", ".join(r.name for r in roles)
+        await ctx.send(
+            f"✅ Team-Panel Rollen gesetzt auf: **{role_names}**\n"
+            f"Nutze `[p]teampanel` um das Panel zu aktualisieren."
+        )
 
-        ok = await self.update_team_panel(channel, guild)
-        if ok:
-            await ctx.send(f"✅ Team-Panel in {channel.mention} aktualisiert!")
-        else:
-            await ctx.send("❌ Konnte Team-Panel nicht aktualisieren (fehlende Rechte?).")
+    @teampanel.command(name="resetroles")
+    async def teampanel_resetroles(self, ctx: commands.Context):
+        """Setzt die Team-Panel Rollen zurück (verwendet automatisch Support/Whitelist-Rolle)."""
+        await self.config.guild(ctx.guild).team_panel_roles.set([])
+        await ctx.send("✅ Team-Panel Rollen zurückgesetzt. Verwendet automatisch Support-Rolle und Whitelist-Rolle.")
 
     # ============================================
     # TICKET SYSTEM
@@ -7617,8 +7572,9 @@ class SupportCog(commands.Cog):
         counter = await self.config.guild(guild).ticket_counter() or 0
         counter += 1
         await self.config.guild(guild).ticket_counter.set(counter)
-        # Ticket-Name: <kategorie>-<nummer>
-        ticket_name = f"{cat_key}-{counter:04d}"
+        # Ticket-Name: <kategorie>-<username> (sanitized)
+        username_clean = re.sub(r"[^a-zA-Z0-9_]", "", requester.display_name.lower())[:20] or str(requester.id)[-6:]
+        ticket_name = f"{cat_key}-{username_clean}"
 
         # Berechtigungen
         overwrites = {
@@ -7680,16 +7636,9 @@ class SupportCog(commands.Cog):
         }
         embed_color = color_map.get(color_name, discord.Color.blurple())
 
-        # Description sauber aufbauen
-        desc_lines = [f"Hallo {requester.mention}!"]
-        if subject and subject.strip():
-            subject_short = subject.strip()[:1000]
-            desc_lines.append(f"**Anliegen:**\n{subject_short}")
-        desc_lines.append("")
-        desc_lines.append(welcome_msg)
+        # Haupt-Embed: Ticket-Info (kurz und kompakt)
         embed = discord.Embed(
             title=f"{cat.get('emoji', '🎫')} {cat.get('name', 'Ticket')} #{counter}",
-            description="\n".join(desc_lines),
             color=embed_color,
             timestamp=_now(),
         )
@@ -7697,7 +7646,7 @@ class SupportCog(commands.Cog):
         embed.add_field(name="📂 Kategorie", value=cat.get("name", cat_key), inline=True)
         embed.add_field(name="👤 Erstellt von", value=f"{requester.mention}\n`{requester.id}`", inline=True)
         embed.add_field(name="📊 Status", value="🟡 Offen", inline=True)
-        embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
+        embed.set_footer(text="Ticket-System")
 
         # View mit Close + Claim + Unclaim-Buttons
         view = TicketControlView(self, claim_enabled=claim_enabled)
@@ -7709,7 +7658,23 @@ class SupportCog(commands.Cog):
                 allowed_mentions=discord.AllowedMentions(roles=[support_role], users=[requester]),
             )
         except discord.HTTPException:
-            log.warning("Konnte Begrüßungs-Nachricht im Ticket-Channel nicht senden (Guild %s)", guild.id)
+            log.warning("Konnte Haupt-Nachricht im Ticket-Channel nicht senden (Guild %s)", guild.id)
+
+        # Willkommens-Embed (separat, darunter)
+        welcome_embed = discord.Embed(
+            title=f"👋 Willkommen, {requester.display_name}!",
+            description=welcome_msg,
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        if subject and subject.strip():
+            welcome_embed.add_field(name="📝 Dein Anliegen", value=subject.strip()[:1024], inline=False)
+        welcome_embed.add_field(name="ℹ️ Hinweis", value="Ein Teammitglied wird sich gleich um dich kümmern. Bitte habe etwas Geduld.\n🔒 Dieses Gespräch wird aufgezeichnet (Transcript) und dir bei Schließung zugesendet.", inline=False)
+        welcome_embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
+        try:
+            await ticket_channel.send(embed=welcome_embed)
+        except discord.HTTPException:
+            pass
 
         # Welcome-Nachricht pinnen für bessere Übersicht
         try:
@@ -8134,7 +8099,8 @@ class SupportCog(commands.Cog):
         counter = await self.config.guild(guild).ticket_counter() or 0
         counter += 1
         await self.config.guild(guild).ticket_counter.set(counter)
-        ticket_name = f"ticket-{counter:04d}"
+        username_clean = re.sub(r"[^a-zA-Z0-9_]", "", requester.display_name.lower())[:20] or str(requester.id)[-6:]
+        ticket_name = f"ticket-{username_clean}"
 
         # Berechtigungen
         overwrites = {
@@ -8181,24 +8147,16 @@ class SupportCog(commands.Cog):
         welcome_msg = await self.config.guild(guild).ticket_welcome_message() or "Willkommen zu deinem Ticket! Ein Teammitglied wird sich gleich um dein Anliegen kümmern."
         claim_enabled = await self.config.guild(guild).ticket_claim_enabled()
 
-        # Description sauber aufbauen — subject ist bereits der User-Text, welcome_msg kommt dazu
-        desc_lines = [f"Hallo {requester.mention}!"]
-        if subject and subject.strip():
-            # Subject auf 1000 Zeichen begrenzen für die Description
-            subject_short = subject.strip()[:1000]
-            desc_lines.append(f"**Anliegen:**\n{subject_short}")
-        desc_lines.append("")  # Leerzeile
-        desc_lines.append(welcome_msg)
+        # Haupt-Embed: Ticket-Info (kurz und kompakt)
         embed = discord.Embed(
             title=f"🎫 Ticket #{counter}",
-            description="\n".join(desc_lines),
             color=discord.Color.blurple(),
             timestamp=_now(),
         )
         embed.add_field(name="🎫 Ticket-ID", value=f"#{counter}", inline=True)
         embed.add_field(name="👤 Erstellt von", value=f"{requester.mention}\n`{requester.id}`", inline=True)
         embed.add_field(name="📊 Status", value="🟡 Offen", inline=True)
-        embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
+        embed.set_footer(text="Ticket-System")
 
         # View mit Close + Claim + Add-User-Buttons
         view = TicketControlView(self, claim_enabled=claim_enabled)
@@ -8210,7 +8168,23 @@ class SupportCog(commands.Cog):
                 allowed_mentions=discord.AllowedMentions(roles=[support_role], users=[requester]),
             )
         except discord.HTTPException:
-            log.warning("Konnte Begrüßungs-Nachricht im Ticket-Channel nicht senden (Guild %s)", guild.id)
+            log.warning("Konnte Haupt-Nachricht im Ticket-Channel nicht senden (Guild %s)", guild.id)
+
+        # Willkommens-Embed (separat, darunter)
+        welcome_embed = discord.Embed(
+            title=f"👋 Willkommen, {requester.display_name}!",
+            description=welcome_msg,
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        if subject and subject.strip():
+            welcome_embed.add_field(name="📝 Dein Anliegen", value=subject.strip()[:1024], inline=False)
+        welcome_embed.add_field(name="ℹ️ Hinweis", value="Ein Teammitglied wird sich gleich um dich kümmern. Bitte habe etwas Geduld.\n🔒 Dieses Gespräch wird aufgezeichnet (Transcript) und dir bei Schließung zugesendet.", inline=False)
+        welcome_embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
+        try:
+            await ticket_channel.send(embed=welcome_embed)
+        except discord.HTTPException:
+            pass
 
         # Log-Eintrag
         log_channel_id = await self.config.guild(guild).ticket_log_channel()
@@ -10898,7 +10872,18 @@ class SupportCog(commands.Cog):
                 if channel is None:
                     continue
                 try:
-                    # Auto-Close mit Begründung
+                    # Transcript erstellen (vor dem Löschen)
+                    transcript_enabled = await self.config.guild(member.guild).ticket_transcript()
+                    if transcript_enabled:
+                        try:
+                            transcript_html, transcript_txt, _, ticket_num_str = await self._ticket_create_transcript(
+                                channel, closed_by=member, reason="User hat den Server verlassen"
+                            )
+                        except Exception:
+                            transcript_html, transcript_txt, ticket_num_str = "", "", "?"
+                    else:
+                        transcript_html, transcript_txt, ticket_num_str = "", "", "?"
+                    # Auto-Close-Nachricht
                     embed = discord.Embed(
                         title="⏰ Auto-Close (User verlassen)",
                         description=f"Dieses Ticket wurde automatisch geschlossen da {member.mention} den Server verlassen hat.",
@@ -10909,6 +10894,25 @@ class SupportCog(commands.Cog):
                         await channel.send(embed=embed)
                     except discord.HTTPException:
                         pass
+                    # Log-Channel mit Transcript
+                    log_channel_id = await self.config.guild(member.guild).ticket_log_channel()
+                    log_channel = member.guild.get_channel(log_channel_id) if log_channel_id else None
+                    if log_channel and transcript_html:
+                        try:
+                            import io
+                            log_embed = discord.Embed(
+                                title="⏰ Auto-Close (User verlassen)",
+                                description=f"Channel: `{channel.name}` (gelöscht)\nUser: {member.mention}",
+                                color=discord.Color.orange(),
+                                timestamp=_now(),
+                            )
+                            html_file = discord.File(io.StringIO(transcript_html), filename=f"transcript-ticket-{ticket_num_str}.html")
+                            try:
+                                await log_channel.send(embed=log_embed, files=[html_file, discord.File(io.StringIO(transcript_txt), filename=f"transcript-ticket-{ticket_num_str}.txt")])
+                            except discord.HTTPException:
+                                await log_channel.send(embed=log_embed, file=discord.File(io.StringIO(transcript_txt), filename=f"transcript-ticket-{ticket_num_str}.txt"))
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
                     await asyncio.sleep(2)
                     try:
                         await channel.delete(reason=f"Auto-Close: User {member} hat die Guild verlassen")
