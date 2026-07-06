@@ -477,6 +477,7 @@ class SupportCog(commands.Cog):
             self.bot.add_view(TeamPollView(self, "0", []))
         except Exception:
             pass
+        # TeamApplicationStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
 
     async def _ticket_register_persistent_views(self):
         """Registriert persistente Multi-Panel Views nach Guild-Ready."""
@@ -6236,52 +6237,85 @@ class SupportCog(commands.Cog):
             await ctx.send_help()
 
     @team_app.command(name="submit", aliases=["bewerben", "create"])
-    async def team_app_submit(self, ctx: commands.Context, position: str, *, application_text: str):
-        """Reicht eine Bewerbung für eine Team-Position ein.
-        Beispiel: `[p]teamapp submit Moderator Ich möchte gerne Moderator werden weil...`
+    async def team_app_submit(self, ctx: commands.Context):
+        """Reicht eine Bewerbung für eine Team-Position ein (öffnet ein Modal via Button)."""
+        embed = discord.Embed(
+            title="📋 Bewerbung einreichen",
+            description="Klicke auf den Button unten um das Bewerbungsformular zu öffnen.\nDu wirst nach Position und Bewerbungstext gefragt.",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Team-Management • Bewerbungssystem")
+        view = TeamApplicationStartView(self)
+        await ctx.send(embed=embed, view=view)
+
+    @team_app.command(name="textsubmit", aliases=["textbewerben"])
+    async def team_app_textsubmit(self, ctx: commands.Context, position: str, *, application_text: str):
+        """Text-Befehl Alternative zum Einreichen einer Bewerbung (ohne Modal).
+        Beispiel: `[p]teamapp textsubmit Moderator Ich möchte Moderator werden weil...`
         """
         if len(position) > 100:
             await ctx.send("❌ Position zu lang (max 100 Zeichen).")
             return
-        if len(application_text) < 50:
-            await ctx.send("❌ Bewerbungstext zu kurz (min 50 Zeichen). Erkläre warum du geeignet bist.")
-            return
         if len(application_text) > 2000:
             await ctx.send("❌ Bewerbungstext zu lang (max 2000 Zeichen).")
             return
+        await self._team_app_create(ctx, ctx.author, position, application_text)
+
+    async def _team_app_create(self, ctx_or_interaction, applicant: discord.Member, position: str, application_text: str, *, guild: discord.Guild = None):
+        """Erstellt eine Bewerbung und sendet sie an den Review-Channel.
+        ctx_or_interaction kann ein Context oder eine Interaction sein."""
+        if guild is None:
+            guild = ctx_or_interaction.guild if hasattr(ctx_or_interaction, 'guild') else None
+        if guild is None:
+            return
         # Bewerbung erstellen
-        counter = await self.config.guild(ctx.guild).team_applications_counter() or 0
+        counter = await self.config.guild(guild).team_applications_counter() or 0
         counter += 1
         app_id = str(counter)
-        apps = await self.config.guild(ctx.guild).team_applications() or {}
+        apps = await self.config.guild(guild).team_applications() or {}
         apps[app_id] = {
-            "user_id": ctx.author.id,
-            "username": ctx.author.display_name,
+            "user_id": applicant.id,
+            "username": applicant.display_name,
             "position": position,
             "application_text": application_text,
-            "status": "pending",  # pending, accepted, rejected
+            "status": "pending",
             "submitted_ts": _now_ts(),
             "decided_by": None,
             "decided_ts": None,
             "decision_reason": None,
         }
-        await self.config.guild(ctx.guild).team_applications.set(apps)
-        await self.config.guild(ctx.guild).team_applications_counter.set(counter)
+        await self.config.guild(guild).team_applications.set(apps)
+        await self.config.guild(guild).team_applications_counter.set(counter)
         # Bestätigung an Bewerber
-        await ctx.send(f"✅ Deine Bewerbung #{app_id} für **{position}** wurde eingereicht.\nDu wirst benachrichtigt sobald eine Entscheidung vorliegt.")
+        try:
+            if hasattr(ctx_or_interaction, 'response') and not ctx_or_interaction.response.is_done():
+                await ctx_or_interaction.response.send_message(
+                    f"✅ Deine Bewerbung #{app_id} für **{position}** wurde eingereicht.\nDu wirst benachrichtigt sobald eine Entscheidung vorliegt.",
+                    ephemeral=True,
+                )
+            elif hasattr(ctx_or_interaction, 'followup'):
+                await ctx_or_interaction.followup.send(
+                    f"✅ Deine Bewerbung #{app_id} für **{position}** wurde eingereicht.\nDu wirst benachrichtigt sobald eine Entscheidung vorliegt.",
+                    ephemeral=True,
+                )
+            else:
+                await ctx_or_interaction.send(f"✅ Deine Bewerbung #{app_id} für **{position}** wurde eingereicht.\nDu wirst benachrichtigt sobald eine Entscheidung vorliegt.")
+        except discord.HTTPException:
+            pass
         # An Review-Channel senden
-        review_ch_id = await self.config.guild(ctx.guild).team_applications_channel()
+        review_ch_id = await self.config.guild(guild).team_applications_channel()
         if review_ch_id:
-            review_ch = ctx.guild.get_channel(review_ch_id)
+            review_ch = guild.get_channel(review_ch_id)
             if review_ch:
                 try:
                     embed = discord.Embed(
                         title=f"📋 Neue Bewerbung #{app_id}",
-                        description=f"**Position:** {position}\n**Bewerber:** {ctx.author.mention}\n`{ctx.author.id}`",
+                        description=f"**Position:** {position}\n**Bewerber:** {applicant.mention}\n`{applicant.id}`",
                         color=discord.Color.gold(),
                         timestamp=_now(),
                     )
-                    embed.add_field(name="📝 Bewerbungstext", value=application_text[:1024], inline=False)
+                    embed.add_field(name="📝 Bewerbungstext", value=application_text[:1024] if application_text else "Kein Text", inline=False)
                     embed.add_field(name="📅 Eingereicht am", value=_fmt_berlin_full(_now()), inline=True)
                     embed.set_footer(text=f"Bewerbungs-ID: {app_id}")
                     view = TeamApplicationReviewView(self, app_id)
@@ -13942,6 +13976,68 @@ class TeamAppointmentView(discord.ui.View):
         await interaction.response.edit_message(embed=embed)
 
 
+class TeamApplicationStartView(discord.ui.View):
+    """View mit Button um das Bewerbungs-Modal zu öffnen."""
+
+    def __init__(self, cog):
+        super().__init__(timeout=300)
+        self.cog = cog
+
+    @discord.ui.button(label="Bewerbung einreichen", style=discord.ButtonStyle.success, emoji="📋", custom_id="team_app_start")
+    async def start_app(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        modal = TeamApplicationModal(self.cog, interaction.user)
+        await interaction.response.send_modal(modal)
+
+
+class TeamApplicationModal(discord.ui.Modal):
+    """Modal zur Eingabe der Bewerbung (Position + Text)."""
+
+    def __init__(self, cog, applicant: discord.Member):
+        super().__init__(title="📋 Bewerbung einreichen", timeout=600)
+        self.cog = cog
+        self.applicant = applicant
+        self.position_input = discord.ui.TextInput(
+            label="Position (wofür bewirbst du dich?)",
+            placeholder="z.B. Moderator, Supporter, Event-Manager...",
+            required=True,
+            max_length=100,
+            custom_id="app_position",
+        )
+        self.add_item(self.position_input)
+        self.text_input = discord.ui.TextInput(
+            label="Bewerbungstext",
+            placeholder="Warum möchtest du diese Position? Was qualifiziert dich?",
+            required=True,
+            max_length=2000,
+            min_length=1,
+            style=discord.TextStyle.paragraph,
+            custom_id="app_text",
+        )
+        self.add_item(self.text_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        position = self.position_input.value.strip()
+        application_text = self.text_input.value.strip()
+        if not position or not application_text:
+            await interaction.response.send_message("❌ Bitte fülle alle Felder aus.", ephemeral=True)
+            return
+        # Bewerbung erstellen über die cog-Methode
+        await self.cog._team_app_create(interaction, self.applicant, position, application_text, guild=interaction.guild)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im TeamApplicationModal", exc_info=error)
+
+
 class TeamApplicationReviewView(discord.ui.View):
     """View für Bewerbungs-Review mit Annehmen/Ablehnen/Einladen-Buttons."""
 
@@ -14125,7 +14221,7 @@ class TeamInterviewModal(discord.ui.Modal):
         self.cog = cog
         self.app_id = app_id
         self.channel_input = discord.ui.TextInput(
-            label="Channel-ID oder #Mention",
+            label="Channel-ID oder Mention (Text oder Sprach)",
             placeholder="z.B. #interviews oder 123456789012345678",
             required=True,
             max_length=50,
@@ -14161,10 +14257,9 @@ class TeamInterviewModal(discord.ui.Modal):
         self.add_item(self.notes_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Channel parsen
+        # Channel parsen — akzeptiert Text- UND Sprachkanäle
         channel_str = self.channel_input.value.strip()
-        channel = None
-        # Mention-Format <#123456>
+        # Mention-Format <#123456> oder <#123456> (beides gleich für Text/Voice)
         m = re.match(r"<#(\d+)>", channel_str)
         if m:
             channel_id = int(m.group(1))
@@ -14172,11 +14267,17 @@ class TeamInterviewModal(discord.ui.Modal):
             try:
                 channel_id = int(channel_str)
             except ValueError:
-                await interaction.response.send_message("❌ Ungültiger Channel. Verwende eine Channel-ID oder #Mention.", ephemeral=True)
+                await interaction.response.send_message("❌ Ungültiger Channel. Verwende eine Channel-ID oder #Mention (funktioniert auch für Sprachkanäle).", ephemeral=True)
                 return
         channel = interaction.guild.get_channel(channel_id)
-        if not channel or not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("❌ Channel nicht gefunden oder kein Text-Channel.", ephemeral=True)
+        if not channel:
+            await interaction.response.send_message("❌ Channel nicht gefunden.", ephemeral=True)
+            return
+        # Channel-Typ ermitteln
+        is_voice = isinstance(channel, discord.VoiceChannel)
+        is_text = isinstance(channel, discord.TextChannel)
+        if not (is_voice or is_text):
+            await interaction.response.send_message("❌ Das ist kein Text- oder Sprachkanal. Verwende einen Text- oder Voice-Channel.", ephemeral=True)
             return
         # Datum/Zeit parsen
         try:
@@ -14196,17 +14297,29 @@ class TeamInterviewModal(discord.ui.Modal):
             await interaction.response.send_message("❌ Bewerbung existiert nicht mehr.", ephemeral=True)
             return
         app = apps[self.app_id]
+        # Prüfen ob schon ein Interview für diese Bewerbung existiert
+        interviews = await self.cog.config.guild(interaction.guild).team_interviews() or {}
+        for iv in interviews.values():
+            if iv.get("app_id") == self.app_id and iv.get("status") == "scheduled":
+                await interaction.response.send_message(
+                    f"❌ Für diese Bewerbung existiert bereits ein geplantes Interview (#{iv.get('interview_id', '?')}).\n"
+                    f"Sage dieses zuerst ab mit `[p]teaminterview cancel <id>` bevor du ein neues erstellst.",
+                    ephemeral=True,
+                )
+                return
         # Interview erstellen
         counter = await self.cog.config.guild(interaction.guild).team_interviews_counter() or 0
         counter += 1
         interview_id = str(counter)
-        interviews = await self.cog.config.guild(interaction.guild).team_interviews() or {}
         notes = self.notes_input.value.strip() if self.notes_input.value else ""
         interviews[interview_id] = {
+            "interview_id": interview_id,
             "app_id": self.app_id,
             "user_id": app.get("user_id"),
             "username": app.get("username"),
             "channel_id": channel.id,
+            "channel_name": channel.name,
+            "channel_type": "voice" if is_voice else "text",
             "scheduled_ts": scheduled_ts,
             "status": "scheduled",
             "notes": notes,
@@ -14216,7 +14329,9 @@ class TeamInterviewModal(discord.ui.Modal):
         }
         await self.cog.config.guild(interaction.guild).team_interviews.set(interviews)
         await self.cog.config.guild(interaction.guild).team_interviews_counter.set(counter)
-        # Interview-Embed im Channel posten
+        # Channel-Typ Info
+        channel_type_label = "🎤 Sprachkanal" if is_voice else "💬 Textkanal"
+        # Interview-Embed im Channel posten (nur bei Text-Channel, Voice kann keine Nachrichten empfangen)
         embed = discord.Embed(
             title=f"📅 Interview #{interview_id} — {app.get('position', '?')}",
             description=f"Bewerber: <@{app.get('user_id')}> (`{app.get('user_id')}`)",
@@ -14224,18 +14339,25 @@ class TeamInterviewModal(discord.ui.Modal):
             timestamp=_now(),
         )
         embed.add_field(name="📅 Termin", value=_fmt_berlin_full(scheduled_dt) + " (MEZ/MESZ)", inline=True)
-        embed.add_field(name="📍 Channel", value=channel.mention, inline=True)
+        embed.add_field(name="📍 Treffpunkt", value=f"{channel_type_label}: {channel.mention}", inline=True)
         embed.add_field(name="👤 Eingeladen von", value=interaction.user.mention, inline=True)
         if notes:
             embed.add_field(name="📝 Notizen", value=notes[:500], inline=False)
         embed.add_field(name="📋 Bewerbung", value=f"App-ID: #{self.app_id}\nPosition: {app.get('position', '?')}", inline=False)
         embed.set_footer(text=f"Interview-ID: {interview_id}")
-        try:
-            await channel.send(content=f"<@{app.get('user_id')}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
-        except (discord.Forbidden, discord.HTTPException) as e:
-            await interaction.response.send_message(f"❌ Konnte Interview-Embed nicht senden: `{e}`", ephemeral=True)
-            return
-        # Bewerber per DM benachrichtigen
+        if is_text:
+            try:
+                await channel.send(content=f"<@{app.get('user_id')}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await interaction.response.send_message(f"❌ Konnte Interview-Embed nicht im Channel senden: `{e}`", ephemeral=True)
+                return
+        else:
+            # Bei Voice-Channel: im aktuellen Channel posten
+            try:
+                await interaction.channel.send(content=f"<@{app.get('user_id')}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        # Bewerber per DM benachrichtigen — mit klickbarem Channel-Link
         try:
             user = await self.cog.bot.fetch_user(app.get("user_id"))
             if user:
@@ -14246,14 +14368,29 @@ class TeamInterviewModal(discord.ui.Modal):
                     timestamp=_now(),
                 )
                 dm_embed.add_field(name="📅 Termin", value=_fmt_berlin_full(scheduled_dt) + " (MEZ/MESZ)", inline=True)
-                dm_embed.add_field(name="📍 Wo", value=f"{interaction.guild.name} → {channel.name}", inline=True)
+                # Channel als klickbaren Link anzeigen
+                # discord mention (<#ID>) ist in DMs klickbar und führt zum Channel
+                dm_embed.add_field(
+                    name="📍 Treffpunkt",
+                    value=f"{channel_type_label}: {channel.mention}\n👉 Klicke darauf um dorthin zu kommen!",
+                    inline=True,
+                )
+                if is_voice:
+                    dm_embed.add_field(
+                        name="💡 Hinweis",
+                        value="Dies ist ein Sprachkanal. Bitte sei zur vereinbarten Zeit im Voice-Channel!",
+                        inline=False,
+                    )
                 if notes:
                     dm_embed.add_field(name="📝 Notizen", value=notes[:500], inline=False)
                 dm_embed.set_footer(text=f"Interview-ID: {interview_id} • Bitte sei pünktlich!")
                 await user.send(embed=dm_embed)
         except (discord.Forbidden, discord.HTTPException):
             pass
-        await interaction.response.send_message(f"✅ Interview #{interview_id} geplant: {channel.mention} am {_fmt_berlin_full(scheduled_dt)} (MEZ/MESZ)\nBewerber wurde per DM benachrichtigt.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Interview #{interview_id} geplant: {channel_type_label} {channel.mention} am {_fmt_berlin_full(scheduled_dt)} (MEZ/MESZ)\nBewerber wurde per DM benachrichtigt.",
+            ephemeral=True,
+        )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         try:
