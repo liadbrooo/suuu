@@ -238,6 +238,40 @@ class SupportCog(commands.Cog):
             
             # DUTY GRANT ROLE SETTINGS
             "support_duty_grant_role": None,  # Rolle die berechtigt ist anderen die Support-Duty-Rolle zu geben
+
+            # ============================================
+            # CROSS-SERVER SYNC (BanSync / ModSync)
+            # ============================================
+            "sync_enabled": False,                # Master-Schalter
+            "sync_master_guild_id": None,         # Wenn gesetzt: nur dieser Server ist Master (bei master_to_all)
+            "sync_direction": "master_to_all",    # "master_to_all" | "bidirectional"
+            "sync_bans": True,
+            "sync_unbans": True,
+            "sync_timeouts": True,
+            "sync_kicks": True,
+            "sync_warns": True,
+            "sync_audit_log": False,              # Audit-Logs auswerten für manuelle Aktionen
+            "sync_log_channel": None,             # Log-Channel für Sync-Events
+            "sync_excluded_guilds": [],           # Liste von Guild-IDs die nicht synchronisiert werden
+            "sync_role_map": {},                  # Auto-Role-Sync: {source_role_id: [{guild_id, role_id}]}
+            "sync_role_sync_enabled": False,
+            # Interne Tracking-Daten (runtime, nicht von User gesetzt):
+            "sync_recent_actions": {},            # {action_key: ts} — verhindert Rekursion beim Sync
+
+            # ============================================
+            # ANTI-NUKE
+            # ============================================
+            "antinuke_enabled": False,
+            "antinuke_ban_threshold": 10,         # Maximale Banns im Zeitfenster
+            "antinuke_kick_threshold": 10,
+            "antinuke_channel_delete_threshold": 5,
+            "antinuke_role_delete_threshold": 5,
+            "antinuke_window_seconds": 60,        # Zeitfenster in Sekunden
+            "antinuke_action": "strip",           # "strip" (Mod-Rechte entfernen) | "notify" (nur loggen)
+            "antinuke_log_channel": None,
+            "antinuke_whitelist_roles": [],       # Rollen-IDs die immun sind
+            "antinuke_whitelist_users": [],       # User-IDs die immun sind
+            "antinuke_tracker": {},               # Runtime: {user_id: {action: [ts, ts, ...]}}
         }
 
         # Speichert On-Duty Status pro User (für beide Systeme)
@@ -5697,6 +5731,1214 @@ class SupportCog(commands.Cog):
 
     # ENDE DER BEFEHLE - Alle weiteren Befehle (serverinfo, roleinfo) wurden entfernt da sie im offiziellen 'info' Cog enthalten sind
 
+    # ============================================
+    # CROSS-SERVER SYNC (BanSync / ModSync)
+    # ============================================
+
+    async def _sync_get_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Log-Channel für Sync-Events."""
+        cid = await self.config.guild(guild).sync_log_channel()
+        if cid:
+            ch = guild.get_channel(cid)
+            if ch and isinstance(ch, discord.TextChannel):
+                return ch
+        return None
+
+    async def _sync_is_excluded(self, guild: discord.Guild) -> bool:
+        """Prüft ob eine Guild von der Synchronisation ausgeschlossen ist."""
+        excluded = await self.config.guild(guild).sync_excluded_guilds() or []
+        return guild.id in excluded
+
+    async def _sync_should_propagate_from(self, guild: discord.Guild) -> bool:
+        """Darf diese Guild überhaupt Aktionen an andere senden?"""
+        if not await self.config.guild(guild).sync_enabled():
+            return False
+        if await self._sync_is_excluded(guild):
+            return False
+        direction = await self.config.guild(guild).sync_direction()
+        if direction == "bidirectional":
+            return True
+        # master_to_all: nur die Master-Guild darf propagieren
+        master_id = await self.config.guild(guild).sync_master_guild_id()
+        if master_id is None:
+            # Keine Master gesetzt → diese Guild ist implizit Master
+            return True
+        return guild.id == master_id
+
+    async def _sync_should_accept_for(self, guild: discord.Guild) -> bool:
+        """Darf diese Guild Aktionen empfangen?"""
+        if not await self.config.guild(guild).sync_enabled():
+            return False
+        if await self._sync_is_excluded(guild):
+            return False
+        return True
+
+    def _sync_action_key(self, action: str, user_id: int, source_guild_id: int) -> str:
+        """Builds a deduplication key for sync actions."""
+        return f"{action}:{user_id}:{source_guild_id}"
+
+    async def _sync_mark_recent(self, guild: discord.Guild, key: str, ttl: int = 30):
+        """Mark an action as recently-synced to prevent recursion."""
+        recent = await self.config.guild(guild).sync_recent_actions() or {}
+        recent[key] = _now_ts()
+        # Cleanup old entries (>ttl seconds)
+        cutoff = _now_ts() - ttl
+        recent = {k: v for k, v in recent.items() if v > cutoff}
+        await self.config.guild(guild).sync_recent_actions.set(recent)
+
+    async def _sync_was_recent(self, guild: discord.Guild, key: str, ttl: int = 30) -> bool:
+        """Check if an action was recently synced (prevents recursion)."""
+        recent = await self.config.guild(guild).sync_recent_actions() or {}
+        ts = recent.get(key)
+        if ts is None:
+            return False
+        if _now_ts() - ts > ttl:
+            return False
+        return True
+
+    async def _sync_target_guilds(self, source_guild: discord.Guild) -> list[discord.Guild]:
+        """Liste aller Guilds, auf die synchronisiert werden soll."""
+        targets = []
+        for g in self.bot.guilds:
+            if g.id == source_guild.id:
+                continue
+            if not await self._sync_should_accept_for(g):
+                continue
+            targets.append(g)
+        return targets
+
+    async def _sync_log(self, source_guild: discord.Guild, message: str, *, embed: Optional[discord.Embed] = None):
+        """Schreibt einen Sync-Log-Eintrag in den Log-Channel der SOURCE-Guild."""
+        log_ch = await self._sync_get_log_channel(source_guild)
+        if not log_ch:
+            return
+        try:
+            if embed is not None:
+                await log_ch.send(content=message, embed=embed)
+            else:
+                await log_ch.send(message)
+        except discord.HTTPException:
+            pass
+
+    async def _sync_propagate_ban(self, source_guild: discord.Guild, user: discord.abc.User, reason: str):
+        """Propagiert einen Ban auf alle Ziel-Guilds."""
+        if not await self._sync_should_propagate_from(source_guild):
+            return
+        if not await self.config.guild(source_guild).sync_bans():
+            return
+        targets = await self._sync_target_guilds(source_guild)
+        success, failed = [], []
+        for g in targets:
+            key = self._sync_action_key("ban", user.id, source_guild.id)
+            await self._sync_mark_recent(g, key)
+            try:
+                # Prüfen ob schon gebannt
+                try:
+                    ban_entry = await g.fetch_ban(user)
+                    if ban_entry:
+                        success.append(g.name)
+                        continue
+                except discord.NotFound:
+                    pass  # nicht gebannt → weiter
+                # discord.py 2.x (Red 3.5+) verwendet delete_message_seconds,
+                # 1.x verwendete delete_message_days. Wir versuchen beides mit Fallback.
+                try:
+                    await g.ban(user, reason=f"[BanSync von {source_guild.name}] {reason}", delete_message_seconds=86400)
+                except TypeError:
+                    # Alte discord.py Version ohne delete_message_seconds
+                    await g.ban(user, reason=f"[BanSync von {source_guild.name}] {reason}")
+                success.append(g.name)
+            except discord.Forbidden:
+                failed.append((g.name, "Fehlende Rechte"))
+            except discord.HTTPException as e:
+                failed.append((g.name, str(e)))
+        # Log
+        embed = discord.Embed(
+            title="🔄 BanSync",
+            description=f"**{user}** (`{user.id}`) wurde auf `{source_guild.name}` gebannt.",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Grund", value=reason[:500] or "Kein Grund angegeben", inline=False)
+        embed.add_field(name=f"✅ Synchronisiert ({len(success)})", value=", ".join(success) or "Keine", inline=False)
+        if failed:
+            embed.add_field(
+                name=f"❌ Fehlgeschlagen ({len(failed)})",
+                value="\n".join(f"`{n}`: {r}" for n, r in failed[:10]),
+                inline=False,
+            )
+        await self._sync_log(source_guild, f"🔄 Ban für {user} synchronisiert", embed=embed)
+
+    async def _sync_propagate_unban(self, source_guild: discord.Guild, user: discord.abc.User):
+        """Propagiert einen Unban auf alle Ziel-Guilds."""
+        if not await self._sync_should_propagate_from(source_guild):
+            return
+        if not await self.config.guild(source_guild).sync_unbans():
+            return
+        targets = await self._sync_target_guilds(source_guild)
+        success, failed = [], []
+        for g in targets:
+            key = self._sync_action_key("unban", user.id, source_guild.id)
+            await self._sync_mark_recent(g, key)
+            try:
+                await g.unban(user, reason=f"[BanSync von {source_guild.name}] Entbannung")
+                success.append(g.name)
+            except discord.NotFound:
+                # war nicht gebannt → OK, kein Fehler
+                success.append(g.name)
+            except discord.Forbidden:
+                failed.append((g.name, "Fehlende Rechte"))
+            except discord.HTTPException as e:
+                failed.append((g.name, str(e)))
+        embed = discord.Embed(
+            title="🔄 UnbanSync",
+            description=f"**{user}** (`{user.id}`) wurde auf `{source_guild.name}` entbannt.",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        embed.add_field(name=f"✅ Synchronisiert ({len(success)})", value=", ".join(success) or "Keine", inline=False)
+        if failed:
+            embed.add_field(
+                name=f"❌ Fehlgeschlagen ({len(failed)})",
+                value="\n".join(f"`{n}`: {r}" for n, r in failed[:10]),
+                inline=False,
+            )
+        await self._sync_log(source_guild, f"🔄 Unban für {user} synchronisiert", embed=embed)
+
+    async def _sync_propagate_timeout(
+        self, source_guild: discord.Guild, member: discord.Member,
+        until: Optional[datetime], reason: str,
+    ):
+        """Propagiert einen Timeout auf alle Ziel-Guilds."""
+        if not await self._sync_should_propagate_from(source_guild):
+            return
+        if not await self.config.guild(source_guild).sync_timeouts():
+            return
+        targets = await self._sync_target_guilds(source_guild)
+        success, failed = [], []
+        for g in targets:
+            key = self._sync_action_key("timeout", member.id, source_guild.id)
+            await self._sync_mark_recent(g, key)
+            try:
+                target_member = g.get_member(member.id)
+                if target_member is None:
+                    # User ist auf dieser Guild nicht vorhanden → skip
+                    continue
+                await target_member.timeout(until, reason=f"[BanSync von {source_guild.name}] {reason}")
+                success.append(g.name)
+            except discord.Forbidden:
+                failed.append((g.name, "Fehlende Rechte"))
+            except discord.HTTPException as e:
+                failed.append((g.name, str(e)))
+        embed = discord.Embed(
+            title="🔄 TimeoutSync",
+            description=f"**{member}** (`{member.id}`) hat auf `{source_guild.name}` einen Timeout erhalten.",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Grund", value=reason[:500] or "Kein Grund", inline=False)
+        embed.add_field(name="Bis", value=until.strftime("%d.%m.%Y %H:%M UTC") if until else "Aufgehoben", inline=True)
+        embed.add_field(name=f"✅ Synchronisiert ({len(success)})", value=", ".join(success) or "Keine", inline=False)
+        if failed:
+            embed.add_field(
+                name=f"❌ Fehlgeschlagen ({len(failed)})",
+                value="\n".join(f"`{n}`: {r}" for n, r in failed[:10]),
+                inline=False,
+            )
+        await self._sync_log(source_guild, f"🔄 Timeout für {member} synchronisiert", embed=embed)
+
+    async def _sync_propagate_kick(self, source_guild: discord.Guild, member: discord.Member, reason: str):
+        """Propagiert einen Kick auf alle Ziel-Guilds."""
+        if not await self._sync_should_propagate_from(source_guild):
+            return
+        if not await self.config.guild(source_guild).sync_kicks():
+            return
+        targets = await self._sync_target_guilds(source_guild)
+        success, failed = [], []
+        for g in targets:
+            key = self._sync_action_key("kick", member.id, source_guild.id)
+            await self._sync_mark_recent(g, key)
+            try:
+                target_member = g.get_member(member.id)
+                if target_member is None:
+                    continue
+                await target_member.kick(reason=f"[BanSync von {source_guild.name}] {reason}")
+                success.append(g.name)
+            except discord.Forbidden:
+                failed.append((g.name, "Fehlende Rechte"))
+            except discord.HTTPException as e:
+                failed.append((g.name, str(e)))
+        embed = discord.Embed(
+            title="🔄 KickSync",
+            description=f"**{member}** (`{member.id}`) wurde auf `{source_guild.name}` gekickt.",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Grund", value=reason[:500] or "Kein Grund", inline=False)
+        embed.add_field(name=f"✅ Synchronisiert ({len(success)})", value=", ".join(success) or "Keine", inline=False)
+        if failed:
+            embed.add_field(
+                name=f"❌ Fehlgeschlagen ({len(failed)})",
+                value="\n".join(f"`{n}`: {r}" for n, r in failed[:10]),
+                inline=False,
+            )
+        await self._sync_log(source_guild, f"🔄 Kick für {member} synchronisiert", embed=embed)
+
+    async def _sync_propagate_warn(self, source_guild: discord.Guild, user_id: int, user_name: str, reason: str):
+        """Propagiert eine Warnung als Log-Eintrag auf alle Ziel-Guilds (keine echte Mod-Aktion,
+        nur Log-Eintrag weil Warnungen lokal im Cog gespeichert wären)."""
+        if not await self._sync_should_propagate_from(source_guild):
+            return
+        if not await self.config.guild(source_guild).sync_warns():
+            return
+        targets = await self._sync_target_guilds(source_guild)
+        for g in targets:
+            log_ch = await self._sync_get_log_channel(g)
+            if not log_ch:
+                continue
+            try:
+                embed = discord.Embed(
+                    title="⚠️ Warnung synchronisiert",
+                    description=f"**{user_name}** (`{user_id}`) wurde auf `{source_guild.name}` verwarnt.",
+                    color=discord.Color.yellow(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="Grund", value=reason[:500] or "Kein Grund", inline=False)
+                await log_ch.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+    # --- LISTENERS ---
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild: discord.Guild, user: discord.User):
+        """Wird gefeuert wenn ein User gebannt wird — synchronisiert an andere Guilds."""
+        # Anti-Nuke Tracking (immer, wenn enabled)
+        await self._antinuke_track(guild, "ban")
+        # Sync
+        if not await self._sync_should_propagate_from(guild):
+            return
+        # Vermeide Rekursion: wenn die Aktion vor kurzem durch Sync getriggert wurde, skip
+        # Der propagate-Aufruf markiert den Key auf der ZIEL-Guild. Auf der QUELL-Guild gibt
+        # es keinen Key (weil die Original-Aktion vom User kam, nicht vom Sync). Hier prüfen
+        # wir trotzdem: falls diese Guild selbst vor kurzem Ziel eines Sync-Banns war, skip.
+        # Das ist wichtig für bidirektionale Sync-Setups.
+        key = self._sync_action_key("ban", user.id, guild.id)
+        if await self._sync_was_recent(guild, key):
+            return
+        # Reason aus Audit Log holen falls aktiviert
+        reason = "Kein Grund verfügbar"
+        if await self.config.guild(guild).sync_audit_log():
+            try:
+                async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
+                    if entry.target and entry.target.id == user.id:
+                        reason = entry.reason or "Kein Grund angegeben"
+                        break
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        await self._sync_propagate_ban(guild, user, reason)
+
+    @commands.Cog.listener()
+    async def on_member_unban(self, guild: discord.Guild, user: discord.User):
+        """Wird gefeuert wenn ein User entbannt wird — synchronisiert an andere Guilds."""
+        # Anti-Nuke: unban nicht limitiert, nur Sync
+        if not await self._sync_should_propagate_from(guild):
+            return
+        # Rekursion verhindern (bidirektionaler Modus)
+        key = self._sync_action_key("unban", user.id, guild.id)
+        if await self._sync_was_recent(guild, key):
+            return
+        await self._sync_propagate_unban(guild, user)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        """Erkennt Timeout-Änderungen und Rollen-Änderungen (für Auto-Role-Sync)."""
+        # Timeout-Erkennung
+        before_timeout = getattr(before, "timed_out_until", None)
+        after_timeout = getattr(after, "timed_out_until", None)
+        if before_timeout != after_timeout:
+            # Timeout wurde geändert
+            if after_timeout is not None and (after_timeout.replace(tzinfo=timezone.utc) if after_timeout.tzinfo is None else after_timeout) > _now():
+                # Neuer/verlängerter Timeout
+                if await self._sync_should_propagate_from(before.guild):
+                    if await self.config.guild(before.guild).sync_timeouts():
+                        reason = "Timeout (via Member Update)"
+                        # Audit Log für Reason
+                        if await self.config.guild(before.guild).sync_audit_log():
+                            try:
+                                async for entry in before.guild.audit_logs(limit=5, action=discord.AuditLogAction.member_update):
+                                    if entry.target and entry.target.id == after.id:
+                                        reason = entry.reason or reason
+                                        break
+                            except (discord.Forbidden, discord.HTTPException):
+                                pass
+                        await self._sync_propagate_timeout(before.guild, after, after_timeout, reason)
+            elif after_timeout is None or (after_timeout.replace(tzinfo=timezone.utc) if after_timeout.tzinfo is None else after_timeout) <= _now():
+                # Timeout aufgehoben
+                if await self._sync_should_propagate_from(before.guild):
+                    if await self.config.guild(before.guild).sync_timeouts():
+                        await self._sync_propagate_timeout(before.guild, after, None, "Timeout aufgehoben")
+
+        # Auto-Role-Sync
+        if not await self.config.guild(before.guild).sync_role_sync_enabled():
+            return
+        if not await self._sync_should_propagate_from(before.guild):
+            return
+        before_roles = set(r.id for r in before.roles)
+        after_roles = set(r.id for r in after.roles)
+        added = after_roles - before_roles
+        removed = before_roles - after_roles
+        role_map = await self.config.guild(before.guild).sync_role_map() or {}
+        for source_role_id in added:
+            if str(source_role_id) in role_map:
+                await self._sync_propagate_role_add(before.guild, after, source_role_id)
+        for source_role_id in removed:
+            if str(source_role_id) in role_map:
+                await self._sync_propagate_role_remove(before.guild, after, source_role_id)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """Erkennt Kicks (via Audit Log) und synchronisiert."""
+        await self._antinuke_track(member.guild, "kick")
+        if not await self._sync_should_propagate_from(member.guild):
+            return
+        if not await self.config.guild(member.guild).sync_kicks():
+            return
+        # Prüfe Audit Log ob es ein Kick war (kein Ban, kein Selbst-Leave)
+        if not await self.config.guild(member.guild).sync_audit_log():
+            return  # ohne Audit Log können wir Kicks nicht zuverlässig erkennen
+        try:
+            async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
+                if entry.target and entry.target.id == member.id:
+                    # Prüfen ob der Eintrag neu ist (letzte 30 Sekunden)
+                    if entry.created_at and (_now() - entry.created_at.replace(tzinfo=timezone.utc)).total_seconds() < 30:
+                        reason = entry.reason or "Kein Grund angegeben"
+                        await self._sync_propagate_kick(member.guild, member, reason)
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    @commands.Cog.listener()
+    async def on_audit_log_entry_create(self, entry: discord.AuditLogEntry):
+        """Optional: Zusätzliche Audit-Log-Auswertung für manuelle Aktionen.
+        Wird nur gefeuert wenn sync_audit_log aktiviert ist. Hauptzweck: Warnungs-Sync
+        (da Warnungen keinen eigenen Listener haben)."""
+        if not await self.config.guild(entry.guild).sync_audit_log():
+            return
+        # Warn-Sync via Audit Log ist nicht direkt möglich (Discord hat keinen "warn" AuditLogAction).
+        # Warnungen müssen über den [p]warn Befehl des Cogs laufen — falls dieser entfernt wurde,
+        # ist Warn-Sync nur über externe Tools möglich. Hier ist nur ein Stub.
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        """Anti-Nuke: Channel-Löschungen tracken."""
+        await self._antinuke_track(channel.guild, "channel_delete")
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role: discord.Role):
+        """Anti-Nuke: Rollen-Löschungen tracken."""
+        await self._antinuke_track(role.guild, "role_delete")
+
+    # --- AUTO-ROLE-SYNC HELPER ---
+
+    async def _sync_propagate_role_add(self, source_guild: discord.Guild, member: discord.Member, source_role_id: int):
+        """Propagiert eine Rollen-Vergabe auf andere Guilds."""
+        role_map = await self.config.guild(source_guild).sync_role_map() or {}
+        targets = role_map.get(str(source_role_id), [])
+        success, failed = [], []
+        for entry in targets:
+            try:
+                target_guild_id = entry.get("guild_id")
+                target_role_id = entry.get("role_id")
+                if not target_guild_id or not target_role_id:
+                    continue
+                g = self.bot.get_guild(target_guild_id)
+                if g is None:
+                    continue
+                target_member = g.get_member(member.id)
+                if target_member is None:
+                    continue
+                target_role = g.get_role(target_role_id)
+                if target_role is None:
+                    continue
+                if target_role not in target_member.roles:
+                    await target_member.add_roles(target_role, reason=f"[RoleSync von {source_guild.name}]")
+                success.append(g.name)
+            except discord.Forbidden:
+                failed.append((entry.get("guild_id"), "Fehlende Rechte"))
+            except discord.HTTPException as e:
+                failed.append((entry.get("guild_id"), str(e)))
+        if success or failed:
+            embed = discord.Embed(
+                title="🔄 RoleSync (hinzugefügt)",
+                description=f"**{member}** erhielt Rolle `{source_role_id}` auf `{source_guild.name}`.",
+                color=discord.Color.green(),
+                timestamp=_now(),
+            )
+            embed.add_field(name=f"✅ Synchronisiert ({len(success)})", value=", ".join(success) or "Keine", inline=False)
+            if failed:
+                embed.add_field(
+                    name=f"❌ Fehlgeschlagen ({len(failed)})",
+                    value="\n".join(f"`{n}`: {r}" for n, r in failed[:10]),
+                    inline=False,
+                )
+            await self._sync_log(source_guild, f"🔄 RoleSync für {member}", embed=embed)
+
+    async def _sync_propagate_role_remove(self, source_guild: discord.Guild, member: discord.Member, source_role_id: int):
+        """Propagiert eine Rollen-Entfernung auf andere Guilds."""
+        role_map = await self.config.guild(source_guild).sync_role_map() or {}
+        targets = role_map.get(str(source_role_id), [])
+        success, failed = [], []
+        for entry in targets:
+            try:
+                target_guild_id = entry.get("guild_id")
+                target_role_id = entry.get("role_id")
+                if not target_guild_id or not target_role_id:
+                    continue
+                g = self.bot.get_guild(target_guild_id)
+                if g is None:
+                    continue
+                target_member = g.get_member(member.id)
+                if target_member is None:
+                    continue
+                target_role = g.get_role(target_role_id)
+                if target_role is None:
+                    continue
+                if target_role in target_member.roles:
+                    await target_member.remove_roles(target_role, reason=f"[RoleSync von {source_guild.name}]")
+                success.append(g.name)
+            except discord.Forbidden:
+                failed.append((entry.get("guild_id"), "Fehlende Rechte"))
+            except discord.HTTPException as e:
+                failed.append((entry.get("guild_id"), str(e)))
+        if success or failed:
+            embed = discord.Embed(
+                title="🔄 RoleSync (entfernt)",
+                description=f"**{member}** verlor Rolle `{source_role_id}` auf `{source_guild.name}`.",
+                color=discord.Color.red(),
+                timestamp=_now(),
+            )
+            embed.add_field(name=f"✅ Synchronisiert ({len(success)})", value=", ".join(success) or "Keine", inline=False)
+            if failed:
+                embed.add_field(
+                    name=f"❌ Fehlgeschlagen ({len(failed)})",
+                    value="\n".join(f"`{n}`: {r}" for n, r in failed[:10]),
+                    inline=False,
+                )
+            await self._sync_log(source_guild, f"🔄 RoleSync für {member}", embed=embed)
+
+    # ============================================
+    # ANTI-NUKE LOGIK
+    # ============================================
+
+    async def _antinuke_track(self, guild: discord.Guild, action: str):
+        """Trackt eine Aktion für Anti-Nuke. Wenn Schwellwert überschritten → Aktion."""
+        if not await self.config.guild(guild).antinuke_enabled():
+            return
+        # Versuche den Moderator via Audit Log zu identifizieren
+        mod_id = None
+        audit_action_map = {
+            "ban": discord.AuditLogAction.ban,
+            "kick": discord.AuditLogAction.kick,
+            "channel_delete": discord.AuditLogAction.channel_delete,
+            "role_delete": discord.AuditLogAction.role_delete,
+        }
+        audit_action = audit_action_map.get(action)
+        if audit_action is None:
+            return  # unban z.B. wird nur geloggt, nicht limitiert
+        try:
+            async for entry in guild.audit_logs(limit=1, action=audit_action):
+                # Prüfen ob der Eintrag neu ist (letzte 5 Sekunden, sonst ist es alte Aktion)
+                if entry.created_at:
+                    entry_dt = entry.created_at.replace(tzinfo=timezone.utc) if entry.created_at.tzinfo is None else entry.created_at
+                    if (_now() - entry_dt).total_seconds() > 5:
+                        return
+                mod_id = entry.user_id if entry.user else None
+                break
+        except (discord.Forbidden, discord.HTTPException):
+            # Keine Audit-Log-Rechte → kein Tracking möglich
+            return
+        if mod_id is None or mod_id == self.bot.user.id:
+            # Selbst-Action des Bots → nicht tracken
+            return
+        # Whitelist prüfen
+        wl_users = await self.config.guild(guild).antinuke_whitelist_users() or []
+        if mod_id in wl_users:
+            return
+        # Whitelist-Rollen prüfen
+        wl_roles = await self.config.guild(guild).antinuke_whitelist_roles() or []
+        mod_member = guild.get_member(mod_id)
+        if mod_member and wl_roles:
+            for r in mod_member.roles:
+                if r.id in wl_roles:
+                    return
+        # Tracker aktualisieren
+        tracker = await self.config.guild(guild).antinuke_tracker() or {}
+        user_actions = tracker.get(str(mod_id), {})
+        now_ts = _now_ts()
+        window = await self.config.guild(guild).antinuke_window_seconds() or 60
+        cutoff = now_ts - window
+        # Cleanup alte Einträge
+        actions = [ts for ts in user_actions.get(action, []) if ts > cutoff]
+        actions.append(now_ts)
+        user_actions[action] = actions
+        tracker[str(mod_id)] = user_actions
+        await self.config.guild(guild).antinuke_tracker.set(tracker)
+        # Schwellwert prüfen
+        threshold_key = f"antinuke_{action}_threshold"
+        threshold = await self.config.guild(guild).get_attr(threshold_key)()
+        if threshold and len(actions) > threshold:
+            await self._antinuke_trigger(guild, mod_id, action, len(actions), threshold)
+
+    async def _antinuke_trigger(self, guild: discord.Guild, mod_id: int, action: str, count: int, threshold: int):
+        """Wird ausgelöst wenn ein Schwellwert überschritten wurde."""
+        action_label = {
+            "ban": "Banns",
+            "kick": "Kicks",
+            "channel_delete": "Channel-Löschungen",
+            "role_delete": "Rollen-Löschungen",
+        }.get(action, action)
+        # Action ausführen
+        antinuke_action = await self.config.guild(guild).antinuke_action()
+        log_channel_id = await self.config.guild(guild).antinuke_log_channel()
+        log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
+        target_member = guild.get_member(mod_id)
+        target_name = target_member.display_name if target_member else f"<@{mod_id}>"
+
+        stripped_roles = []
+        if antinuke_action == "strip" and target_member:
+            # Entferne alle Rollen mit gefährlichen Rechten
+            try:
+                dangerous_perms = (
+                    discord.Permissions(administrator=True)
+                    | discord.Permissions(ban_members=True)
+                    | discord.Permissions(kick_members=True)
+                    | discord.Permissions(manage_channels=True)
+                    | discord.Permissions(manage_roles=True)
+                    | discord.Permissions(manage_guild=True)
+                    | discord.Permissions(moderate_members=True)
+                )
+                roles_to_remove = []
+                for r in target_member.roles:
+                    if r.permissions >= dangerous_perms or any(getattr(r.permissions, p, False) for p in ["administrator", "ban_members", "kick_members", "manage_channels", "manage_roles", "manage_guild", "moderate_members"]):
+                        if r.position < guild.me.top_role.position and not r.managed:
+                            roles_to_remove.append(r)
+                if roles_to_remove:
+                    try:
+                        await target_member.remove_roles(*roles_to_remove, reason=f"[Anti-Nuke] {action_label}-Schwellwert überschritten")
+                        stripped_roles = [r.name for r in roles_to_remove]
+                    except discord.Forbidden:
+                        antinuke_action = "notify (Strip fehlgeschlagen: Rechte fehlen)"
+                    except discord.HTTPException:
+                        antinuke_action = "notify (Strip fehlgeschlagen: HTTP-Fehler)"
+            except Exception:
+                log.exception("Anti-Nuke Strip fehlgeschlagen")
+
+        # Log-Eintrag
+        embed = discord.Embed(
+            title="🚨 ANTI-NUKE ALARM",
+            description=(
+                f"**{target_name}** (`{mod_id}`) hat den Schwellwert für **{action_label}** überschritten!\n\n"
+                f"**Aktionen:** {count} in letzter Zeit\n"
+                f"**Schwellwert:** {threshold}\n"
+                f"**Maßnahme:** {antinuke_action}"
+            ),
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        if stripped_roles:
+            embed.add_field(name="🧹 Entfernte Rollen", value=", ".join(stripped_roles[:10]), inline=False)
+        if log_channel:
+            try:
+                await log_channel.send(content="@here ANTI-NUKE ALARM", embed=embed)
+            except discord.HTTPException:
+                pass
+        # Auch ins Sync-Log
+        await self._sync_log(guild, f"🚨 Anti-Nuke: {target_name} hat {action_label}-Limit überschritten", embed=embed)
+
+        # Tracker zurücksetzen für diesen User
+        tracker = await self.config.guild(guild).antinuke_tracker() or {}
+        if str(mod_id) in tracker:
+            tracker[str(mod_id)].pop(action, None)
+            if not tracker[str(mod_id)]:
+                del tracker[str(mod_id)]
+            await self.config.guild(guild).antinuke_tracker.set(tracker)
+
+    # ============================================
+    # SYNCSET BEFEHLE
+    # ============================================
+
+    @commands.group(name="syncset", aliases=["syncconfig", "modsyncset"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def syncset(self, ctx: commands.Context):
+        """Konfiguriert das Cross-Server Sync-System (BanSync/ModSync)."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @syncset.command(name="quickstart")
+    async def syncset_quickstart(self, ctx: commands.Context):
+        """Ein-Klick-Setup mit empfohlenen Defaults für diese Guild.
+
+        Aktiviert:
+        - Sync generell
+        - Diese Guild als Master (wenn noch keine gesetzt) ODER als Empfänger
+        - Ban/Unban/Timeout/Kick-Sync alle AN
+        - Audit-Log-Auswertung AN
+        - Log-Channel = aktueller Channel
+
+        Für EMPFÄNGER-Guilds stattdessen `[p]syncset slave <master_id>` verwenden.
+        """
+        g = self.config.guild(ctx.guild)
+        # 1. Sync aktivieren
+        await g.sync_enabled.set(True)
+        # 2. Master-Guild setzen wenn noch keine konfiguriert
+        master_id = await g.sync_master_guild_id()
+        if master_id is None:
+            await g.sync_master_guild_id.set(ctx.guild.id)
+            await g.sync_direction.set("master_to_all")
+            role_label = "Master (Hauptserver)"
+        elif master_id == ctx.guild.id:
+            await g.sync_direction.set("master_to_all")
+            role_label = "Master (Hauptserver)"
+        else:
+            # Diese Guild ist nicht Master → als bidirektionaler Empfänger setzen
+            await g.sync_direction.set("bidirectional")
+            role_label = f"Empfänger (Master: `{master_id}`)"
+        # 3. Alle Aktionen aktivieren
+        await g.sync_bans.set(True)
+        await g.sync_unbans.set(True)
+        await g.sync_timeouts.set(True)
+        await g.sync_kicks.set(True)
+        await g.sync_warns.set(True)
+        # 4. Audit-Log aktivieren (für manuelle Aktionen & Kick-Erkennung)
+        await g.sync_audit_log.set(True)
+        # 5. Log-Channel = aktueller Channel
+        if isinstance(ctx.channel, discord.TextChannel):
+            await g.sync_log_channel.set(ctx.channel.id)
+            log_ch_label = ctx.channel.mention
+        else:
+            log_ch_label = "❌ (kein Text-Channel)"
+        # Zusammenfassung
+        embed = discord.Embed(
+            title="✅ BanSync QuickStart fertig!",
+            description=(
+                f"Diese Guild ist konfiguriert als: **{role_label}**\n\n"
+                f"**Automatisch synchronisiert werden:**\n"
+                f"• 🚫 Banns\n"
+                f"• ✅ Entbannungen\n"
+                f"• ⏱️ Timeouts/Mutes\n"
+                f"• 👢 Kicks\n"
+                f"• ⚠️ Warnungen (nur Log)\n\n"
+                f"**Audit-Log-Auswertung:** ✅ (erkennt manuelle Aktionen)\n"
+                f"**Log-Channel:** {log_ch_label}\n\n"
+                f"**WICHTIG für {len(self.bot.guilds) - 1} andere Server:**\n"
+                f"Führe dort `[p]syncset slave {ctx.guild.id}` aus, damit sie als Empfänger fungieren."
+            ),
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        # Falls Master: Hinweis auf SyncNow
+        if role_label.startswith("Master"):
+            embed.add_field(
+                name="💡 Optional: Bestehende Banns übertragen",
+                value=f"Führe `[p]syncset syncnow` aus, um alle bereits existierenden Banns dieser Guild auf alle Empfänger zu übertragen (einmalig).",
+                inline=False,
+            )
+        embed.set_footer(text=f"BanSync QuickStart • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    @syncset.command(name="slave", aliases=["receiver", "client"])
+    async def syncset_slave(self, ctx: commands.Context, master_guild_id: int):
+        """Quick-Setup für eine Empfänger-Guild (Nimmt Aktionen vom Master entgegen).
+
+        Beispiel: `[p]syncset slave 123456789012345678`
+        """
+        # Prüfen ob Bot auf Master-Guild ist
+        master_guild = self.bot.get_guild(master_guild_id)
+        if master_guild is None:
+            await ctx.send(f"❌ Bot ist nicht auf Master-Guild `{master_guild_id}`.")
+            return
+        g = self.config.guild(ctx.guild)
+        await g.sync_enabled.set(True)
+        await g.sync_master_guild_id.set(master_guild_id)
+        await g.sync_direction.set("master_to_all")  # nur Master propagiert
+        await g.sync_bans.set(True)
+        await g.sync_unbans.set(True)
+        await g.sync_timeouts.set(True)
+        await g.sync_kicks.set(True)
+        await g.sync_warns.set(True)
+        await g.sync_audit_log.set(False)  # als Slave nicht nötig
+        # Log-Channel = aktueller Channel
+        log_ch_label = "❌ (kein Text-Channel)"
+        if isinstance(ctx.channel, discord.TextChannel):
+            await g.sync_log_channel.set(ctx.channel.id)
+            log_ch_label = ctx.channel.mention
+        embed = discord.Embed(
+            title="✅ Empfänger-Guild eingerichtet!",
+            description=(
+                f"Diese Guild (`{ctx.guild.name}`) ist jetzt **Empfänger** für Mod-Aktionen von:\n"
+                f"**{master_guild.name}** (`{master_guild_id}`)\n\n"
+                f"**Diese Guild wird automatisch empfangen:**\n"
+                f"• 🚫 Banns (vom Master gebannt → hier auch gebannt)\n"
+                f"• ✅ Entbannungen\n"
+                f"• ⏱️ Timeouts/Mutes\n"
+                f"• 👢 Kicks (sofern User hier ist)\n"
+                f"• ⚠️ Warnungen (nur Log-Eintrag hier)\n\n"
+                f"**Log-Channel:** {log_ch_label}\n\n"
+                f"💡 **Auf dem Master-Server** muss `[p]syncset quickstart` ausgeführt worden sein."
+            ),
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text=f"BanSync Slave • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    @syncset.command(name="setup")
+    async def syncset_setup(self, ctx: commands.Context):
+        """Interaktiver Einrichtungsassistent für BanSync (mit Buttons)."""
+        view = SyncSetupWizardView(self, ctx.guild)
+        embed = view.build_embed()
+        await ctx.send(embed=embed, view=view)
+
+    @syncset.command(name="show")
+    async def syncset_show(self, ctx: commands.Context):
+        """Zeigt die aktuelle Sync-Konfiguration."""
+        g = self.config.guild(ctx.guild)
+        embed = discord.Embed(title="🔄 Cross-Server Sync Konfiguration", color=discord.Color.blue(), timestamp=_now())
+        embed.add_field(name="Aktiviert", value="✅ Ja" if await g.sync_enabled() else "❌ Nein", inline=True)
+        embed.add_field(name="Richtung", value=await g.sync_direction(), inline=True)
+        master_id = await g.sync_master_guild_id()
+        embed.add_field(name="Master-Guild", value=f"`{master_id}`" if master_id else "Aktuelle Guild (implizit)", inline=True)
+        embed.add_field(name="Banns", value="✅" if await g.sync_bans() else "❌", inline=True)
+        embed.add_field(name="Unbanns", value="✅" if await g.sync_unbans() else "❌", inline=True)
+        embed.add_field(name="Timeouts", value="✅" if await g.sync_timeouts() else "❌", inline=True)
+        embed.add_field(name="Kicks", value="✅" if await g.sync_kicks() else "❌", inline=True)
+        embed.add_field(name="Warnungen", value="✅" if await g.sync_warns() else "❌", inline=True)
+        embed.add_field(name="Audit-Log-Auswertung", value="✅" if await g.sync_audit_log() else "❌", inline=True)
+        log_ch_id = await g.sync_log_channel()
+        log_ch = ctx.guild.get_channel(log_ch_id) if log_ch_id else None
+        embed.add_field(name="Log-Channel", value=log_ch.mention if log_ch else "❌ Nicht gesetzt", inline=True)
+        excluded = await g.sync_excluded_guilds() or []
+        embed.add_field(name="Ausgeschlossene Guilds", value=", ".join(f"`{x}`" for x in excluded) or "Keine", inline=False)
+        # Stats
+        embed.add_field(name="Bot-Guilds gesamt", value=str(len(self.bot.guilds)), inline=True)
+        embed.add_field(name="Mögliche Sync-Targets", value=str(len(self.bot.guilds) - 1), inline=True)
+        embed.set_footer(text=f"Sync Config • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    @syncset.command(name="toggle")
+    async def syncset_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert das Sync-System für diese Guild."""
+        current = await self.config.guild(ctx.guild).sync_enabled()
+        await self.config.guild(ctx.guild).sync_enabled.set(not current)
+        status = "✅ aktiviert" if not current else "❌ deaktiviert"
+        await ctx.send(f"🔄 Cross-Server Sync ist jetzt **{status}**.")
+
+        # Warnung: braucht auf allen Ziel-Guilds aktivierten Sync
+        if not current:
+            target_count = sum(1 for g in self.bot.guilds if g.id != ctx.guild.id)
+            await ctx.send(
+                f"ℹ️ Hinweis: Auf den {target_count} anderen Guilds muss Sync ebenfalls aktiviert sein "
+                f"(mindestens als Empfänger). Konfiguriere mit `[p]syncset toggle` auf jeder Guild separat."
+            )
+
+    @syncset.command(name="master")
+    async def syncset_master(self, ctx: commands.Context, guild_id: int = None):
+        """Setzt die Master-Guild-ID (für master_to_all Richtung).
+        Ohne Angabe wird die aktuelle Guild als Master gesetzt."""
+        if guild_id is None:
+            guild_id = ctx.guild.id
+        # Prüfen ob Bot auf dieser Guild ist
+        if self.bot.get_guild(guild_id) is None:
+            await ctx.send(f"❌ Bot ist nicht auf Guild `{guild_id}`.")
+            return
+        await self.config.guild(ctx.guild).sync_master_guild_id.set(guild_id)
+        await ctx.send(f"✅ Master-Guild gesetzt auf `{guild_id}`.")
+
+    @syncset.command(name="direction")
+    async def syncset_direction(self, ctx: commands.Context, direction: str):
+        """Setzt die Sync-Richtung. `master_to_all` oder `bidirectional`."""
+        direction = direction.lower()
+        if direction not in ("master_to_all", "bidirectional"):
+            await ctx.send("❌ Ungültige Richtung. Verwende `master_to_all` oder `bidirectional`.")
+            return
+        await self.config.guild(ctx.guild).sync_direction.set(direction)
+        await ctx.send(f"✅ Sync-Richtung gesetzt auf `{direction}`.")
+
+    @syncset.command(name="bans")
+    async def syncset_bans(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert Sync von Banns."""
+        await self.config.guild(ctx.guild).sync_bans.set(enabled)
+        await ctx.send(f"✅ Ban-Sync {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @syncset.command(name="unbans")
+    async def syncset_unbans(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert Sync von Entbannungen."""
+        await self.config.guild(ctx.guild).sync_unbans.set(enabled)
+        await ctx.send(f"✅ Unban-Sync {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @syncset.command(name="timeouts")
+    async def syncset_timeouts(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert Sync von Timeouts."""
+        await self.config.guild(ctx.guild).sync_timeouts.set(enabled)
+        await ctx.send(f"✅ Timeout-Sync {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @syncset.command(name="kicks")
+    async def syncset_kicks(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert Sync von Kicks."""
+        await self.config.guild(ctx.guild).sync_kicks.set(enabled)
+        await ctx.send(f"✅ Kick-Sync {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @syncset.command(name="warns")
+    async def syncset_warns(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert Sync von Warnungen."""
+        await self.config.guild(ctx.guild).sync_warns.set(enabled)
+        await ctx.send(f"✅ Warn-Sync {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @syncset.command(name="auditlog")
+    async def syncset_auditlog(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert die Audit-Log-Auswertung (für manuelle Aktionen & Kicks)."""
+        await self.config.guild(ctx.guild).sync_audit_log.set(enabled)
+        await ctx.send(
+            f"✅ Audit-Log-Auswertung {'aktiviert' if enabled else 'deaktiviert'}.\n"
+            f"⚠️ Erfordert `View Audit Log` Berechtigung auf der Guild."
+        )
+
+    @syncset.command(name="logchannel")
+    async def syncset_logchannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Log-Channel für Sync-Events. Ohne Angabe zurückgesetzt."""
+        if channel is None:
+            await self.config.guild(ctx.guild).sync_log_channel.set(None)
+            await ctx.send("✅ Sync-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).sync_log_channel.set(channel.id)
+        await ctx.send(f"✅ Sync-Log-Channel gesetzt auf {channel.mention}.")
+
+    @syncset.command(name="exclude")
+    async def syncset_exclude(self, ctx: commands.Context, action: str, guild_id: int):
+        """Schließt eine Guild von der Synchronisation aus.
+        `add` oder `remove` als Aktion."""
+        excluded = await self.config.guild(ctx.guild).sync_excluded_guilds() or []
+        if action.lower() == "add":
+            if guild_id not in excluded:
+                excluded.append(guild_id)
+            await self.config.guild(ctx.guild).sync_excluded_guilds.set(excluded)
+            await ctx.send(f"✅ Guild `{guild_id}` von Sync ausgeschlossen.")
+        elif action.lower() == "remove":
+            if guild_id in excluded:
+                excluded.remove(guild_id)
+            await self.config.guild(ctx.guild).sync_excluded_guilds.set(excluded)
+            await ctx.send(f"✅ Guild `{guild_id}` wieder für Sync freigegeben.")
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
+
+    @syncset.command(name="excludelist", aliases=["listexcluded"])
+    async def syncset_excludelist(self, ctx: commands.Context):
+        """Zeigt alle ausgeschlossenen Guilds."""
+        excluded = await self.config.guild(ctx.guild).sync_excluded_guilds() or []
+        if not excluded:
+            await ctx.send("ℹ️ Keine Guilds ausgeschlossen.")
+            return
+        lines = []
+        for gid in excluded:
+            g = self.bot.get_guild(gid)
+            name = g.name if g else "Unbekannt"
+            lines.append(f"• `{gid}` — {name}")
+        embed = discord.Embed(
+            title="🚫 Ausgeschlossene Guilds",
+            description="\n".join(lines),
+            color=discord.Color.orange(),
+        )
+        await ctx.send(embed=embed)
+
+    @syncset.command(name="syncnow")
+    async def syncset_syncnow(self, ctx: commands.Context):
+        """Synchronisiert ALLE bestehenden Banns der aktuellen Guild auf alle anderen ( einmalig)."""
+        if not await self._sync_should_propagate_from(ctx.guild):
+            await ctx.send("❌ Sync ist nicht aktiviert oder diese Guild darf nicht propagieren.")
+            return
+        if not await self.config.guild(ctx.guild).sync_bans():
+            await ctx.send("❌ Ban-Sync ist deaktiviert. Aktiviere mit `[p]syncset bans True`.")
+            return
+        await ctx.send("⏳ Synchronisiere bestehende Banns... das kann einen Moment dauern.")
+        try:
+            bans = await ctx.guild.bans(limit=None)
+        except discord.Forbidden:
+            await ctx.send("❌ Fehlende Rechte um Bans abzufragen.")
+            return
+        success_count = 0
+        fail_count = 0
+        for ban_entry in bans:
+            user = ban_entry.user
+            reason = ban_entry.reason or "Bestehender Ban (SyncNow)"
+            try:
+                # propagate_ban kümmert sich um alles
+                await self._sync_propagate_ban(ctx.guild, user, reason)
+                success_count += 1
+            except Exception:
+                fail_count += 1
+        await ctx.send(f"✅ SyncNow fertig: {success_count} Banns synchronisiert, {fail_count} Fehler.")
+
+    @syncset.command(name="test")
+    async def syncset_test(self, ctx: commands.Context):
+        """Testet welche Guilds als Sync-Targets verfügbar wären."""
+        targets = await self._sync_target_guilds(ctx.guild)
+        if not targets:
+            await ctx.send("ℹ️ Keine Sync-Targets verfügbar. Stelle sicher dass Sync auf anderen Guilds aktiviert ist.")
+            return
+        lines = []
+        for g in targets:
+            lines.append(f"• {g.name} (`{g.id}`) — {g.member_count} Mitglieder")
+        embed = discord.Embed(
+            title=f"🔄 Sync-Targets für {ctx.guild.name}",
+            description="\n".join(lines[:20]),
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+        if len(targets) > 20:
+            embed.set_footer(text=f"Zeige 20 von {len(targets)}")
+        await ctx.send(embed=embed)
+
+    # ============================================
+    # ROLE SYNC BEFEHLE
+    # ============================================
+
+    @commands.group(name="rolesyncset", aliases=["rsyncset"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def rolesyncset(self, ctx: commands.Context):
+        """Konfiguriert das Auto-Role-Sync System."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @rolesyncset.command(name="toggle")
+    async def rolesyncset_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert Auto-Role-Sync."""
+        current = await self.config.guild(ctx.guild).sync_role_sync_enabled()
+        await self.config.guild(ctx.guild).sync_role_sync_enabled.set(not current)
+        await ctx.send(f"🔄 Auto-Role-Sync ist jetzt **{'✅ aktiviert' if not current else '❌ deaktiviert'}**.")
+
+    @rolesyncset.command(name="add")
+    async def rolesyncset_add(self, ctx: commands.Context, source_role: discord.Role, target_guild_id: int, target_role_id: int):
+        """Fügt ein Rollen-Mapping hinzu.
+        Beispiel: `[p]rolesyncset add @Verified 1234567890 9876543210`"""
+        target_guild = self.bot.get_guild(target_guild_id)
+        if target_guild is None:
+            await ctx.send(f"❌ Bot ist nicht auf Ziel-Guild `{target_guild_id}`.")
+            return
+        target_role = target_guild.get_role(target_role_id)
+        if target_role is None:
+            await ctx.send(f"❌ Rolle `{target_role_id}` nicht auf Ziel-Guild `{target_guild.name}` gefunden.")
+            return
+        role_map = await self.config.guild(ctx.guild).sync_role_map() or {}
+        sid = str(source_role.id)
+        if sid not in role_map:
+            role_map[sid] = []
+        # Prüfen ob schon existiert
+        for entry in role_map[sid]:
+            if entry.get("guild_id") == target_guild_id and entry.get("role_id") == target_role_id:
+                await ctx.send("ℹ️ Dieses Mapping existiert bereits.")
+                return
+        role_map[sid].append({"guild_id": target_guild_id, "role_id": target_role_id})
+        await self.config.guild(ctx.guild).sync_role_map.set(role_map)
+        await ctx.send(
+            f"✅ Mapping hinzugefügt: {source_role.mention} (`{source_role.id}`) "
+            f"→ {target_role.name} auf {target_guild.name} (`{target_role_id}`)"
+        )
+
+    @rolesyncset.command(name="remove", aliases=["delete"])
+    async def rolesyncset_remove(self, ctx: commands.Context, source_role: discord.Role, target_guild_id: int, target_role_id: int):
+        """Entfernt ein Rollen-Mapping."""
+        role_map = await self.config.guild(ctx.guild).sync_role_map() or {}
+        sid = str(source_role.id)
+        if sid not in role_map:
+            await ctx.send("ℹ️ Keine Mappings für diese Rolle gefunden.")
+            return
+        before_count = len(role_map[sid])
+        role_map[sid] = [
+            e for e in role_map[sid]
+            if not (e.get("guild_id") == target_guild_id and e.get("role_id") == target_role_id)
+        ]
+        if not role_map[sid]:
+            del role_map[sid]
+        await self.config.guild(ctx.guild).sync_role_map.set(role_map)
+        await ctx.send(f"✅ Mapping entfernt. Vorher: {before_count}, Jetzt: {len(role_map.get(sid, []))}")
+
+    @rolesyncset.command(name="list")
+    async def rolesyncset_list(self, ctx: commands.Context):
+        """Zeigt alle Rollen-Mappings."""
+        role_map = await self.config.guild(ctx.guild).sync_role_map() or {}
+        if not role_map:
+            await ctx.send("ℹ️ Keine Rollen-Mappings konfiguriert.")
+            return
+        lines = []
+        for source_role_id, targets in role_map.items():
+            src_role = ctx.guild.get_role(int(source_role_id))
+            src_name = src_role.name if src_role else f"Unbekannt ({source_role_id})"
+            for t in targets:
+                g = self.bot.get_guild(t.get("guild_id"))
+                gname = g.name if g else f"Unbekannt ({t.get('guild_id')})"
+                r = g.get_role(t.get("role_id")) if g else None
+                rname = r.name if r else f"Unbekannt ({t.get('role_id')})"
+                lines.append(f"• `{src_name}` → `{rname}` auf `{gname}`")
+        embed = discord.Embed(
+            title="🔄 Rollen-Mappings",
+            description="\n".join(lines[:25]) or "Keine",
+            color=discord.Color.blue(),
+        )
+        if len(lines) > 25:
+            embed.set_footer(text=f"Zeige 25 von {len(lines)}")
+        await ctx.send(embed=embed)
+
+    # ============================================
+    # ANTI-NUKE BEFEHLE
+    # ============================================
+
+    @commands.group(name="antinukeset", aliases=["antinukeconfig", "nukeset"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def antinukeset(self, ctx: commands.Context):
+        """Konfiguriert das Anti-Nuke System."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @antinukeset.command(name="show")
+    async def antinukeset_show(self, ctx: commands.Context):
+        """Zeigt die Anti-Nuke Konfiguration."""
+        g = self.config.guild(ctx.guild)
+        embed = discord.Embed(title="🚨 Anti-Nuke Konfiguration", color=discord.Color.red(), timestamp=_now())
+        embed.add_field(name="Aktiviert", value="✅ Ja" if await g.antinuke_enabled() else "❌ Nein", inline=True)
+        embed.add_field(name="Aktion", value=await g.antinuke_action(), inline=True)
+        embed.add_field(name="Zeitfenster", value=f"{await g.antinuke_window_seconds()}s", inline=True)
+        embed.add_field(name="Ban-Limit", value=await g.antinuke_ban_threshold(), inline=True)
+        embed.add_field(name="Kick-Limit", value=await g.antinuke_kick_threshold(), inline=True)
+        embed.add_field(name="Channel-Del-Limit", value=await g.antinuke_channel_delete_threshold(), inline=True)
+        embed.add_field(name="Role-Del-Limit", value=await g.antinuke_role_delete_threshold(), inline=True)
+        log_ch_id = await g.antinuke_log_channel()
+        log_ch = ctx.guild.get_channel(log_ch_id) if log_ch_id else None
+        embed.add_field(name="Log-Channel", value=log_ch.mention if log_ch else "❌ Nicht gesetzt", inline=True)
+        wl_users = await g.antinuke_whitelist_users() or []
+        embed.add_field(name="Whitelist Users", value=", ".join(f"<@{u}>" for u in wl_users[:10]) or "Keine", inline=False)
+        wl_roles = await g.antinuke_whitelist_roles() or []
+        embed.add_field(name="Whitelist Rollen", value=", ".join(f"<@&{r}>" for r in wl_roles[:10]) or "Keine", inline=False)
+        embed.set_footer(text=f"Anti-Nuke Config • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    @antinukeset.command(name="toggle")
+    async def antinukeset_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert Anti-Nuke."""
+        current = await self.config.guild(ctx.guild).antinuke_enabled()
+        await self.config.guild(ctx.guild).antinuke_enabled.set(not current)
+        await ctx.send(f"🚨 Anti-Nuke ist jetzt **{'✅ aktiviert' if not current else '❌ deaktiviert'}**.")
+
+    @antinukeset.command(name="banthreshold")
+    async def antinukeset_banthreshold(self, ctx: commands.Context, count: int):
+        """Setzt das Limit für Banns im Zeitfenster."""
+        if count < 1:
+            await ctx.send("❌ Wert muss mindestens 1 sein.")
+            return
+        await self.config.guild(ctx.guild).antinuke_ban_threshold.set(count)
+        await ctx.send(f"✅ Ban-Limit gesetzt auf {count}.")
+
+    @antinukeset.command(name="kickthreshold")
+    async def antinukeset_kickthreshold(self, ctx: commands.Context, count: int):
+        """Setzt das Limit für Kicks im Zeitfenster."""
+        if count < 1:
+            await ctx.send("❌ Wert muss mindestens 1 sein.")
+            return
+        await self.config.guild(ctx.guild).antinuke_kick_threshold.set(count)
+        await ctx.send(f"✅ Kick-Limit gesetzt auf {count}.")
+
+    @antinukeset.command(name="channelthreshold", aliases=["channeldeletethreshold"])
+    async def antinukeset_channelthreshold(self, ctx: commands.Context, count: int):
+        """Setzt das Limit für Channel-Löschungen im Zeitfenster."""
+        if count < 1:
+            await ctx.send("❌ Wert muss mindestens 1 sein.")
+            return
+        await self.config.guild(ctx.guild).antinuke_channel_delete_threshold.set(count)
+        await ctx.send(f"✅ Channel-Delete-Limit gesetzt auf {count}.")
+
+    @antinukeset.command(name="rolethreshold", aliases=["roledeletethreshold"])
+    async def antinukeset_rolethreshold(self, ctx: commands.Context, count: int):
+        """Setzt das Limit für Rollen-Löschungen im Zeitfenster."""
+        if count < 1:
+            await ctx.send("❌ Wert muss mindestens 1 sein.")
+            return
+        await self.config.guild(ctx.guild).antinuke_role_delete_threshold.set(count)
+        await ctx.send(f"✅ Role-Delete-Limit gesetzt auf {count}.")
+
+    @antinukeset.command(name="window")
+    async def antinukeset_window(self, ctx: commands.Context, seconds: int):
+        """Setzt das Zeitfenster (in Sekunden) für Anti-Nuke."""
+        if seconds < 5:
+            await ctx.send("❌ Wert muss mindestens 5 Sekunden sein.")
+            return
+        await self.config.guild(ctx.guild).antinuke_window_seconds.set(seconds)
+        await ctx.send(f"✅ Zeitfenster gesetzt auf {seconds} Sekunden.")
+
+    @antinukeset.command(name="action")
+    async def antinukeset_action(self, ctx: commands.Context, action: str):
+        """Setzt die Aktion bei Überschreitung. `strip` oder `notify`."""
+        action = action.lower()
+        if action not in ("strip", "notify"):
+            await ctx.send("❌ Ungültige Aktion. Verwende `strip` (entfernt Mod-Rechte) oder `notify` (nur Loggen).")
+            return
+        await self.config.guild(ctx.guild).antinuke_action.set(action)
+        await ctx.send(f"✅ Anti-Nuke-Aktion gesetzt auf `{action}`.")
+
+    @antinukeset.command(name="logchannel")
+    async def antinukeset_logchannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Log-Channel für Anti-Nuke Alarme."""
+        if channel is None:
+            await self.config.guild(ctx.guild).antinuke_log_channel.set(None)
+            await ctx.send("✅ Anti-Nuke-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).antinuke_log_channel.set(channel.id)
+        await ctx.send(f"✅ Anti-Nuke-Log-Channel gesetzt auf {channel.mention}.")
+
+    @antinukeset.command(name="whitelistuser", aliases=["wluser"])
+    async def antinukeset_whitelistuser(self, ctx: commands.Context, action: str, user: discord.User):
+        """Fügt einen User zur Anti-Nuke Whitelist hinzu oder entfernt ihn.
+        `add` oder `remove` als Aktion."""
+        wl = await self.config.guild(ctx.guild).antinuke_whitelist_users() or []
+        if action.lower() == "add":
+            if user.id not in wl:
+                wl.append(user.id)
+            await self.config.guild(ctx.guild).antinuke_whitelist_users.set(wl)
+            await ctx.send(f"✅ {user.mention} zur Anti-Nuke Whitelist hinzugefügt.")
+        elif action.lower() == "remove":
+            if user.id in wl:
+                wl.remove(user.id)
+            await self.config.guild(ctx.guild).antinuke_whitelist_users.set(wl)
+            await ctx.send(f"✅ {user.mention} von Anti-Nuke Whitelist entfernt.")
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
+
+    @antinukeset.command(name="whitelistrole", aliases=["wlrole"])
+    async def antinukeset_whitelistrole(self, ctx: commands.Context, action: str, role: discord.Role):
+        """Fügt eine Rolle zur Anti-Nuke Whitelist hinzu oder entfernt sie.
+        `add` oder `remove` als Aktion."""
+        wl = await self.config.guild(ctx.guild).antinuke_whitelist_roles() or []
+        if action.lower() == "add":
+            if role.id not in wl:
+                wl.append(role.id)
+            await self.config.guild(ctx.guild).antinuke_whitelist_roles.set(wl)
+            await ctx.send(f"✅ Rolle {role.mention} zur Anti-Nuke Whitelist hinzugefügt.")
+        elif action.lower() == "remove":
+            if role.id in wl:
+                wl.remove(role.id)
+            await self.config.guild(ctx.guild).antinuke_whitelist_roles.set(wl)
+            await ctx.send(f"✅ Rolle {role.mention} von Anti-Nuke Whitelist entfernt.")
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
+
+    @antinukeset.command(name="reset")
+    async def antinukeset_reset(self, ctx: commands.Context):
+        """Setzt den Anti-Nuke Tracker zurück (löscht alle getrackten Aktionen)."""
+        await self.config.guild(ctx.guild).antinuke_tracker.set({})
+        await ctx.send("✅ Anti-Nuke Tracker zurückgesetzt.")
+
 
 class DutyButtonView(discord.ui.View):
     """Button-View für Duty An-/Abmeldung mit erweiterten Funktionen"""
@@ -6935,6 +8177,210 @@ class TicketCloseView(discord.ui.View):
             await interaction.response.send_message("❌ Dieser Button kann nur in einem Channel verwendet werden.", ephemeral=True)
             return
         await self.cog._close_ticket(interaction, interaction.channel)
+
+
+class SyncSetupWizardView(discord.ui.View):
+    """Interaktiver Setup-Wizard für BanSync mit Buttons."""
+
+    def __init__(self, cog, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.message: Optional[discord.Message] = None
+
+    def build_embed(self) -> discord.Embed:
+        """Baut das Embed mit der aktuellen Konfiguration."""
+        # Config live auslesen ist async, deshalb verwenden wir Caches die beim Klick aktualisiert werden.
+        # Da wir hier synchron sind, bauen wir nur ein generisches Embed.
+        embed = discord.Embed(
+            title="🔄 BanSync Setup Wizard",
+            description=(
+                "Willkommen beim Einrichtungsassistenten!\n\n"
+                "**So funktioniert es:**\n"
+                "1️⃣ Auf dem **Hauptserver**: Klicke `🚀 QuickStart Master`\n"
+                "2️⃣ Auf jedem **anderen Server**: Klicke `📦 QuickStart Empfänger` und gib die Master-ID an\n\n"
+                "**Oder manuell konfigurieren:**\n"
+                "• `⚙️ Toggle` — Sync an/aus\n"
+                "• `🎯 Master setzen` — diese Guild als Master\n"
+                "• `📋 Konfiguration anzeigen` — aktuellen Status sehen"
+            ),
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="BanSync Setup Wizard • Klicke eine Option")
+        return embed
+
+    @discord.ui.button(label="QuickStart Master", style=discord.ButtonStyle.success, emoji="🚀", custom_id="sync_quickstart_master")
+    async def quickstart_master(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Ein-Klick-Setup für den Master-Server."""
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        # Berechtigungsprüfung
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+            return
+        g = self.cog.config.guild(self.guild)
+        await g.sync_enabled.set(True)
+        await g.sync_master_guild_id.set(self.guild.id)
+        await g.sync_direction.set("master_to_all")
+        await g.sync_bans.set(True)
+        await g.sync_unbans.set(True)
+        await g.sync_timeouts.set(True)
+        await g.sync_kicks.set(True)
+        await g.sync_warns.set(True)
+        await g.sync_audit_log.set(True)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await g.sync_log_channel.set(interaction.channel.id)
+            log_label = interaction.channel.mention
+        else:
+            log_label = "❌"
+        embed = discord.Embed(
+            title="✅ Master-Server eingerichtet!",
+            description=(
+                f"**{self.guild.name}** ist jetzt der Master-Server.\n\n"
+                f"**Automatisch synchronisiert (an alle Empfänger):**\n"
+                f"• 🚫 Banns  • ✅ Unbanns  • ⏱️ Timeouts  • 👢 Kicks  • ⚠️ Warns\n"
+                f"**Audit-Log-Auswertung:** ✅\n"
+                f"**Log-Channel:** {log_label}\n\n"
+                f"**Master-ID für andere Server:** `{self.guild.id}`\n\n"
+                f"👉 Gehe jetzt auf jeden anderen Server und führe dort aus:\n"
+                f"```\n[p]syncset slave {self.guild.id}\n```\n\n"
+                f"💡 Optional: `[p]syncset syncnow` überträgt alle bestehenden Banns einmalig."
+            ),
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="QuickStart Empfänger", style=discord.ButtonStyle.primary, emoji="📦", custom_id="sync_quickstart_slave")
+    async def quickstart_slave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Slave-Setup — öffnet Modal für Master-ID Eingabe."""
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+            return
+        modal = SyncSlaveModal(self.cog, self.guild)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Toggle Sync", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="sync_toggle")
+    async def toggle_sync(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Schaltet Sync an/aus."""
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+            return
+        current = await self.cog.config.guild(self.guild).sync_enabled()
+        await self.cog.config.guild(self.guild).sync_enabled.set(not current)
+        await interaction.response.send_message(
+            f"🔄 BanSync ist jetzt **{'✅ AN' if not current else '❌ AUS'}** für diese Guild.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Konfiguration anzeigen", style=discord.ButtonStyle.secondary, emoji="📋", custom_id="sync_show")
+    async def show_config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Zeigt die aktuelle Konfiguration."""
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        g = self.cog.config.guild(self.guild)
+        embed = discord.Embed(title="🔄 BanSync Konfiguration", color=discord.Color.blue(), timestamp=_now())
+        embed.add_field(name="Aktiviert", value="✅ Ja" if await g.sync_enabled() else "❌ Nein", inline=True)
+        embed.add_field(name="Richtung", value=await g.sync_direction(), inline=True)
+        master_id = await g.sync_master_guild_id()
+        embed.add_field(name="Master-Guild", value=f"`{master_id}`" if master_id else "Aktuelle (implizit)", inline=True)
+        embed.add_field(name="Banns", value="✅" if await g.sync_bans() else "❌", inline=True)
+        embed.add_field(name="Unbanns", value="✅" if await g.sync_unbans() else "❌", inline=True)
+        embed.add_field(name="Timeouts", value="✅" if await g.sync_timeouts() else "❌", inline=True)
+        embed.add_field(name="Kicks", value="✅" if await g.sync_kicks() else "❌", inline=True)
+        embed.add_field(name="Warns", value="✅" if await g.sync_warns() else "❌", inline=True)
+        embed.add_field(name="Audit-Log", value="✅" if await g.sync_audit_log() else "❌", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Abbrechen", style=discord.ButtonStyle.danger, emoji="✖️", custom_id="sync_cancel")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Bricht den Wizard ab."""
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="❌ Setup abgebrochen",
+                description="BanSync wurde nicht verändert.",
+                color=discord.Color.red(),
+            ),
+            view=None,
+        )
+
+
+class SyncSlaveModal(discord.ui.Modal):
+    """Modal zur Eingabe der Master-Guild-ID für Slave-Setup."""
+
+    def __init__(self, cog, guild: discord.Guild):
+        super().__init__(title="📦 Empfänger-Guild einrichten", timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.master_id_input = discord.ui.TextInput(
+            label="Master-Guild-ID",
+            placeholder=f"z.B. 123456789012345678 (die ID des Haupt-Servers)",
+            min_length=17,
+            max_length=20,
+            required=True,
+            custom_id="master_guild_id",
+        )
+        self.add_item(self.master_id_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            master_id = int(self.master_id_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message("❌ Ungültige Guild-ID. Muss eine Zahl sein.", ephemeral=True)
+            return
+        master_guild = self.cog.bot.get_guild(master_id)
+        if master_guild is None:
+            await interaction.response.send_message(f"❌ Bot ist nicht auf Guild `{master_id}`.", ephemeral=True)
+            return
+        g = self.cog.config.guild(self.guild)
+        await g.sync_enabled.set(True)
+        await g.sync_master_guild_id.set(master_id)
+        await g.sync_direction.set("master_to_all")
+        await g.sync_bans.set(True)
+        await g.sync_unbans.set(True)
+        await g.sync_timeouts.set(True)
+        await g.sync_kicks.set(True)
+        await g.sync_warns.set(True)
+        await g.sync_audit_log.set(False)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await g.sync_log_channel.set(interaction.channel.id)
+            log_label = interaction.channel.mention
+        else:
+            log_label = "❌"
+        embed = discord.Embed(
+            title="✅ Empfänger-Guild eingerichtet!",
+            description=(
+                f"**{self.guild.name}** ist jetzt Empfänger für Mod-Aktionen von:\n"
+                f"**{master_guild.name}** (`{master_id}`)\n\n"
+                f"**Wird automatisch empfangen:** 🚫 Banns • ✅ Unbanns • ⏱️ Timeouts • 👢 Kicks • ⚠️ Warns\n"
+                f"**Log-Channel:** {log_label}"
+            ),
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im SyncSlaveModal", exc_info=error)
 
 
 async def setup(bot: Red):
