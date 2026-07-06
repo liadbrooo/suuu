@@ -99,7 +99,6 @@ import asyncio
 import hashlib
 import logging
 import re
-import random
 
 _ = Translator("SupportCog", __file__)
 log = logging.getLogger("red.supportcog")
@@ -410,15 +409,11 @@ class SupportCog(commands.Cog):
         self.bot.add_view(TicketPanelView(self))
         self.bot.add_view(TicketControlView(self, claim_enabled=True))
         self.bot.add_view(TicketCloseView(self))
-        # Multi-Kategorie Panel: dummy View mit sample-Kategorien registrieren
-        # (damit persistente Buttons nach Reload wieder funktionieren)
-        # Die eigentliche View wird bei `[p]ticketset createmulti` neu erzeugt.
-        # Hier registrieren wir nur eine "leere" View mit dem custom_id Schema
-        # damit Discord die Buttons nach Restart noch erkennt.
-        try:
-            self.bot.add_view(TicketMultiPanelView(self, []))
-        except Exception:
-            pass  # ignore if registration fails (e.g. no categories)
+        # Multi-Kategorie Panel: persistente View mit gespeicherten Kategorien registrieren
+        # damit Buttons nach Reload wieder funktionieren. Als Background-Task da
+        # beim cog_load Guilds/Config noch nicht bereit sein könnten.
+        if not hasattr(self, "_ticket_view_register_task") or self._ticket_view_register_task is None or self._ticket_view_register_task.done():
+            self._ticket_view_register_task = asyncio.create_task(self._ticket_register_persistent_views())
         # Background loop: auto-expire duty sessions + temp whitelists
         if self._duty_expiry_task is None or self._duty_expiry_task.done():
             self._duty_expiry_task = asyncio.create_task(self._background_sweep_loop())
@@ -431,6 +426,25 @@ class SupportCog(commands.Cog):
         # Background loop: ticket reminder (für Auto-Reminder wenn Team nicht reagiert)
         if not hasattr(self, "_ticket_reminder_task") or self._ticket_reminder_task is None or self._ticket_reminder_task.done():
             self._ticket_reminder_task = asyncio.create_task(self._ticket_reminder_loop())
+
+    async def _ticket_register_persistent_views(self):
+        """Registriert persistente Multi-Panel Views nach Guild-Ready."""
+        await self.bot.wait_until_red_ready()
+        await asyncio.sleep(5)
+        try:
+            for guild in self.bot.guilds:
+                try:
+                    cats = await self.config.guild(guild).ticket_categories() or {}
+                    valid_cats = [(k, c) for k, c in cats.items() if c.get("category_id") and c.get("support_role_id")]
+                    if valid_cats:
+                        panel_msg_id = await self.config.guild(guild).ticket_panel_message_id()
+                        if panel_msg_id:
+                            view = TicketMultiPanelView(self, valid_cats)
+                            self.bot.add_view(view, message_id=panel_msg_id)
+                except Exception:
+                    pass
+        except Exception:
+            log.exception("Fehler beim Registrieren der Multi-Panel Views")
 
     async def cog_unload(self):
         """Cleanup beim Entladen - Background-Tasks abbrechen."""
@@ -466,6 +480,14 @@ class SupportCog(commands.Cog):
                 pass
             except Exception:
                 log.exception("Fehler beim Stoppen des Ticket-Reminder-Loops")
+        if hasattr(self, "_ticket_view_register_task") and self._ticket_view_register_task is not None and not self._ticket_view_register_task.done():
+            self._ticket_view_register_task.cancel()
+            try:
+                await self._ticket_view_register_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Fehler beim Stoppen des View-Register-Tasks")
 
     async def _ticket_panel_refresh_loop(self):
         """Background loop: aktualisiert das Panel periodisch für Live-Workload-Anzeige.
@@ -2494,8 +2516,8 @@ class SupportCog(commands.Cog):
         embed.set_footer(text="Bitte habe etwas Geduld nachdem du geklickt hast.")
         
         view = SupportCallView(self)
-        message = await channel.send(embed=embed, view=view)
-        
+        await channel.send(embed=embed, view=view)
+
         await ctx.send("✅ Support-Aufruf-Panel wurde erstellt!")
 
     @supportset.command(name="createteampanel")
@@ -4358,7 +4380,6 @@ class SupportCog(commands.Cog):
         title = await self.config.guild(guild).ticket_panel_title()
         description = await self.config.guild(guild).ticket_panel_description()
         color_name = await self.config.guild(guild).ticket_panel_color()
-        emoji = await self.config.guild(guild).ticket_panel_emoji()
 
         color_map = {
             "blurple": discord.Color.blurple(),
@@ -5330,6 +5351,7 @@ class SupportCog(commands.Cog):
                 user_id_int = int(user_id_str)
                 for cid in list(channel_ids):
                     await self._ticket_remove_active(ctx.guild, user_id_int, cid)
+                    await self._ticket_clear_claim(ctx.guild, cid)
             except Exception:
                 pass
         await ctx.send(f"✅ Massenschließung fertig: {closed} Tickets geschlossen, {failed} Fehler.")
@@ -6427,7 +6449,7 @@ class SupportCog(commands.Cog):
         txt_lines.append(f"Ersteller: {creator_str}")
         txt_lines.append(f"Geschlossen von: {closed_by} ({closed_by.id if closed_by else '?'})")
         txt_lines.append(f"Grund: {reason}")
-        txt_lines.append(f"Zeitzone: Europe/Berlin (MEZ/MESZ)")
+        txt_lines.append("Zeitzone: Europe/Berlin (MEZ/MESZ)")
         txt_lines.append("=" * 60)
         txt_lines.append("")
         for msg in messages:
@@ -6694,7 +6716,6 @@ class SupportCog(commands.Cog):
             except discord.HTTPException:
                 pass
             return
-        support_role = await self.get_ticket_support_role(guild)
         requester_member = interaction.user
         if not isinstance(requester_member, discord.Member):
             try:
@@ -7559,6 +7580,10 @@ class SupportCog(commands.Cog):
                         user_id_int = int(user_id_str)
                         await self._ticket_remove_active(guild, user_id_int, channel_id)
                     except (ValueError, Exception):
+                        pass
+                    try:
+                        await self._ticket_clear_claim(guild, channel_id)
+                    except Exception:
                         pass
                 except Exception:
                     log.exception("Auto-Close fehlgeschlagen für Channel %s", channel_id)
@@ -8483,8 +8508,7 @@ class SupportCog(commands.Cog):
         """
         if not member:
             member = ctx.author
-        
-        guild = ctx.guild
+
         is_on_duty = await self.config.member(member).on_duty()
         
         # Hole Statistiken
@@ -8758,13 +8782,9 @@ class SupportCog(commands.Cog):
         guild_data = await self.config.guild(guild).all()
         
         base_role_id = guild_data.get("role")
-        duty_role_id = guild_data.get("duty_role")
-        wl_duty_role_id = guild_data.get("whitelist_duty_role")
-        
+
         base_role = guild.get_role(base_role_id) if base_role_id else None
-        duty_role = guild.get_role(duty_role_id) if duty_role_id else None
-        wl_duty_role = guild.get_role(wl_duty_role_id) if wl_duty_role_id else None
-        
+
         is_support = base_role in member.roles if base_role else False
         is_on_duty = await self.config.member(member).on_duty()
         is_wl_duty = await self.config.member(member).whitelist_on_duty()
@@ -9365,6 +9385,10 @@ class SupportCog(commands.Cog):
                         await self._ticket_remove_active(member.guild, member.id, channel_id)
                     except Exception:
                         pass
+                    try:
+                        await self._ticket_clear_claim(member.guild, channel_id)
+                    except Exception:
+                        pass
                 except Exception:
                     log.exception("Auto-Close bei Member-Remove fehlgeschlagen")
         except Exception:
@@ -9712,7 +9736,7 @@ class SupportCog(commands.Cog):
         if role_label.startswith("Master"):
             embed.add_field(
                 name="💡 Optional: Bestehende Banns übertragen",
-                value=f"Führe `[p]syncset syncnow` aus, um alle bereits existierenden Banns dieser Guild auf alle Empfänger zu übertragen (einmalig).",
+                value="Führe `[p]syncset syncnow` aus, um alle bereits existierenden Banns dieser Guild auf alle Empfänger zu übertragen (einmalig).",
                 inline=False,
             )
         embed.set_footer(text=f"BanSync QuickStart • {ctx.guild.name}")
@@ -12398,7 +12422,7 @@ class SyncSlaveModal(discord.ui.Modal):
         self.guild = guild
         self.master_id_input = discord.ui.TextInput(
             label="Master-Guild-ID",
-            placeholder=f"z.B. 123456789012345678 (die ID des Haupt-Servers)",
+            placeholder="z.B. 123456789012345678 (die ID des Haupt-Servers)",
             min_length=17,
             max_length=20,
             required=True,
