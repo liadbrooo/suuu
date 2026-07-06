@@ -232,6 +232,20 @@ class SupportCog(commands.Cog):
             "ticket_max_open": 1,  # Maximal gleichzeitig offene Tickets pro User
             "ticket_active": {},  # Runtime: {user_id: [channel_ids]} — aktuell offene Tickets
             "ticket_panel_button_text": "Ticket erstellen",
+            # MULTI-KATEGORIE-SYSTEM
+            # ticket_categories: {
+            #   "support": {
+            #     "name": "Allgemeiner Support", "emoji": "🎫", "color": "blurple",
+            #     "button_text": "Support", "category_id": 123, "support_role_id": 456,
+            #     "description": "Allgemeine Fragen und Probleme",
+            #     "welcome_message": "Ein Teammitglied hilft dir gleich!",
+            #     "modal_question": "Was ist dein Problem?",
+            #     "modal_placeholder": "Beschreibe dein Anliegen..."
+            #   },
+            #   "report": { ... }, ...
+            # }
+            "ticket_categories": {},  # Dict von Kategorie-Key → Kategorie-Config
+            "ticket_panel_multi_enabled": False,  # Wenn True: Multi-Button-Panel statt einzelne Panels
 
             # AWAY AUTO-RETURN
             "away_auto_return_minutes": 15,  # Auto-Revert von "away" zu "available" nach X Min (0 = deaktiviert)
@@ -345,6 +359,15 @@ class SupportCog(commands.Cog):
         self.bot.add_view(TicketPanelView(self))
         self.bot.add_view(TicketControlView(self, claim_enabled=True))
         self.bot.add_view(TicketCloseView(self))
+        # Multi-Kategorie Panel: dummy View mit sample-Kategorien registrieren
+        # (damit persistente Buttons nach Reload wieder funktionieren)
+        # Die eigentliche View wird bei `[p]ticketset createmulti` neu erzeugt.
+        # Hier registrieren wir nur eine "leere" View mit dem custom_id Schema
+        # damit Discord die Buttons nach Restart noch erkennt.
+        try:
+            self.bot.add_view(TicketMultiPanelView(self, []))
+        except Exception:
+            pass  # ignore if registration fails (e.g. no categories)
         # Background loop: auto-expire duty sessions + temp whitelists
         if self._duty_expiry_task is None or self._duty_expiry_task.done():
             self._duty_expiry_task = asyncio.create_task(self._background_sweep_loop())
@@ -4073,9 +4096,10 @@ class SupportCog(commands.Cog):
         if ctx.invoked_subcommand is None:
             await ctx.send_help()
 
-    @ticketset.command(name="category")
-    async def ticketset_category(self, ctx: commands.Context, *, category: str = None):
-        """Setzt die Kategorie, in der Ticket-Channels erstellt werden. 'reset' zum Zurücksetzen."""
+    @ticketset.command(name="legacycategory", aliases=["legacycat", "setcategory", "setcat"])
+    async def ticketset_legacycategory(self, ctx: commands.Context, *, category: str = None):
+        """Setzt die Standard-Kategorie (Legacy), in der Ticket-Channels erstellt werden. 'reset' zum Zurücksetzen.
+        Hinweis: Für Multi-Kategorie-System nutze `[p]ticketset category ...`."""
         if category is None or category.lower() == "reset":
             await self.config.guild(ctx.guild).ticket_category.set(None)
             await ctx.send("✅ Ticket-Kategorie zurückgesetzt.")
@@ -4560,6 +4584,522 @@ class SupportCog(commands.Cog):
             await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
 
     # ============================================
+    # MULTI-KATEGORIE-SYSTEM
+    # ============================================
+
+    @ticketset.group(name="category", aliases=["cat"])
+    async def ticketset_cat_group(self, ctx: commands.Context):
+        """Verwaltet Ticket-Kategorien (Multi-Kategorie-System)."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @ticketset_cat_group.command(name="add")
+    async def ticketset_category_add(self, ctx: commands.Context, key: str, name: str):
+        """Fügt eine neue Ticket-Kategorie hinzu.
+        Beispiel: `[p]ticketset category add support "Allgemeiner Support"`
+        """
+        key = key.lower()
+        if len(key) > 20 or not key.replace("_", "").isalnum():
+            await ctx.send("❌ Key muss alphanumerisch sein (max 20 Zeichen, _ erlaubt).")
+            return
+        if len(name) > 100:
+            await ctx.send("❌ Name zu lang (max 100 Zeichen).")
+            return
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert bereits. Nutze `[p]ticketset category edit {key}` zum Bearbeiten.")
+            return
+        cats[key] = {
+            "name": name,
+            "emoji": "🎫",
+            "color": "blurple",
+            "button_text": name[:80],
+            "category_id": None,
+            "support_role_id": None,
+            "description": "",
+            "welcome_message": "Ein Teammitglied wird sich gleich um dein Anliegen kümmern.",
+            "modal_question": "Was ist dein Anliegen?",
+            "modal_placeholder": "Beschreibe dein Anliegen so detailliert wie möglich...",
+        }
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(
+            f"✅ Kategorie `{key}` erstellt.\n\n"
+            f"**Nächste Schritte:**\n"
+            f"• `[p]ticketset category emoji {key} 🎫` — Emoji setzen\n"
+            f"• `[p]ticketset category categoryid {key} <category_id>` — Discord-Kategorie setzen\n"
+            f"• `[p]ticketset category role {key} @Rolle` — Support-Rolle setzen\n"
+            f"• `[p]ticketset category show {key}` — Konfiguration anzeigen"
+        )
+
+    @ticketset_cat_group.command(name="remove", aliases=["delete"])
+    async def ticketset_category_remove(self, ctx: commands.Context, key: str):
+        """Entfernt eine Ticket-Kategorie."""
+        key = key.lower()
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        del cats[key]
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Kategorie `{key}` entfernt.")
+
+    @ticketset_cat_group.command(name="list")
+    async def ticketset_category_list(self, ctx: commands.Context):
+        """Listet alle Ticket-Kategorien auf."""
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if not cats:
+            await ctx.send("ℹ️ Keine Kategorien konfiguriert. Nutze `[p]ticketset category add <key> <name>`.")
+            return
+        embed = discord.Embed(
+            title="🎫 Ticket-Kategorien",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        for key, cat in cats.items():
+            status = []
+            if cat.get("category_id"):
+                status.append("✅ Category")
+            else:
+                status.append("❌ Category")
+            if cat.get("support_role_id"):
+                status.append("✅ Rolle")
+            else:
+                status.append("❌ Rolle")
+            cat_obj = ctx.guild.get_channel(cat.get("category_id")) if cat.get("category_id") else None
+            role_obj = ctx.guild.get_role(cat.get("support_role_id")) if cat.get("support_role_id") else None
+            embed.add_field(
+                name=f"{cat.get('emoji', '🎫')} `{key}` — {cat.get('name', '?')}",
+                value=(
+                    f"• Discord-Kategorie: {cat_obj.name if cat_obj else '❌'}\n"
+                    f"• Support-Rolle: {role_obj.mention if role_obj else '❌'}\n"
+                    f"• Button-Text: {cat.get('button_text', '?')}\n"
+                    f"• Farbe: {cat.get('color', '?')}\n"
+                    f"• Status: {' '.join(status)}"
+                ),
+                inline=False,
+            )
+        await ctx.send(embed=embed)
+
+    @ticketset_cat_group.command(name="show")
+    async def ticketset_category_show(self, ctx: commands.Context, key: str):
+        """Zeigt die Konfiguration einer Kategorie."""
+        key = key.lower()
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cat = cats[key]
+        cat_obj = ctx.guild.get_channel(cat.get("category_id")) if cat.get("category_id") else None
+        role_obj = ctx.guild.get_role(cat.get("support_role_id")) if cat.get("support_role_id") else None
+        embed = discord.Embed(
+            title=f"🎫 Kategorie: {cat.get('name', key)}",
+            description=f"Key: `{key}`\nEmoji: {cat.get('emoji', '🎫')}\nFarbe: `{cat.get('color', 'blurple')}`",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Name", value=cat.get("name", "?"), inline=True)
+        embed.add_field(name="Button-Text", value=cat.get("button_text", "?"), inline=True)
+        embed.add_field(name="Discord-Kategorie", value=cat_obj.name if cat_obj else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Support-Rolle", value=role_obj.mention if role_obj else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Beschreibung", value=cat.get("description", "Keine") or "Keine", inline=False)
+        embed.add_field(name="Welcome-Message", value=(cat.get("welcome_message", "") or "")[:500], inline=False)
+        embed.add_field(name="Modal-Frage", value=cat.get("modal_question", "?"), inline=True)
+        embed.add_field(name="Modal-Placeholder", value=cat.get("modal_placeholder", "?"), inline=True)
+        await ctx.send(embed=embed)
+
+    @ticketset_cat_group.command(name="emoji")
+    async def ticketset_category_emoji(self, ctx: commands.Context, key: str, emoji: str):
+        """Setzt das Emoji einer Kategorie."""
+        key = key.lower()
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        if len(emoji) > 50:
+            await ctx.send("❌ Emoji zu lang.")
+            return
+        cats[key]["emoji"] = emoji
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Emoji für `{key}` gesetzt auf: {emoji}")
+
+    @ticketset_cat_group.command(name="color")
+    async def ticketset_category_color(self, ctx: commands.Context, key: str, color: str):
+        """Setzt die Farbe einer Kategorie (blurple, red, green, grey, orange)."""
+        key = key.lower()
+        color = color.lower()
+        if color not in ("blurple", "red", "green", "grey", "orange"):
+            await ctx.send("❌ Farbe muss sein: blurple, red, green, grey, orange.")
+            return
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cats[key]["color"] = color
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Farbe für `{key}` gesetzt auf: `{color}`")
+
+    @ticketset_cat_group.command(name="buttontext")
+    async def ticketset_category_buttontext(self, ctx: commands.Context, key: str, *, text: str):
+        """Setzt den Button-Text einer Kategorie."""
+        key = key.lower()
+        if len(text) > 80:
+            await ctx.send("❌ Text zu lang (max 80 Zeichen).")
+            return
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cats[key]["button_text"] = text
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Button-Text für `{key}` gesetzt auf: `{text}`")
+
+    @ticketset_cat_group.command(name="categoryid", aliases=["channel"])
+    async def ticketset_category_categoryid(self, ctx: commands.Context, key: str, category: discord.CategoryChannel):
+        """Setzt die Discord-Kategorie in der Ticket-Channels erstellt werden."""
+        key = key.lower()
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cats[key]["category_id"] = category.id
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Discord-Kategorie für `{key}` gesetzt auf: {category.name}")
+
+    @ticketset_cat_group.command(name="role", aliases=["supportrole"])
+    async def ticketset_category_role(self, ctx: commands.Context, key: str, role: discord.Role):
+        """Setzt die Support-Rolle die bei Tickets dieser Kategorie gepingt wird."""
+        key = key.lower()
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cats[key]["support_role_id"] = role.id
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Support-Rolle für `{key}` gesetzt auf: {role.mention}")
+
+    @ticketset_cat_group.command(name="description")
+    async def ticketset_category_description(self, ctx: commands.Context, key: str, *, description: str):
+        """Setzt die Beschreibung einer Kategorie."""
+        key = key.lower()
+        if len(description) > 500:
+            await ctx.send("❌ Beschreibung zu lang (max 500 Zeichen).")
+            return
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cats[key]["description"] = description
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Beschreibung für `{key}` gesetzt.")
+
+    @ticketset_cat_group.command(name="welcome")
+    async def ticketset_category_welcome(self, ctx: commands.Context, key: str, *, message: str):
+        """Setzt die Willkommensnachricht einer Kategorie."""
+        key = key.lower()
+        if len(message) > 1500:
+            await ctx.send("❌ Nachricht zu lang (max 1500 Zeichen).")
+            return
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cats[key]["welcome_message"] = message
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Willkommensnachricht für `{key}` gesetzt.")
+
+    @ticketset_cat_group.command(name="modalquestion")
+    async def ticketset_category_modalquestion(self, ctx: commands.Context, key: str, *, question: str):
+        """Setzt die Modal-Frage einer Kategorie."""
+        key = key.lower()
+        if len(question) > 45:
+            await ctx.send("❌ Frage zu lang (max 45 Zeichen — Discord Modal-Limit).")
+            return
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cats[key]["modal_question"] = question
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Modal-Frage für `{key}` gesetzt.")
+
+    @ticketset_cat_group.command(name="modalplaceholder")
+    async def ticketset_category_modalplaceholder(self, ctx: commands.Context, key: str, *, placeholder: str):
+        """Setzt den Modal-Placeholder einer Kategorie."""
+        key = key.lower()
+        if len(placeholder) > 100:
+            await ctx.send("❌ Placeholder zu lang (max 100 Zeichen).")
+            return
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if key not in cats:
+            await ctx.send(f"❌ Kategorie `{key}` existiert nicht.")
+            return
+        cats[key]["modal_placeholder"] = placeholder
+        await self.config.guild(ctx.guild).ticket_categories.set(cats)
+        await ctx.send(f"✅ Modal-Placeholder für `{key}` gesetzt.")
+
+    @ticketset.command(name="createmulti")
+    async def ticketset_createmulti(self, ctx: commands.Context):
+        """Erstellt ein Multi-Kategorie Panel (mehrere Buttons auf einer Nachricht).
+        Voraussetzung: mindestens eine Kategorie ist konfiguriert (category_id + support_role_id)."""
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        valid_cats = []
+        for key, cat in cats.items():
+            if cat.get("category_id") and cat.get("support_role_id"):
+                valid_cats.append((key, cat))
+        if not valid_cats:
+            await ctx.send(
+                "❌ Keine gültigen Kategorien gefunden. Jede Kategorie braucht:\n"
+                "• `category_id` (Discord-Kategorie) — `[p]ticketset category categoryid <key> <category>`\n"
+                "• `support_role_id` (Support-Rolle) — `[p]ticketset category role <key> @Rolle`"
+            )
+            return
+        if len(valid_cats) > 25:
+            await ctx.send(f"❌ Zu viele Kategorien ({len(valid_cats)}). Discord erlaubt max 25 Buttons pro Nachricht.")
+            return
+        # Panel erstellen
+        embed = discord.Embed(
+            title="🎫 Ticket erstellen",
+            description=(
+                "Wähle unten aus, welche Art von Ticket du erstellen möchtest.\n\n"
+                "**Verfügbare Kategorien:**\n"
+                + "\n".join(f"{cat.get('emoji', '🎫')} **{cat.get('name', key)}** — {cat.get('description', '')}" for key, cat in valid_cats)
+            ),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Ticket-System • Wähle eine Kategorie")
+        view = TicketMultiPanelView(self, valid_cats)
+        # Panel-Channel setzen = aktueller Channel falls Text-Channel
+        channel = ctx.channel if isinstance(ctx.channel, discord.TextChannel) else None
+        if channel is None:
+            await ctx.send("❌ Muss in einem Text-Channel ausgeführt werden.")
+            return
+        try:
+            message = await channel.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Panel nicht senden: `{e}`")
+            return
+        # Altes Multi-Panel löschen falls vorhanden
+        old_id = await self.config.guild(ctx.guild).ticket_panel_message_id()
+        if old_id:
+            try:
+                old_msg = await channel.fetch_message(old_id)
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        await self.config.guild(ctx.guild).ticket_panel_message_id.set(message.id)
+        await self.config.guild(ctx.guild).ticket_panel_channel.set(channel.id)
+        await self.config.guild(ctx.guild).ticket_panel_multi_enabled.set(True)
+        await ctx.send(f"✅ Multi-Kategorie Panel erstellt: {message.jump_url}")
+
+    # ============================================
+    # MULTI-KATEGORIE-CORE-LOGIK
+    # ============================================
+
+    async def _ticket_create_for_category(self, interaction: discord.Interaction, cat_key: str, subject: str, requester: discord.Member):
+        """Erstellt ein Ticket für eine bestimmte Kategorie."""
+        guild = interaction.guild
+        cats = await self.config.guild(guild).ticket_categories() or {}
+        cat = cats.get(cat_key)
+        if not cat:
+            try:
+                await interaction.response.send_message(f"❌ Kategorie `{cat_key}` existiert nicht mehr.", ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
+
+        category_id = cat.get("category_id")
+        support_role_id = cat.get("support_role_id")
+        category = guild.get_channel(category_id) if category_id else None
+        support_role = guild.get_role(support_role_id) if support_role_id else None
+
+        if not category or not isinstance(category, discord.CategoryChannel):
+            try:
+                await interaction.response.send_message(
+                    "❌ Die Discord-Kategorie für diese Ticket-Kategorie ist nicht (mehr) verfügbar. Bitte informiere einen Admin.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
+        if not support_role:
+            try:
+                await interaction.response.send_message(
+                    "❌ Die Support-Rolle für diese Ticket-Kategorie ist nicht (mehr) verfügbar. Bitte informiere einen Admin.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        # Blacklist prüfen
+        blacklist = await self.config.guild(guild).ticket_blacklist() or []
+        if requester.id in blacklist:
+            try:
+                await interaction.response.send_message(
+                    "❌ Du bist aktuell vom Ticket-System ausgeschlossen.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        # Max-Open-Check
+        max_open = await self.config.guild(guild).ticket_max_open() or 1
+        current_open = await self._ticket_user_open_count(guild, requester.id)
+        if current_open >= max_open:
+            try:
+                await interaction.response.send_message(
+                    f"❌ Du hast bereits {current_open} offene Ticket(s). Maximum ist {max_open}.\n"
+                    f"Bitte schließe zuerst ein bestehendes Ticket.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        # Ticket-Nummer hochzählen
+        counter = await self.config.guild(guild).ticket_counter() or 0
+        counter += 1
+        await self.config.guild(guild).ticket_counter.set(counter)
+        # Ticket-Name: <kategorie>-<nummer>
+        ticket_name = f"{cat_key}-{counter:04d}"
+
+        # Berechtigungen
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            requester: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                attach_files=True, embed_links=True,
+            ),
+            support_role: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                attach_files=True, embed_links=True, manage_messages=True,
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                manage_channels=True, manage_messages=True,
+            ),
+        }
+
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=ticket_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Ticket #{counter} ({cat_key}) von {requester.display_name}",
+                topic=f"Ticket #{counter} • Category: {cat_key} • User: {requester.id} • Betreff: {subject[:200]} • Created: {_now_ts()}",
+            )
+        except discord.Forbidden:
+            try:
+                await interaction.followup.send(
+                    "❌ Mir fehlen die Rechte, um einen Ticket-Channel zu erstellen.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
+        except discord.HTTPException as e:
+            try:
+                await interaction.followup.send(
+                    f"❌ Konnte Ticket-Channel nicht erstellen: `{e}`",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        # Active-Tracking aktualisieren
+        await self._ticket_add_active(guild, requester.id, ticket_channel.id)
+
+        # Welcome-Embed
+        welcome_msg = cat.get("welcome_message") or "Ein Teammitglied wird sich gleich um dein Anliegen kümmern."
+        claim_enabled = await self.config.guild(guild).ticket_claim_enabled()
+        color_name = cat.get("color", "blurple")
+        color_map = {
+            "blurple": discord.Color.blurple(),
+            "red": discord.Color.red(),
+            "green": discord.Color.green(),
+            "grey": discord.Color.greyple(),
+            "orange": discord.Color.orange(),
+        }
+        embed_color = color_map.get(color_name, discord.Color.blurple())
+
+        embed = discord.Embed(
+            title=f"{cat.get('emoji', '🎫')} {cat.get('name', 'Ticket')} #{counter}",
+            description=(
+                f"Hallo {requester.mention}!\n\n"
+                f"**Betreff:** {subject}\n\n"
+                f"{welcome_msg}\n\n"
+                f"Bitte beschreibe dein Problem so detailliert wie möglich."
+            ),
+            color=embed_color,
+            timestamp=_now(),
+        )
+        embed.add_field(name="🎫 Ticket-ID", value=f"#{counter}", inline=True)
+        embed.add_field(name="📂 Kategorie", value=cat.get("name", cat_key), inline=True)
+        embed.add_field(name="👤 Erstellt von", value=f"{requester.mention}\n`{requester.id}`", inline=True)
+        embed.add_field(name="📊 Status", value="🟡 Offen", inline=True)
+        embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
+
+        # View mit Close + Claim + Unclaim-Buttons
+        view = TicketControlView(self, claim_enabled=claim_enabled)
+        try:
+            await ticket_channel.send(
+                content=f"{cat.get('emoji', '🎫')} {support_role.mention} | {requester.mention}",
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(roles=[support_role], users=[requester]),
+            )
+        except discord.HTTPException:
+            log.warning("Konnte Begrüßungs-Nachricht im Ticket-Channel nicht senden (Guild %s)", guild.id)
+
+        # Welcome-Nachricht pinnen für bessere Übersicht
+        try:
+            # Letzte Nachricht (unsere) pinnen
+            async for msg in ticket_channel.history(limit=1):
+                await msg.pin()
+                break
+        except (discord.Forbidden, discord.HTTPException):
+            pass  # nicht kritisch
+
+        # Log-Eintrag
+        log_channel_id = await self.config.guild(guild).ticket_log_channel()
+        log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
+        if log_channel:
+            try:
+                log_embed = discord.Embed(
+                    title="🎫 Ticket erstellt",
+                    description=f"Ticket-Channel: {ticket_channel.mention}",
+                    color=discord.Color.green(),
+                    timestamp=_now(),
+                )
+                log_embed.add_field(name="👤 Von", value=f"{requester.mention}\n`{requester.id}`", inline=True)
+                log_embed.add_field(name="🎫 ID", value=f"#{counter}", inline=True)
+                log_embed.add_field(name="📂 Kategorie", value=cat.get("name", cat_key), inline=True)
+                log_embed.add_field(name="📝 Betreff", value=subject[:1024], inline=False)
+                log_embed.add_field(name="🔗 Channel", value=ticket_channel.mention, inline=True)
+                log_embed.add_field(name="🎭 Support-Rolle", value=support_role.mention, inline=True)
+                log_embed.set_footer(text=f"Ticket-System • {guild.name}")
+                await log_channel.send(embed=log_embed)
+            except discord.HTTPException:
+                pass
+
+        try:
+            await interaction.followup.send(
+                f"✅ Dein Ticket wurde erstellt: {ticket_channel.mention}",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
+
+    # ============================================
     # ERWEITERTE TICKET-CORE-LOGIK
     # ============================================
 
@@ -4574,6 +5114,216 @@ class SupportCog(commands.Cog):
             except ValueError:
                 pass
         return None
+
+    def _ticket_build_html_transcript(
+        self,
+        channel: discord.TextChannel,
+        messages: list,
+        *,
+        closed_by: Optional[discord.abc.User] = None,
+        reason: str = "",
+        creator: Optional[discord.abc.User] = None,
+        category_name: str = "",
+    ) -> str:
+        """Baut ein schick formatiertes HTML-Transcript."""
+        import html as _html
+        ticket_num = "?"
+        if channel.topic:
+            m = re.search(r"Ticket #(\d+)", channel.topic)
+            if m:
+                ticket_num = m.group(1)
+        # Header
+        closed_at_str = _now().strftime("%d.%m.%Y %H:%M:%S UTC")
+        created_at_str = ""
+        if channel.created_at:
+            created_at_str = channel.created_at.strftime("%d.%m.%Y %H:%M:%S UTC")
+        creator_name = creator.display_name if creator else "Unbekannt"
+        creator_id = creator.id if creator else "?"
+        closer_name = closed_by.display_name if closed_by else "Unbekannt"
+        closer_id = closed_by.id if closed_by else "?"
+        msg_count = len(messages)
+        # Messages HTML bauen
+        msg_html_parts = []
+        for msg in messages:
+            ts = msg.created_at.strftime("%H:%M:%S") if msg.created_at else "?"
+            date_str = msg.created_at.strftime("%d.%m.%Y") if msg.created_at else ""
+            author_name = _html.escape(msg.author.display_name) if msg.author else "Unbekannt"
+            author_id = msg.author.id if msg.author else "?"
+            author_avatar = msg.author.display_avatar.url if msg.author and hasattr(msg.author, "display_avatar") else ""
+            author_color = "#5865F2"
+            try:
+                if msg.author and hasattr(msg.author, "color") and msg.author.color.value != 0:
+                    author_color = f"#{msg.author.color.value:06x}"
+            except Exception:
+                pass
+            content_html = _html.escape(msg.content) if msg.content else ""
+            if content_html:
+                # Simple markdown: **bold**, *italic*, `code`, line breaks
+                content_html = content_html.replace("\n", "<br>")
+                import re as _re
+                content_html = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", content_html)
+                content_html = _re.sub(r"\*(.+?)\*", r"<em>\1</em>", content_html)
+                content_html = _re.sub(r"`(.+?)`", r"<code>\1</code>", content_html)
+            # Attachments
+            attachments_html = ""
+            if msg.attachments:
+                attachments_html = '<div class="attachments">'
+                for att in msg.attachments:
+                    ext = att.filename.lower().rsplit(".", 1)[-1] if "." in att.filename else ""
+                    if ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+                        attachments_html += f'<div class="attachment image"><a href="{_html.escape(att.url)}" target="_blank"><img src="{_html.escape(att.url)}" alt="{_html.escape(att.filename)}"></a></div>'
+                    else:
+                        attachments_html += f'<div class="attachment file"><a href="{_html.escape(att.url)}" target="_blank">📎 {_html.escape(att.filename)} ({att.size // 1024} KB)</a></div>'
+                attachments_html += '</div>'
+            # Embeds (vereinfacht)
+            embeds_html = ""
+            if msg.embeds:
+                for emb in msg.embeds:
+                    embed_title = _html.escape(emb.title) if emb.title else ""
+                    embed_desc = _html.escape(emb.description) if emb.description else ""
+                    embed_color = "#5865F2"
+                    if emb.color:
+                        try:
+                            embed_color = f"#{emb.color.value:06x}"
+                        except Exception:
+                            pass
+                    embeds_html += f'<div class="embed" style="border-left-color: {embed_color};"><div class="embed-title">{embed_title}</div><div class="embed-desc">{embed_desc}</div></div>'
+            msg_html_parts.append(f"""
+            <div class="message">
+                <div class="message-avatar"><img src="{_html.escape(str(author_avatar))}" alt=""></div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="author" style="color: {author_color};">{author_name}</span>
+                        <span class="timestamp">{date_str} {ts}</span>
+                    </div>
+                    <div class="message-text">{content_html}</div>
+                    {attachments_html}
+                    {embeds_html}
+                </div>
+            </div>""")
+        messages_html = "\n".join(msg_html_parts) or '<div class="no-messages">Keine Nachrichten vorhanden</div>'
+        # Volles HTML
+        html = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ticket #{ticket_num} Transcript — {channel.name}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; background: #313338; color: #dbdee1; padding: 20px; }}
+        .container {{ max-width: 900px; margin: 0 auto; background: #2b2d31; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.3); }}
+        .header {{ background: #1e1f22; padding: 20px; border-bottom: 3px solid #5865F2; }}
+        .header h1 {{ color: #fff; font-size: 22px; margin-bottom: 10px; }}
+        .header .meta {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; color: #949ba4; font-size: 13px; }}
+        .header .meta-item {{ background: #313338; padding: 8px 12px; border-radius: 4px; }}
+        .header .meta-item strong {{ color: #dbdee1; display: block; margin-bottom: 2px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .messages {{ padding: 20px; }}
+        .message {{ display: flex; gap: 12px; padding: 8px 0; }}
+        .message:hover {{ background: rgba(255,255,255,0.02); }}
+        .message-avatar {{ flex-shrink: 0; }}
+        .message-avatar img {{ width: 40px; height: 40px; border-radius: 50%; }}
+        .message-content {{ flex: 1; min-width: 0; }}
+        .message-header {{ display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }}
+        .author {{ font-weight: 600; font-size: 14px; }}
+        .timestamp {{ font-size: 11px; color: #949ba4; }}
+        .message-text {{ font-size: 14px; line-height: 1.4; word-wrap: break-word; }}
+        .message-text code {{ background: #1e1f22; padding: 2px 4px; border-radius: 3px; font-family: 'Consolas', monospace; font-size: 13px; }}
+        .attachments {{ margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }}
+        .attachment.image img {{ max-width: 400px; max-height: 300px; border-radius: 4px; }}
+        .attachment.file a {{ color: #00a8fc; text-decoration: none; font-size: 13px; }}
+        .attachment.file a:hover {{ text-decoration: underline; }}
+        .embed {{ background: #2b2d31; border-left: 4px solid #5865F2; padding: 8px 12px; margin-top: 8px; border-radius: 0 4px 4px 0; }}
+        .embed-title {{ font-weight: 600; color: #fff; font-size: 14px; margin-bottom: 4px; }}
+        .embed-desc {{ font-size: 13px; color: #dbdee1; }}
+        .no-messages {{ text-align: center; color: #949ba4; padding: 40px; }}
+        .footer {{ background: #1e1f22; padding: 12px 20px; text-align: center; color: #949ba4; font-size: 11px; border-top: 1px solid #3f4147; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎫 Ticket #{ticket_num} — Transcript</h1>
+            <div class="meta">
+                <div class="meta-item"><strong>Channel</strong>{_html.escape(channel.name)}</div>
+                <div class="meta-item"><strong>Kategorie</strong>{_html.escape(category_name or "—")}</div>
+                <div class="meta-item"><strong>Erstellt am</strong>{created_at_str or "—"}</div>
+                <div class="meta-item"><strong>Geschlossen am</strong>{closed_at_str}</div>
+                <div class="meta-item"><strong>Ersteller</strong>{_html.escape(creator_name)} ({creator_id})</div>
+                <div class="meta-item"><strong>Geschlossen von</strong>{_html.escape(closer_name)} ({closer_id})</div>
+                <div class="meta-item"><strong>Nachrichten</strong>{msg_count}</div>
+                <div class="meta-item"><strong>Grund</strong>{_html.escape(reason[:200] or "Kein Grund angegeben")}</div>
+            </div>
+        </div>
+        <div class="messages">
+            {messages_html}
+        </div>
+        <div class="footer">
+            Generiert von SupportCog • {_now().strftime("%d.%m.%Y %H:%M:%S UTC")} • {msg_count} Nachrichten
+        </div>
+    </div>
+</body>
+</html>"""
+        return html
+
+    async def _ticket_create_transcript(self, channel: discord.TextChannel, *, closed_by: Optional[discord.abc.User] = None, reason: str = "") -> tuple:
+        """Erstellt ein Transcript für einen Ticket-Channel.
+        Returns: (html_content, txt_content, creator_user, ticket_num_str)."""
+        messages = []
+        try:
+            async for msg in channel.history(limit=None, oldest_first=True):
+                messages.append(msg)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Creator ermitteln
+        creator_id = await self._ticket_get_creator(channel)
+        creator_user = None
+        if creator_id is not None:
+            try:
+                creator_user = await self.bot.fetch_user(creator_id)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+        # Kategorie ermitteln
+        category_name = ""
+        if channel.topic:
+            m = re.search(r"Category: (\w+)", channel.topic)
+            if m:
+                cat_key = m.group(1)
+                cats = await self.config.guild(channel.guild).ticket_categories() or {}
+                cat = cats.get(cat_key)
+                if cat:
+                    category_name = cat.get("name", cat_key)
+        # HTML Transcript
+        html_content = self._ticket_build_html_transcript(
+            channel, messages,
+            closed_by=closed_by, reason=reason,
+            creator=creator_user, category_name=category_name,
+        )
+        # TXT Transcript (Fallback)
+        txt_lines = []
+        ticket_num = "?"
+        if channel.topic:
+            m = re.search(r"Ticket #(\d+)", channel.topic)
+            if m:
+                ticket_num = m.group(1)
+        txt_lines.append(f"Transcript für Ticket #{ticket_num}")
+        txt_lines.append(f"Channel: #{channel.name}")
+        txt_lines.append(f"Kategorie: {category_name or '—'}")
+        txt_lines.append(f"Geschlossen von: {closed_by} ({closed_by.id if closed_by else '?'})")
+        txt_lines.append(f"Grund: {reason}")
+        txt_lines.append("=" * 60)
+        txt_lines.append("")
+        for msg in messages:
+            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if msg.created_at else "?"
+            author = msg.author.display_name if msg.author else "Unbekannt"
+            content = msg.content or ""
+            if msg.attachments:
+                content += " " + " ".join(f"[Attachment: {a.filename}]" for a in msg.attachments)
+            if msg.embeds:
+                content += f" [{len(msg.embeds)} Embeds]"
+            txt_lines.append(f"[{ts}] {author}: {content}")
+        txt_content = "\n".join(txt_lines)
+        return html_content, txt_content, creator_user, ticket_num
 
     async def _ticket_get_counter(self, channel: discord.TextChannel) -> Optional[int]:
         """Extrahiert die Ticket-Nummer aus dem Channel-Topic."""
@@ -4813,44 +5563,24 @@ class SupportCog(commands.Cog):
             pass
 
         # Transcript erstellen (vor dem Löschen!)
-        transcript_text = ""
+        transcript_html = ""
+        transcript_txt = ""
         transcript_enabled = await self.config.guild(guild).ticket_transcript()
+        creator_user = None
+        ticket_num_str = "?"
         if transcript_enabled:
             try:
-                messages = []
-                try:
-                    async for msg in channel.history(limit=None, oldest_first=True):
-                        messages.append(msg)
-                except (discord.Forbidden, discord.HTTPException):
-                    messages = []
-                if messages:
-                    lines = []
-                    lines.append(f"Transcript für Ticket #{await self._ticket_get_counter(channel) or '?'}")
-                    lines.append(f"Channel: #{channel.name}")
-                    lines.append(f"Erstellt am: {discord.utils.format_dt(_now(), 'F')}")
-                    lines.append(f"Geschlossen von: {requester_member} ({requester_member.id})")
-                    lines.append(f"Grund: {reason}")
-                    lines.append("=" * 60)
-                    lines.append("")
-                    for msg in messages:
-                        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if msg.created_at else "?"
-                        author = msg.author.display_name if msg.author else "Unbekannt"
-                        content = msg.content or ""
-                        if msg.attachments:
-                            content += " " + " ".join(f"[Attachment: {a.filename}]" for a in msg.attachments)
-                        if msg.embeds:
-                            content += f" [{len(msg.embeds)} Embeds]"
-                        lines.append(f"[{ts}] {author}: {content}")
-                    transcript_text = "\n".join(lines)
+                transcript_html, transcript_txt, creator_user, ticket_num_str = await self._ticket_create_transcript(
+                    channel, closed_by=requester_member, reason=reason
+                )
             except Exception as e:
                 log.exception("Transcript-Erstellung fehlgeschlagen")
-                transcript_text = f"Transcript-Fehler: {e}"
 
         # Creator ermitteln für DM
         creator_mention = "Unbekannt"
-        creator_user = None
         if creator_id is not None:
             creator_mention = f"<@{creator_id}>"
+        if creator_user is None and creator_id is not None:
             try:
                 creator_user = await self.bot.fetch_user(creator_id)
             except (discord.NotFound, discord.HTTPException):
@@ -4870,14 +5600,17 @@ class SupportCog(commands.Cog):
                 log_embed.add_field(name="👤 Geschlossen von", value=f"{requester_member.mention}\n`{requester_member.id}`", inline=True)
                 log_embed.add_field(name="🎫 Ersteller", value=creator_mention, inline=True)
                 log_embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
-                # Transcript als File anhängen
-                if transcript_text:
+                # Transcript als File anhängen (HTML + TXT)
+                if transcript_html:
                     try:
                         import io
-                        ticket_num = await self._ticket_get_counter(channel) or "?"
-                        filename = f"transcript-ticket-{ticket_num}.txt"
-                        file_obj = discord.File(io.StringIO(transcript_text), filename=filename)
-                        await log_channel.send(embed=log_embed, file=file_obj)
+                        html_file = discord.File(io.StringIO(transcript_html), filename=f"transcript-ticket-{ticket_num_str}.html")
+                        txt_file = discord.File(io.StringIO(transcript_txt), filename=f"transcript-ticket-{ticket_num_str}.txt")
+                        try:
+                            await log_channel.send(embed=log_embed, files=[html_file, txt_file])
+                        except discord.HTTPException:
+                            # Fallback: nur TXT (HTML evtl. zu groß)
+                            await log_channel.send(embed=log_embed, file=txt_file)
                     except (discord.Forbidden, discord.HTTPException):
                         await log_channel.send(embed=log_embed)
                 else:
@@ -4899,13 +5632,15 @@ class SupportCog(commands.Cog):
                     color=discord.Color.red(),
                     timestamp=_now(),
                 )
-                if transcript_text:
+                if transcript_html:
                     try:
                         import io
-                        ticket_num = await self._ticket_get_counter(channel) or "?"
-                        filename = f"transcript-ticket-{ticket_num}.txt"
-                        file_obj = discord.File(io.StringIO(transcript_text), filename=filename)
-                        await creator_user.send(embed=dm_embed, file=file_obj)
+                        html_file = discord.File(io.StringIO(transcript_html), filename=f"transcript-ticket-{ticket_num_str}.html")
+                        txt_file = discord.File(io.StringIO(transcript_txt), filename=f"transcript-ticket-{ticket_num_str}.txt")
+                        try:
+                            await creator_user.send(embed=dm_embed, files=[html_file, txt_file])
+                        except discord.HTTPException:
+                            await creator_user.send(embed=dm_embed, file=txt_file)
                     except (discord.Forbidden, discord.HTTPException):
                         await creator_user.send(embed=dm_embed)
                 else:
@@ -4939,18 +5674,17 @@ class SupportCog(commands.Cog):
     @commands.guild_only()
     async def claim_ticket(self, ctx: commands.Context):
         """Übernimmt ein Ticket (Claim-System). Zeigt anderen Teammitgliedern dass du zuständig bist."""
-        if not ctx.channel.name.startswith("ticket-"):
+        if not ctx.channel.name.startswith("ticket-") and not self._is_ticket_channel(ctx.channel):
             await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
             return
         claim_enabled = await self.config.guild(ctx.guild).ticket_claim_enabled()
         if not claim_enabled:
             await ctx.send("❌ Claim-System ist deaktiviert.")
             return
-        support_role = await self.get_ticket_support_role(ctx.guild)
-        if not support_role or ctx.author.get_role(support_role.id) is None:
-            if not ctx.author.guild_permissions.manage_channels:
-                await ctx.send("❌ Du brauchst die Support-Rolle oder Admin-Rechte.")
-                return
+        # Berechtigungsprüfung: Support-Rolle (legacy oder kategorie-spezifisch) oder Admin
+        if not await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild):
+            await ctx.send("❌ Du brauchst eine Support-Rolle oder Admin-Rechte.")
+            return
         # Channel-Topic aktualisieren
         topic = ctx.channel.topic or ""
         # Alten Claimed-Eintrag entfernen
@@ -4969,19 +5703,91 @@ class SupportCog(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+    @commands.command(name="unclaim", aliases=["unclaimticket", "release"])
+    @commands.guild_only()
+    async def unclaim_ticket(self, ctx: commands.Context):
+        """Gibt ein geclaimtes Ticket wieder ab (Unclaim). Das Ticket ist danach wieder für alle Teammitglieder offen."""
+        if not ctx.channel.name.startswith("ticket-") and not self._is_ticket_channel(ctx.channel):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        claim_enabled = await self.config.guild(ctx.guild).ticket_claim_enabled()
+        if not claim_enabled:
+            await ctx.send("❌ Claim-System ist deaktiviert.")
+            return
+        # Prüfen ob Ticket überhaupt geclaimt ist
+        topic = ctx.channel.topic or ""
+        m = re.search(r"Claimed by: (\d+)", topic)
+        if not m:
+            await ctx.send("ℹ️ Dieses Ticket ist aktuell nicht geclaimt.")
+            return
+        claimed_by_id = int(m.group(1))
+        # Berechtigung: nur der Claimer selbst, Admins oder andere Support-Mitglieder können unclaimen
+        is_admin = ctx.author.guild_permissions.manage_channels
+        is_claimer = ctx.author.id == claimed_by_id
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_claimer or is_admin or is_staff):
+            await ctx.send("❌ Nur der aktuelle Claimer, Teammitglieder oder Admins können das Ticket freigeben.")
+            return
+        # Claimed-Eintrag aus Topic entfernen
+        topic_clean = re.sub(r" • Claimed by: \d+", "", topic)
+        try:
+            await ctx.channel.edit(topic=topic_clean, reason=f"Ticket unclaimed by {ctx.author.display_name}")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Channel-Topic nicht aktualisieren: `{e}`")
+            return
+        embed = discord.Embed(
+            title="🔓 Ticket freigegeben",
+            description=(
+                f"{ctx.author.mention} hat dieses Ticket wieder freigegeben.\n"
+                f"Es kann nun von jedem Teammitglied übernommen werden (`[p]claim`)."
+            ),
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        await ctx.send(embed=embed)
+
+    def _is_ticket_channel(self, channel) -> bool:
+        """Prüft ob ein Channel ein Ticket-Channel ist (anhand des Topics)."""
+        if not hasattr(channel, "topic") or not channel.topic:
+            return False
+        return "Ticket #" in (channel.topic or "")
+
+    async def _is_ticket_staff(self, member: discord.Member, channel, guild: discord.Guild) -> bool:
+        """Prüft ob ein Member Support-Staff für diesen Ticket-Channel ist.
+        Berücksichtigt sowohl die globale Support-Rolle als auch die kategorie-spezifische Rolle."""
+        if member.guild_permissions.manage_channels:
+            return True
+        # Globale Support-Rolle prüfen
+        support_role = await self.get_ticket_support_role(guild)
+        if support_role and member.get_role(support_role.id) is not None:
+            return True
+        # Kategorie-spezifische Rolle prüfen
+        if hasattr(channel, "topic") and channel.topic:
+            # Kategorie-Key aus Topic extrahieren
+            m = re.search(r"Category: (\w+)", channel.topic)
+            if m:
+                cat_key = m.group(1)
+                cats = await self.config.guild(guild).ticket_categories() or {}
+                cat = cats.get(cat_key)
+                if cat:
+                    role_id = cat.get("support_role_id")
+                    if role_id:
+                        role = guild.get_role(role_id)
+                        if role and member.get_role(role_id) is not None:
+                            return True
+        return False
+
     @commands.command(name="ticketadd", aliases=["tadd", "adduser"])
     @commands.guild_only()
     async def ticket_add(self, ctx: commands.Context, user: discord.Member):
         """Fügt einen User zum aktuellen Ticket-Channel hinzu."""
-        if not ctx.channel.name.startswith("ticket-"):
+        if not ctx.channel.name.startswith("ticket-") and not self._is_ticket_channel(ctx.channel):
             await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
             return
-        support_role = await self.get_ticket_support_role(ctx.guild)
-        is_support = support_role and ctx.author.get_role(support_role.id) is not None
-        is_admin = ctx.author.guild_permissions.manage_channels
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
         creator_id = await self._ticket_get_creator(ctx.channel)
         is_creator = creator_id == ctx.author.id
-        if not (is_support or is_admin or is_creator):
+        if not (is_staff or is_creator):
             await ctx.send("❌ Du bist nicht berechtigt, User hinzuzufügen.")
             return
         try:
@@ -5001,15 +5807,13 @@ class SupportCog(commands.Cog):
     @commands.guild_only()
     async def ticket_remove(self, ctx: commands.Context, user: discord.Member):
         """Entfernt einen User aus dem aktuellen Ticket-Channel."""
-        if not ctx.channel.name.startswith("ticket-"):
+        if not ctx.channel.name.startswith("ticket-") and not self._is_ticket_channel(ctx.channel):
             await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
             return
-        support_role = await self.get_ticket_support_role(ctx.guild)
-        is_support = support_role and ctx.author.get_role(support_role.id) is not None
-        is_admin = ctx.author.guild_permissions.manage_channels
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
         creator_id = await self._ticket_get_creator(ctx.channel)
         is_creator = creator_id == ctx.author.id
-        if not (is_support or is_admin or is_creator):
+        if not (is_staff or is_creator):
             await ctx.send("❌ Du bist nicht berechtigt, User zu entfernen.")
             return
         if user.id == creator_id:
@@ -5031,22 +5835,20 @@ class SupportCog(commands.Cog):
     @commands.guild_only()
     async def ticket_rename(self, ctx: commands.Context, *, new_name: str):
         """Benennt den aktuellen Ticket-Channel um."""
-        if not ctx.channel.name.startswith("ticket-"):
+        if not ctx.channel.name.startswith("ticket-") and not self._is_ticket_channel(ctx.channel):
             await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
             return
         if len(new_name) > 100:
             await ctx.send("❌ Name zu lang (max 100 Zeichen).")
             return
-        support_role = await self.get_ticket_support_role(ctx.guild)
-        is_support = support_role and ctx.author.get_role(support_role.id) is not None
-        is_admin = ctx.author.guild_permissions.manage_channels
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
         creator_id = await self._ticket_get_creator(ctx.channel)
         is_creator = creator_id == ctx.author.id
-        if not (is_support or is_admin or is_creator):
+        if not (is_staff or is_creator):
             await ctx.send("❌ Du bist nicht berechtigt, das Ticket umzubenennen.")
             return
-        # "ticket-" Prefix erzwingen
-        if not new_name.startswith("ticket-"):
+        # Prefix beibehalten (ticket- oder kategorie-key-)
+        if not (new_name.startswith("ticket-") or re.match(r"^[a-z_]+-\d", new_name)):
             new_name = f"ticket-{new_name}"
         try:
             await ctx.channel.edit(name=new_name.lower().replace(" ", "-"), reason=f"Umbenannt von {ctx.author.display_name}")
@@ -5087,39 +5889,25 @@ class SupportCog(commands.Cog):
             await ctx.send("❌ Nur in Text-Channels verfügbar.")
             return
 
-        # Transcript erstellen
-        transcript_text = ""
+        # Transcript erstellen (vor dem Löschen!)
+        transcript_html = ""
+        transcript_txt = ""
         transcript_enabled = await self.config.guild(guild).ticket_transcript()
+        creator_user = None
+        ticket_num_str = "?"
         if transcript_enabled:
             try:
-                messages = []
-                async for msg in channel.history(limit=None, oldest_first=True):
-                    messages.append(msg)
-                if messages:
-                    lines = []
-                    ticket_num = await self._ticket_get_counter(channel) or "?"
-                    lines.append(f"Transcript für Ticket #{ticket_num}")
-                    lines.append(f"Channel: #{channel.name}")
-                    lines.append(f"Geschlossen von: {ctx.author} ({ctx.author.id})")
-                    lines.append(f"Grund: {reason}")
-                    lines.append("=" * 60)
-                    lines.append("")
-                    for msg in messages:
-                        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if msg.created_at else "?"
-                        author = msg.author.display_name if msg.author else "Unbekannt"
-                        content = msg.content or ""
-                        if msg.attachments:
-                            content += " " + " ".join(f"[Attachment: {a.filename}]" for a in msg.attachments)
-                        lines.append(f"[{ts}] {author}: {content}")
-                    transcript_text = "\n".join(lines)
+                transcript_html, transcript_txt, creator_user, ticket_num_str = await self._ticket_create_transcript(
+                    channel, closed_by=ctx.author, reason=reason
+                )
             except Exception:
                 log.exception("Transcript-Erstellung fehlgeschlagen")
 
         creator_id = await self._ticket_get_creator(channel)
-        creator_user = None
         creator_mention = "Unbekannt"
         if creator_id is not None:
             creator_mention = f"<@{creator_id}>"
+        if creator_user is None and creator_id is not None:
             try:
                 creator_user = await self.bot.fetch_user(creator_id)
             except (discord.NotFound, discord.HTTPException):
@@ -5139,13 +5927,15 @@ class SupportCog(commands.Cog):
                 log_embed.add_field(name="👤 Geschlossen von", value=f"{ctx.author.mention}\n`{ctx.author.id}`", inline=True)
                 log_embed.add_field(name="🎫 Ersteller", value=creator_mention, inline=True)
                 log_embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
-                if transcript_text:
+                if transcript_html:
                     try:
                         import io
-                        ticket_num = await self._ticket_get_counter(channel) or "?"
-                        filename = f"transcript-ticket-{ticket_num}.txt"
-                        file_obj = discord.File(io.StringIO(transcript_text), filename=filename)
-                        await log_channel.send(embed=log_embed, file=file_obj)
+                        html_file = discord.File(io.StringIO(transcript_html), filename=f"transcript-ticket-{ticket_num_str}.html")
+                        txt_file = discord.File(io.StringIO(transcript_txt), filename=f"transcript-ticket-{ticket_num_str}.txt")
+                        try:
+                            await log_channel.send(embed=log_embed, files=[html_file, txt_file])
+                        except discord.HTTPException:
+                            await log_channel.send(embed=log_embed, file=txt_file)
                     except (discord.Forbidden, discord.HTTPException):
                         await log_channel.send(embed=log_embed)
                 else:
@@ -5167,13 +5957,15 @@ class SupportCog(commands.Cog):
                     color=discord.Color.red(),
                     timestamp=_now(),
                 )
-                if transcript_text:
+                if transcript_html:
                     try:
                         import io
-                        ticket_num = await self._ticket_get_counter(channel) or "?"
-                        filename = f"transcript-ticket-{ticket_num}.txt"
-                        file_obj = discord.File(io.StringIO(transcript_text), filename=filename)
-                        await creator_user.send(embed=dm_embed, file=file_obj)
+                        html_file = discord.File(io.StringIO(transcript_html), filename=f"transcript-ticket-{ticket_num_str}.html")
+                        txt_file = discord.File(io.StringIO(transcript_txt), filename=f"transcript-ticket-{ticket_num_str}.txt")
+                        try:
+                            await creator_user.send(embed=dm_embed, files=[html_file, txt_file])
+                        except discord.HTTPException:
+                            await creator_user.send(embed=dm_embed, file=txt_file)
                     except (discord.Forbidden, discord.HTTPException):
                         await creator_user.send(embed=dm_embed)
                 else:
@@ -9294,7 +10086,7 @@ class TicketModal(discord.ui.Modal):
 
 
 class TicketControlView(discord.ui.View):
-    """Persistente View im Ticket-Channel mit Close/Claim-Buttons."""
+    """Persistente View im Ticket-Channel mit Close/Claim/Unclaim-Buttons."""
 
     def __init__(self, cog: SupportCog, claim_enabled: bool = True):
         super().__init__(timeout=None)
@@ -9325,23 +10117,21 @@ class TicketControlView(discord.ui.View):
         if not self.claim_enabled:
             await interaction.response.send_message("❌ Claim-System ist deaktiviert.", ephemeral=True)
             return
-        if interaction.channel is None:
+        if interaction.channel is None or interaction.guild is None:
             await interaction.response.send_message("❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
             return
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
             return
-        support_role = await self.cog.get_ticket_support_role(interaction.guild)
-        is_support = support_role and interaction.user.get_role(support_role.id) is not None
-        is_admin = interaction.user.guild_permissions.manage_channels
-        if not (is_support or is_admin):
+        # Berechtigungsprüfung (inkl. kategorie-spezifischer Rolle)
+        is_staff = await self.cog._is_ticket_staff(interaction.user, interaction.channel, interaction.guild)
+        if not is_staff:
             await interaction.response.send_message("❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
             return
         # Channel-Topic aktualisieren
         channel = interaction.channel
         topic = channel.topic or ""
-        import re as _re
-        topic_clean = _re.sub(r" • Claimed by: \d+", "", topic)
+        topic_clean = re.sub(r" • Claimed by: \d+", "", topic)
         new_topic = f"{topic_clean} • Claimed by: {interaction.user.id}"
         try:
             await channel.edit(topic=new_topic, reason=f"Ticket claimed by {interaction.user.display_name}")
@@ -9355,6 +10145,159 @@ class TicketControlView(discord.ui.View):
             timestamp=_now(),
         )
         await interaction.response.send_message(embed=embed)
+
+    @discord.ui.button(
+        label="Freigeben",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔓",
+        custom_id="ticket_unclaim",
+    )
+    async def unclaim_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.claim_enabled:
+            await interaction.response.send_message("❌ Claim-System ist deaktiviert.", ephemeral=True)
+            return
+        if interaction.channel is None or interaction.guild is None:
+            await interaction.response.send_message("❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        channel = interaction.channel
+        topic = channel.topic or ""
+        m = re.search(r"Claimed by: (\d+)", topic)
+        if not m:
+            await interaction.response.send_message("ℹ️ Dieses Ticket ist aktuell nicht geclaimt.", ephemeral=True)
+            return
+        claimed_by_id = int(m.group(1))
+        is_claimer = interaction.user.id == claimed_by_id
+        is_staff = await self.cog._is_ticket_staff(interaction.user, channel, interaction.guild)
+        if not (is_claimer or is_staff):
+            await interaction.response.send_message("❌ Nur der aktuelle Claimer oder Teammitglieder können freigeben.", ephemeral=True)
+            return
+        # Claimed-Eintrag aus Topic entfernen
+        topic_clean = re.sub(r" • Claimed by: \d+", "", topic)
+        try:
+            await channel.edit(topic=topic_clean, reason=f"Ticket unclaimed by {interaction.user.display_name}")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.response.send_message(f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="🔓 Ticket freigegeben",
+            description=f"{interaction.user.mention} hat dieses Ticket wieder freigegeben.\nEs kann nun von jedem Teammitglied übernommen werden.",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+
+class TicketMultiPanelView(discord.ui.View):
+    """Persistente View für das Multi-Kategorie-Panel — ein Button pro Kategorie."""
+
+    def __init__(self, cog: SupportCog, categories: list):
+        """categories: list of (cat_key, cat_config) tuples."""
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.categories = categories
+        # Buttons dynamisch hinzufügen
+        for cat_key, cat_config in categories:
+            button = TicketCategoryButton(self.cog, cat_key, cat_config)
+            self.add_item(button)
+
+
+class TicketCategoryButton(discord.ui.Button):
+    """Ein Button für eine Ticket-Kategorie im Multi-Panel."""
+
+    def __init__(self, cog: SupportCog, cat_key: str, cat_config: dict):
+        color_map = {
+            "blurple": discord.ButtonStyle.primary,
+            "red": discord.ButtonStyle.danger,
+            "green": discord.ButtonStyle.success,
+            "grey": discord.ButtonStyle.secondary,
+            "orange": discord.ButtonStyle.secondary,
+        }
+        style = color_map.get(cat_config.get("color", "blurple"), discord.ButtonStyle.primary)
+        emoji = cat_config.get("emoji", "🎫")
+        label = cat_config.get("button_text", cat_config.get("name", cat_key))[:80]
+        super().__init__(
+            label=label,
+            style=style,
+            emoji=emoji,
+            custom_id=f"ticket_cat_{cat_key}",
+        )
+        self.cog = cog
+        self.cat_key = cat_key
+        self.cat_config = cat_config
+
+    async def callback(self, interaction: discord.Interaction):
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder können Tickets erstellen.", ephemeral=True)
+            return
+        # Blacklist prüfen
+        blacklist = await self.cog.config.guild(interaction.guild).ticket_blacklist() or []
+        if member.id in blacklist:
+            await interaction.response.send_message(
+                "❌ Du bist aktuell vom Ticket-System ausgeschlossen.",
+                ephemeral=True,
+            )
+            return
+        # Modal öffnen
+        modal = TicketCategoryModal(self.cog, self.cat_key, self.cat_config)
+        await interaction.response.send_modal(modal)
+
+
+class TicketCategoryModal(discord.ui.Modal):
+    """Modal zur Eingabe des Ticket-Betreffs für eine bestimmte Kategorie."""
+
+    def __init__(self, cog: SupportCog, cat_key: str, cat_config: dict):
+        title = f"{cat_config.get('emoji', '🎫')} {cat_config.get('name', 'Ticket')} erstellen"
+        if len(title) > 45:
+            title = title[:45]
+        super().__init__(title=title, timeout=600)
+        self.cog = cog
+        self.cat_key = cat_key
+        self.cat_config = cat_config
+        question = cat_config.get("modal_question", "Was ist dein Anliegen?")[:45]
+        placeholder = cat_config.get("modal_placeholder", "Beschreibe dein Anliegen...")[:100]
+        self.subject_input = discord.ui.TextInput(
+            label=question,
+            placeholder=placeholder,
+            min_length=3,
+            max_length=200,
+            required=True,
+            custom_id="ticket_subject",
+        )
+        self.add_item(self.subject_input)
+        self.detail_input = discord.ui.TextInput(
+            label="Details (optional)",
+            placeholder="Ausführlichere Beschreibung...",
+            required=False,
+            max_length=1500,
+            style=discord.TextStyle.paragraph,
+            custom_id="ticket_details",
+        )
+        self.add_item(self.detail_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        subject = self.subject_input.value.strip()
+        details = self.detail_input.value.strip() if self.detail_input.value else ""
+        full_subject = subject if not details else f"{subject}\n\n{details}"
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        await self.cog._ticket_create_for_category(interaction, self.cat_key, full_subject, member)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        msg = "❌ Ein Fehler ist beim Erstellen des Tickets aufgetreten."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im TicketCategoryModal", exc_info=error)
 
 
 class TicketCloseReasonModal(discord.ui.Modal):
