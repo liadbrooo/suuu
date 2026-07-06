@@ -269,7 +269,14 @@ class SupportCog(commands.Cog):
             "ticket_blacklist": [],  # Liste von User-IDs die keine Tickets erstellen dürfen
             "ticket_max_open": 1,  # Maximal gleichzeitig offene Tickets pro User
             "ticket_active": {},  # Runtime: {user_id: [channel_ids]} — aktuell offene Tickets
+            "ticket_claims": {},  # Runtime: {channel_id: {claimer_id, claim_ts, claimer_name}} — Claim-Status pro Ticket
             "ticket_panel_button_text": "Ticket erstellen",
+            # WORKLOAD / AUSLASTUNGS-ANZEIGE
+            "ticket_workload_in_panel": False,  # Auslastung ins Multi-Panel Embed einbauen
+            "ticket_workload_refresh_minutes": 5,  # Auto-Refresh-Intervall für Panel (0 = deaktiviert)
+            "ticket_priorities": {},  # Runtime: {channel_id: "low"|"normal"|"high"|"urgent"} — Priorität pro Ticket
+            "ticket_notes": {},  # Runtime: {channel_id: [{author_id, author_name, note, ts}]} — interne Notizen
+            "ticket_assignees": {},  # Runtime: {channel_id: [user_id, ...]} — zugewiesene Teammitglieder (zusätzlich zu Claim)
             # MULTI-KATEGORIE-SYSTEM
             # ticket_categories: {
             #   "support": {
@@ -412,6 +419,9 @@ class SupportCog(commands.Cog):
         # Background loop: ticket auto-close
         if not hasattr(self, "_ticket_auto_close_task") or self._ticket_auto_close_task is None or self._ticket_auto_close_task.done():
             self._ticket_auto_close_task = asyncio.create_task(self._ticket_auto_close_loop())
+        # Background loop: ticket panel auto-refresh (für Workload-Anzeige)
+        if not hasattr(self, "_ticket_panel_refresh_task") or self._ticket_panel_refresh_task is None or self._ticket_panel_refresh_task.done():
+            self._ticket_panel_refresh_task = asyncio.create_task(self._ticket_panel_refresh_loop())
 
     async def cog_unload(self):
         """Cleanup beim Entladen - Background-Tasks abbrechen."""
@@ -431,6 +441,53 @@ class SupportCog(commands.Cog):
                 pass
             except Exception:
                 log.exception("Fehler beim Stoppen des Ticket-Auto-Close-Loops")
+        if hasattr(self, "_ticket_panel_refresh_task") and self._ticket_panel_refresh_task is not None and not self._ticket_panel_refresh_task.done():
+            self._ticket_panel_refresh_task.cancel()
+            try:
+                await self._ticket_panel_refresh_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Fehler beim Stoppen des Ticket-Panel-Refresh-Loops")
+
+    async def _ticket_panel_refresh_loop(self):
+        """Background loop: aktualisiert das Panel periodisch für Live-Workload-Anzeige.
+        Findet das kleinste konfigurierte Refresh-Intervall über alle Guilds und nutzt das als Loop-Intervall."""
+        await self.bot.wait_until_red_ready()
+        # Erste Ausführung nach 60s Startup-Verzögerung
+        await asyncio.sleep(60)
+        while True:
+            try:
+                # Kleinstes Refresh-Intervall über alle Guilds finden
+                min_interval = None
+                guilds_to_refresh = []
+                for guild in self.bot.guilds:
+                    try:
+                        refresh_min = await self.config.guild(guild).ticket_workload_refresh_minutes() or 0
+                        if refresh_min <= 0:
+                            continue
+                        in_panel = await self.config.guild(guild).ticket_workload_in_panel()
+                        if not in_panel:
+                            continue
+                        guilds_to_refresh.append(guild)
+                        if min_interval is None or refresh_min < min_interval:
+                            min_interval = refresh_min
+                    except Exception:
+                        log.exception("Fehler beim Sammeln von Guild-Refresh-Configs")
+                # Refresh für alle relevanten Guilds
+                for guild in guilds_to_refresh:
+                    try:
+                        await self._ticket_refresh_panel(guild, silent=True)
+                    except Exception:
+                        log.exception("Fehler im Panel-Refresh für Guild %s", getattr(guild, "id", "?"))
+                # Sleep: mindestens 60s, sonst das kleinste Intervall
+                sleep_time = max(60, (min_interval or 60) * 60)
+                await asyncio.sleep(sleep_time)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Schwerer Fehler im Ticket-Panel-Refresh-Loop")
+                await asyncio.sleep(60)
 
     async def _background_sweep_loop(self):
         """Background loop that periodically:
@@ -4894,18 +4951,100 @@ class SupportCog(commands.Cog):
         if len(valid_cats) > 25:
             await ctx.send(f"❌ Zu viele Kategorien ({len(valid_cats)}). Discord erlaubt max 25 Buttons pro Nachricht.")
             return
-        # Panel erstellen
+        # Panel erstellen (mit Workload falls aktiviert)
+        embed = await self._ticket_build_multi_panel_embed(ctx.guild, valid_cats)
+        view = TicketMultiPanelView(self, valid_cats)
+        # Panel-Channel setzen = aktueller Channel falls Text-Channel
+        channel = ctx.channel if isinstance(ctx.channel, discord.TextChannel) else None
+        if channel is None:
+            await ctx.send("❌ Muss in einem Text-Channel ausgeführt werden.")
+            return
+        try:
+            message = await channel.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Panel nicht senden: `{e}`")
+            return
+        # Altes Multi-Panel löschen falls vorhanden
+        old_id = await self.config.guild(ctx.guild).ticket_panel_message_id()
+        if old_id:
+            try:
+                old_msg = await channel.fetch_message(old_id)
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        await self.config.guild(ctx.guild).ticket_panel_message_id.set(message.id)
+        await self.config.guild(ctx.guild).ticket_panel_channel.set(channel.id)
+        await self.config.guild(ctx.guild).ticket_panel_multi_enabled.set(True)
+        await ctx.send(f"✅ Multi-Kategorie Panel erstellt: {message.jump_url}")
+
+    async def _ticket_build_multi_panel_embed(self, guild: discord.Guild, valid_cats: list) -> discord.Embed:
+        """Baut das Multi-Panel Embed (mit optionaler Workload-Anzeige)."""
+        # Basis-Beschreibung
+        desc_lines = [
+            "Wähle unten aus, welche Art von Ticket du erstellen möchtest.\n",
+            "**Verfügbare Kategorien:**",
+        ]
+        for key, cat in valid_cats:
+            desc_lines.append(f"{cat.get('emoji', '🎫')} **{cat.get('name', key)}** — {cat.get('description', '')}")
+        # Workload-Anzeige falls aktiviert
+        workload_in_panel = await self.config.guild(guild).ticket_workload_in_panel()
+        if workload_in_panel:
+            try:
+                stats = await self._ticket_get_workload_stats(guild)
+                workload_text = self._ticket_build_workload_text(stats, short=True)
+                desc_lines.append("")
+                desc_lines.append(workload_text)
+                # Per-Kategorie Auslastung
+                if stats["categories"]:
+                    cat_wl_lines = []
+                    for cat_stat in stats["categories"]:
+                        if cat_stat["open"] == 0:
+                            continue
+                        # Finde die entsprechende valide Kategorie
+                        for vk, vc in valid_cats:
+                            if vk == cat_stat["key"]:
+                                cat_wl_lines.append(
+                                    f"  └ {cat_stat['emoji']} {cat_stat['name']}: {cat_stat['open']} offen "
+                                    f"(✅ {cat_stat['claimed']} • ⏳ {cat_stat['unclaimed']})"
+                                )
+                                break
+                    if cat_wl_lines:
+                        desc_lines.append("**Auslastung pro Kategorie:**")
+                        desc_lines.extend(cat_wl_lines)
+            except Exception:
+                log.exception("Fehler beim Bauen der Workload-Anzeige für Panel")
         embed = discord.Embed(
             title="🎫 Ticket erstellen",
-            description=(
-                "Wähle unten aus, welche Art von Ticket du erstellen möchtest.\n\n"
-                "**Verfügbare Kategorien:**\n"
-                + "\n".join(f"{cat.get('emoji', '🎫')} **{cat.get('name', key)}** — {cat.get('description', '')}" for key, cat in valid_cats)
-            ),
+            description="\n".join(desc_lines),
             color=discord.Color.blurple(),
             timestamp=_now(),
         )
-        embed.set_footer(text="Ticket-System • Wähle eine Kategorie")
+        footer = "Ticket-System • Wähle eine Kategorie"
+        if workload_in_panel:
+            footer += " • 📊 Live-Auslastung"
+        embed.set_footer(text=footer)
+        return embed
+
+    async def ticketset_createmulti(self, ctx: commands.Context):
+        """Erstellt ein Multi-Kategorie Panel (mehrere Buttons auf einer Nachricht).
+        Voraussetzung: mindestens eine Kategorie ist konfiguriert (category_id + support_role_id)."""
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        valid_cats = []
+        for key, cat in cats.items():
+            if cat.get("category_id") and cat.get("support_role_id"):
+                valid_cats.append((key, cat))
+        if not valid_cats:
+            await ctx.send(
+                "❌ Keine gültigen Kategorien gefunden. Jede Kategorie braucht:\n"
+                "• `category_id` (Discord-Kategorie) — `[p]ticketset category categoryid <key> <category>`\n"
+                "• `support_role_id` (Support-Rolle) — `[p]ticketset category role <key> @Rolle`"
+            )
+            return
+        if len(valid_cats) > 25:
+            await ctx.send(f"❌ Zu viele Kategorien ({len(valid_cats)}). Discord erlaubt max 25 Buttons pro Nachricht.")
+            return
+        # Panel erstellen (mit Workload falls aktiviert)
+        embed = await self._ticket_build_multi_panel_embed(ctx.guild, valid_cats)
         view = TicketMultiPanelView(self, valid_cats)
         # Panel-Channel setzen = aktueller Channel falls Text-Channel
         channel = ctx.channel if isinstance(ctx.channel, discord.TextChannel) else None
@@ -5115,41 +5254,36 @@ class SupportCog(commands.Cog):
 
     @ticketset.command(name="refreshpanel", aliases=["refresh"])
     async def ticketset_refreshpanel(self, ctx: commands.Context):
-        """Aktualisiert das bestehende Ticket-Panel (z.B. nach Kategorie-Änderungen)."""
-        panel_msg_id = await self.config.guild(ctx.guild).ticket_panel_message_id()
-        panel_ch_id = await self.config.guild(ctx.guild).ticket_panel_channel()
+        """Aktualisiert das bestehende Ticket-Panel (z.B. nach Kategorie-Änderungen oder für Workload-Update)."""
+        await self._ticket_refresh_panel(ctx.guild, ctx=ctx)
+
+    async def _ticket_refresh_panel(self, guild: discord.Guild, *, ctx: Optional[commands.Context] = None, silent: bool = False):
+        """Aktualisiert das bestehende Panel. Wenn ctx=None und silent=True, keine Statusmeldung."""
+        panel_msg_id = await self.config.guild(guild).ticket_panel_message_id()
+        panel_ch_id = await self.config.guild(guild).ticket_panel_channel()
         if not panel_msg_id or not panel_ch_id:
-            await ctx.send("❌ Kein Panel konfiguriert. Nutze `[p]ticketset createmulti` oder `[p]ticketset createpanel`.")
-            return
-        channel = ctx.guild.get_channel(panel_ch_id)
+            if ctx and not silent:
+                await ctx.send("❌ Kein Panel konfiguriert. Nutze `[p]ticketset createmulti` oder `[p]ticketset createpanel`.")
+            return False
+        channel = guild.get_channel(panel_ch_id)
         if not channel:
-            await ctx.send("❌ Panel-Channel existiert nicht mehr.")
-            return
-        multi_enabled = await self.config.guild(ctx.guild).ticket_panel_multi_enabled()
+            if ctx and not silent:
+                await ctx.send("❌ Panel-Channel existiert nicht mehr.")
+            return False
+        multi_enabled = await self.config.guild(guild).ticket_panel_multi_enabled()
         if multi_enabled:
-            # Multi-Panel aktualisieren
-            cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+            cats = await self.config.guild(guild).ticket_categories() or {}
             valid_cats = [(k, c) for k, c in cats.items() if c.get("category_id") and c.get("support_role_id")]
             if not valid_cats:
-                await ctx.send("❌ Keine gültigen Kategorien für Multi-Panel.")
-                return
-            embed = discord.Embed(
-                title="🎫 Ticket erstellen",
-                description=(
-                    "Wähle unten aus, welche Art von Ticket du erstellen möchtest.\n\n"
-                    "**Verfügbare Kategorien:**\n"
-                    + "\n".join(f"{c.get('emoji', '🎫')} **{c.get('name', k)}** — {c.get('description', '')}" for k, c in valid_cats)
-                ),
-                color=discord.Color.blurple(),
-                timestamp=_now(),
-            )
-            embed.set_footer(text="Ticket-System • Wähle eine Kategorie")
+                if ctx and not silent:
+                    await ctx.send("❌ Keine gültigen Kategorien für Multi-Panel.")
+                return False
+            embed = await self._ticket_build_multi_panel_embed(guild, valid_cats)
             view = TicketMultiPanelView(self, valid_cats)
         else:
-            # Single-Panel aktualisieren
-            title = await self.config.guild(ctx.guild).ticket_panel_title()
-            description = await self.config.guild(ctx.guild).ticket_panel_description()
-            color_name = await self.config.guild(ctx.guild).ticket_panel_color()
+            title = await self.config.guild(guild).ticket_panel_title()
+            description = await self.config.guild(guild).ticket_panel_description()
+            color_name = await self.config.guild(guild).ticket_panel_color()
             color_map = {
                 "blurple": discord.Color.blurple(),
                 "red": discord.Color.red(),
@@ -5158,22 +5292,23 @@ class SupportCog(commands.Cog):
                 "orange": discord.Color.orange(),
             }
             color = color_map.get(color_name, discord.Color.blurple())
-            embed = discord.Embed(
-                title=title,
-                description=description,
-                color=color,
-                timestamp=_now(),
-            )
+            embed = discord.Embed(title=title, description=description, color=color, timestamp=_now())
             embed.set_footer(text="Ticket-System • Klicke auf den Button")
             view = TicketPanelView(self)
         try:
             message = await channel.fetch_message(panel_msg_id)
             await message.edit(embed=embed, view=view)
-            await ctx.send("✅ Panel aktualisiert.")
+            if ctx and not silent:
+                await ctx.send("✅ Panel aktualisiert.")
+            return True
         except discord.NotFound:
-            await ctx.send("❌ Panel-Nachricht existiert nicht mehr. Erstelle neu mit `[p]ticketset createmulti` oder `[p]ticketset createpanel`.")
+            if ctx and not silent:
+                await ctx.send("❌ Panel-Nachricht existiert nicht mehr. Erstelle neu mit `[p]ticketset createmulti` oder `[p]ticketset createpanel`.")
+            return False
         except (discord.Forbidden, discord.HTTPException) as e:
-            await ctx.send(f"❌ Konnte Panel nicht aktualisieren: `{e}`")
+            if ctx and not silent:
+                await ctx.send(f"❌ Konnte Panel nicht aktualisieren: `{e}`")
+            return False
 
     @ticketset.command(name="closeall")
     @checks.admin_or_permissions(manage_guild=True)
@@ -5260,7 +5395,393 @@ class SupportCog(commands.Cog):
         await g.ticket_blacklist.set([])
         await g.ticket_max_open.set(1)
         await g.ticket_active.set({})
+        await g.ticket_claims.set({})
+        await g.ticket_priorities.set({})
+        await g.ticket_notes.set({})
+        await g.ticket_assignees.set({})
+        await g.ticket_workload_in_panel.set(False)
+        await g.ticket_workload_refresh_minutes.set(5)
         await ctx.send("✅ Ticket-Konfiguration vollständig zurückgesetzt. Nutze `[p]ticketset quickstart` oder `[p]ticketset examples` für Neu-Einrichtung.")
+
+    # ============================================
+    # WORKLOAD / AUSLASTUNGS-ANZEIGE
+    # ============================================
+
+    @ticketset.group(name="workload", aliases=["wl"])
+    async def ticketset_workload(self, ctx: commands.Context):
+        """Konfiguriert die Ticket-Auslastungs-Anzeige."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @ticketset_workload.command(name="toggle")
+    async def ticketset_workload_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert die Auslastungs-Anzeige im Multi-Panel."""
+        current = await self.config.guild(ctx.guild).ticket_workload_in_panel()
+        await self.config.guild(ctx.guild).ticket_workload_in_panel.set(not current)
+        status = "✅ aktiviert" if not current else "❌ deaktiviert"
+        await ctx.send(f"📊 Auslastungs-Anzeige im Panel ist jetzt **{status}**.")
+        if not current:
+            await ctx.send("💡 Aktualisiere das Panel mit `[p]ticketset refreshpanel` um die Anzeige sofort zu sehen.")
+
+    @ticketset_workload.command(name="refresh")
+    async def ticketset_workload_refresh(self, ctx: commands.Context, minutes: int):
+        """Setzt das Auto-Refresh-Intervall für das Panel in Minuten (0 = deaktiviert)."""
+        if minutes < 0:
+            await ctx.send("❌ Wert muss ≥ 0 sein.")
+            return
+        if minutes > 0 and minutes < 2:
+            await ctx.send("❌ Minimum ist 2 Minuten (Discord Rate-Limit). Setze auf 0 zum Deaktivieren oder ≥ 2.")
+            return
+        await self.config.guild(ctx.guild).ticket_workload_refresh_minutes.set(minutes)
+        if minutes == 0:
+            await ctx.send("✅ Auto-Refresh deaktiviert. Panel wird nur bei manuellem `[p]ticketset refreshpanel` aktualisiert.")
+        else:
+            await ctx.send(f"✅ Auto-Refresh gesetzt auf {minutes} Minuten.")
+
+    @ticketset_workload.command(name="show")
+    async def ticketset_workload_show(self, ctx: commands.Context):
+        """Zeigt die aktuellen Workload-Einstellungen."""
+        in_panel = await self.config.guild(ctx.guild).ticket_workload_in_panel()
+        refresh = await self.config.guild(ctx.guild).ticket_workload_refresh_minutes()
+        embed = discord.Embed(
+            title="📊 Workload-Einstellungen",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Auslastung im Panel", value="✅ Aktiviert" if in_panel else "❌ Deaktiviert", inline=True)
+        embed.add_field(name="Auto-Refresh", value=f"{refresh} Min" if refresh > 0 else "Deaktiviert", inline=True)
+        await ctx.send(embed=embed)
+
+    async def _ticket_get_workload_stats(self, guild: discord.Guild) -> dict:
+        """Sammelt Auslastungs-Statistiken für alle Kategorien.
+        Returns: {
+            'total_open': int,
+            'total_claimed': int,
+            'total_unclaimed': int,
+            'categories': [
+                {
+                    'key': str, 'name': str, 'emoji': str,
+                    'open': int, 'claimed': int, 'unclaimed': int,
+                    'support_role_id': int, 'support_role_name': str,
+                }
+            ],
+            'staff': [
+                {'user_id': int, 'name': str, 'claimed_count': int, 'assigned_count': int}
+            ]
+        }
+        """
+        active = await self.config.guild(guild).ticket_active() or {}
+        claims = await self.config.guild(guild).ticket_claims() or {}
+        assignees = await self.config.guild(guild).ticket_assignees() or {}
+        cats = await self.config.guild(guild).ticket_categories() or {}
+        # Alle offenen Channel-IDs sammeln
+        all_open_channels = []
+        for user_id_str, channel_ids in active.items():
+            for cid in channel_ids:
+                all_open_channels.append(cid)
+        total_open = len(all_open_channels)
+        total_claimed = sum(1 for cid in all_open_channels if str(cid) in claims)
+        total_unclaimed = total_open - total_claimed
+        # Per-Kategorie Stats
+        cat_stats = []
+        for cat_key, cat in cats.items():
+            cat_open = 0
+            cat_claimed = 0
+            cat_unclaimed = 0
+            for cid in all_open_channels:
+                channel = guild.get_channel(cid)
+                if channel is None:
+                    continue
+                topic = channel.topic or ""
+                # Kategorie aus Topic extrahieren
+                m = re.search(r"Category:\s*(\w+)", topic)
+                if m and m.group(1) == cat_key:
+                    cat_open += 1
+                    if str(cid) in claims:
+                        cat_claimed += 1
+                    else:
+                        cat_unclaimed += 1
+            # Support-Rolle ermitteln
+            role_id = cat.get("support_role_id")
+            role_name = "—"
+            if role_id:
+                role = guild.get_role(role_id)
+                if role:
+                    role_name = role.name
+            cat_stats.append({
+                "key": cat_key,
+                "name": cat.get("name", cat_key),
+                "emoji": cat.get("emoji", "🎫"),
+                "open": cat_open,
+                "claimed": cat_claimed,
+                "unclaimed": cat_unclaimed,
+                "support_role_id": role_id,
+                "support_role_name": role_name,
+            })
+        # Per-Staff Stats (Claimer)
+        staff_stats = {}
+        for cid_str, claim_data in claims.items():
+            claimer_id = claim_data.get("claimer_id")
+            if claimer_id is None:
+                continue
+            cid = int(cid_str)
+            if cid not in all_open_channels:
+                continue  # Ticket geschlossen
+            if claimer_id not in staff_stats:
+                staff_stats[claimer_id] = {"claimed_count": 0, "assigned_count": 0}
+            staff_stats[claimer_id]["claimed_count"] += 1
+        # Assignees
+        for cid_str, user_ids in assignees.items():
+            cid = int(cid_str)
+            if cid not in all_open_channels:
+                continue
+            for uid in user_ids:
+                if uid not in staff_stats:
+                    staff_stats[uid] = {"claimed_count": 0, "assigned_count": 0}
+                staff_stats[uid]["assigned_count"] += 1
+        # Staff-Liste aufbauen
+        staff_list = []
+        for uid, stats in staff_stats.items():
+            member = guild.get_member(uid)
+            name = member.display_name if member else f"User {uid}"
+            staff_list.append({
+                "user_id": uid,
+                "name": name,
+                "claimed_count": stats["claimed_count"],
+                "assigned_count": stats["assigned_count"],
+            })
+        # Nach claimed_count absteigend sortieren
+        staff_list.sort(key=lambda x: x["claimed_count"], reverse=True)
+        return {
+            "total_open": total_open,
+            "total_claimed": total_claimed,
+            "total_unclaimed": total_unclaimed,
+            "categories": cat_stats,
+            "staff": staff_list,
+        }
+
+    def _ticket_build_workload_text(self, stats: dict, *, short: bool = False) -> str:
+        """Baut den Workload-Text für Panel/Embed. Wenn short=True, nur Zusammenfassung."""
+        if short:
+            return (
+                f"📊 **Offen:** {stats['total_open']} | "
+                f"✅ **Übernommen:** {stats['total_claimed']} | "
+                f"⏳ **Wartend:** {stats['total_unclaimed']}"
+            )
+        lines = []
+        lines.append(f"📊 **Auslastung:** {stats['total_open']} offen | ✅ {stats['total_claimed']} übernommen | ⏳ {stats['total_unclaimed']} wartend")
+        if stats["categories"]:
+            lines.append("")
+            lines.append("**Nach Kategorie:**")
+            for cat in stats["categories"]:
+                if cat["open"] == 0:
+                    continue  # keine offenen Tickets → überspringen
+                lines.append(
+                    f"{cat['emoji']} **{cat['name']}**: {cat['open']} offen "
+                    f"(✅ {cat['claimed']} • ⏳ {cat['unclaimed']})"
+                )
+        if stats["staff"]:
+            lines.append("")
+            lines.append("**Team-Auslastung:**")
+            for staff in stats["staff"][:5]:  # Top 5
+                lines.append(f"• {staff['name']}: {staff['claimed_count']} geclaimt, {staff['assigned_count']} zugewiesen")
+        return "\n".join(lines)
+
+    @commands.command(name="ticketworkload", aliases=["twl", "workload", "auslastung"])
+    @commands.guild_only()
+    async def ticket_workload_cmd(self, ctx: commands.Context):
+        """Zeigt die aktuelle Ticket-Auslastung an (offene Tickets, Claims, Team-Statistiken)."""
+        stats = await self._ticket_get_workload_stats(ctx.guild)
+        if stats["total_open"] == 0:
+            await ctx.send("ℹ️ Aktuell sind keine Tickets offen.")
+            return
+        embed = discord.Embed(
+            title="📊 Ticket-Auslastung",
+            description=self._ticket_build_workload_text(stats),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        # Übersicht als Fields
+        embed.add_field(name="🎫 Gesamt offen", value=str(stats["total_open"]), inline=True)
+        embed.add_field(name="✅ Übernommen", value=str(stats["total_claimed"]), inline=True)
+        embed.add_field(name="⏳ Wartend", value=str(stats["total_unclaimed"]), inline=True)
+        # Per-Kategorie
+        if stats["categories"]:
+            cat_lines = []
+            for cat in stats["categories"]:
+                status_emoji = "🟢" if cat["open"] == 0 else ("🟡" if cat["unclaimed"] > 0 else "🔴")
+                cat_lines.append(
+                    f"{status_emoji} {cat['emoji']} **{cat['name']}** — {cat['open']} offen "
+                    f"(✅ {cat['claimed']} • ⏳ {cat['unclaimed']})"
+                )
+            embed.add_field(name="📂 Kategorien", value="\n".join(cat_lines) or "Keine", inline=False)
+        # Team-Auslastung
+        if stats["staff"]:
+            staff_lines = []
+            for staff in stats["staff"][:10]:
+                staff_lines.append(f"• **{staff['name']}** — {staff['claimed_count']} geclaimt, {staff['assigned_count']} zugewiesen")
+            embed.add_field(name="👥 Team-Auslastung", value="\n".join(staff_lines), inline=False)
+        embed.set_footer(text=f"Ticket-Auslastung • {ctx.guild.name} • {_fmt_berlin_full(_now())} (MEZ/MESZ)")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="ticketpriority", aliases=["tprio", "priority"])
+    @commands.guild_only()
+    async def ticket_priority_cmd(self, ctx: commands.Context, priority: str = None):
+        """Setzt die Priorität des aktuellen Tickets. Optionen: low, normal, high, urgent.
+        Ohne Angabe wird die aktuelle Priorität angezeigt."""
+        if not self._is_ticket_channel(ctx.channel):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not is_staff:
+            await ctx.send("❌ Nur Teammitglieder können die Priorität setzen.")
+            return
+        priorities = await self.config.guild(ctx.guild).ticket_priorities() or {}
+        channel_id_str = str(ctx.channel.id)
+        if priority is None:
+            current = priorities.get(channel_id_str, "normal")
+            priority_emojis = {"low": "🟢", "normal": "🔵", "high": "🟠", "urgent": "🔴"}
+            emoji = priority_emojis.get(current, "🔵")
+            await ctx.send(f"📋 Aktuelle Priorität: {emoji} **{current}**\nÄndern mit: `[p]ticketpriority <low|normal|high|urgent>`")
+            return
+        priority = priority.lower()
+        if priority not in ("low", "normal", "high", "urgent"):
+            await ctx.send("❌ Ungültige Priorität. Verwende: `low`, `normal`, `high`, `urgent`.")
+            return
+        priorities[channel_id_str] = priority
+        await self.config.guild(ctx.guild).ticket_priorities.set(priorities)
+        priority_emojis = {"low": "🟢", "normal": "🔵", "high": "🟠", "urgent": "🔴"}
+        emoji = priority_emojis.get(priority, "🔵")
+        # Channel-Name mit Priority-Emoji versehen (optional, falls User es will)
+        embed = discord.Embed(
+            title=f"{emoji} Priorität geändert",
+            description=f"Dieses Ticket hat jetzt die Priorität: **{priority}**",
+            color={"low": discord.Color.green(), "normal": discord.Color.blurple(), "high": discord.Color.orange(), "urgent": discord.Color.red()}.get(priority, discord.Color.blurple()),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Geändert von", value=ctx.author.mention, inline=True)
+        await ctx.send(embed=embed)
+
+    @commands.command(name="ticketnote", aliases=["tnote", "note"])
+    @commands.guild_only()
+    async def ticket_note_cmd(self, ctx: commands.Context, *, note: str = None):
+        """Fügt eine interne Notiz zum Ticket hinzu (nur für Team sichtbar).
+        Ohne Angabe werden alle Notizen angezeigt.
+        Mit 'clear' als Note werden alle Notizen gelöscht."""
+        if not self._is_ticket_channel(ctx.channel):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not is_staff:
+            await ctx.send("❌ Nur Teammitglieder können Notizen hinzufügen.")
+            return
+        notes = await self.config.guild(ctx.guild).ticket_notes() or {}
+        channel_id_str = str(ctx.channel.id)
+        if note is None:
+            # Alle Notizen anzeigen
+            channel_notes = notes.get(channel_id_str, [])
+            if not channel_notes:
+                await ctx.send("ℹ️ Keine Notizen für dieses Ticket.")
+                return
+            embed = discord.Embed(
+                title="📝 Ticket-Notizen",
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            for i, n in enumerate(channel_notes[:10], 1):
+                author_name = n.get("author_name", "Unbekannt")
+                note_text = n.get("note", "")
+                ts = n.get("ts", 0)
+                ts_str = _fmt_berlin_full(_from_ts(ts)) if ts else "?"
+                embed.add_field(name=f"#{i} — {author_name} ({ts_str})", value=note_text[:1024], inline=False)
+            if len(channel_notes) > 10:
+                embed.set_footer(text=f"Zeige 10 von {len(channel_notes)} Notizen")
+            await ctx.send(embed=embed)
+            return
+        if note.lower() == "clear":
+            if channel_id_str in notes:
+                del notes[channel_id_str]
+                await self.config.guild(ctx.guild).ticket_notes.set(notes)
+            await ctx.send("✅ Alle Notizen für dieses Ticket gelöscht.")
+            return
+        if len(note) > 1500:
+            await ctx.send("❌ Notiz zu lang (max 1500 Zeichen).")
+            return
+        # Notiz hinzufügen
+        if channel_id_str not in notes:
+            notes[channel_id_str] = []
+        notes[channel_id_str].append({
+            "author_id": ctx.author.id,
+            "author_name": ctx.author.display_name,
+            "note": note,
+            "ts": _now_ts(),
+        })
+        await self.config.guild(ctx.guild).ticket_notes.set(notes)
+        await ctx.send(f"✅ Notiz hinzugefügt ({len(notes[channel_id_str])} Notiz(en) gesamt).")
+
+    @commands.command(name="ticketassign", aliases=["tassign", "assign"])
+    @commands.guild_only()
+    async def ticket_assign_cmd(self, ctx: commands.Context, action: str = None, user: discord.Member = None):
+        """Weist ein Ticket einem Teammitglied zu (zusätzlich zum Claim).
+        `add @user` — User zuweisen
+        `remove @user` — User entfernen
+        `list` — Alle zugewiesenen User anzeigen
+        `clear` — Alle Zuweisungen entfernen"""
+        if not self._is_ticket_channel(ctx.channel):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not is_staff:
+            await ctx.send("❌ Nur Teammitglieder können User zuweisen.")
+            return
+        assignees = await self.config.guild(ctx.guild).ticket_assignees() or {}
+        channel_id_str = str(ctx.channel.id)
+        if action is None or action.lower() == "list":
+            current = assignees.get(channel_id_str, [])
+            if not current:
+                await ctx.send("ℹ️ Keine User zugewiesen.")
+                return
+            mentions = [f"<@{uid}>" for uid in current]
+            embed = discord.Embed(
+                title="👥 Zugewiesene Teammitglieder",
+                description="\n".join(f"• {m}" for m in mentions),
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            await ctx.send(embed=embed)
+            return
+        action = action.lower()
+        if action == "clear":
+            if channel_id_str in assignees:
+                del assignees[channel_id_str]
+                await self.config.guild(ctx.guild).ticket_assignees.set(assignees)
+            await ctx.send("✅ Alle Zuweisungen entfernt.")
+            return
+        if user is None:
+            await ctx.send("❌ Bitte User angeben. Beispiel: `[p]ticketassign add @user`")
+            return
+        if channel_id_str not in assignees:
+            assignees[channel_id_str] = []
+        if action == "add":
+            if user.id not in assignees[channel_id_str]:
+                assignees[channel_id_str].append(user.id)
+                await self.config.guild(ctx.guild).ticket_assignees.set(assignees)
+                await ctx.send(f"✅ {user.mention} wurde zugewiesen.")
+            else:
+                await ctx.send("ℹ️ Dieser User ist bereits zugewiesen.")
+            return
+        elif action == "remove":
+            if user.id in assignees[channel_id_str]:
+                assignees[channel_id_str].remove(user.id)
+                if not assignees[channel_id_str]:
+                    del assignees[channel_id_str]
+                await self.config.guild(ctx.guild).ticket_assignees.set(assignees)
+                await ctx.send(f"✅ {user.mention} wurde entfernt.")
+            else:
+                await ctx.send("ℹ️ Dieser User war nicht zugewiesen.")
+            return
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende: `add`, `remove`, `list`, `clear`")
 
     # ============================================
     # MULTI-KATEGORIE-CORE-LOGIK
@@ -5401,14 +5922,16 @@ class SupportCog(commands.Cog):
         }
         embed_color = color_map.get(color_name, discord.Color.blurple())
 
+        # Description sauber aufbauen
+        desc_lines = [f"Hallo {requester.mention}!"]
+        if subject and subject.strip():
+            subject_short = subject.strip()[:1000]
+            desc_lines.append(f"**Anliegen:**\n{subject_short}")
+        desc_lines.append("")
+        desc_lines.append(welcome_msg)
         embed = discord.Embed(
             title=f"{cat.get('emoji', '🎫')} {cat.get('name', 'Ticket')} #{counter}",
-            description=(
-                f"Hallo {requester.mention}!\n\n"
-                f"**Betreff:** {subject}\n\n"
-                f"{welcome_msg}\n\n"
-                f"Bitte beschreibe dein Problem so detailliert wie möglich."
-            ),
+            description="\n".join(desc_lines),
             color=embed_color,
             timestamp=_now(),
         )
@@ -5759,6 +6282,57 @@ class SupportCog(commands.Cog):
                 del active[key]
             await self.config.guild(guild).ticket_active.set(active)
 
+    # === CLAIM-TRACKING (in Config, nicht im Topic) ===
+
+    async def _ticket_get_claim(self, guild: discord.Guild, channel_id: int) -> Optional[dict]:
+        """Gibt den Claim-Status eines Tickets zurück: {claimer_id, claim_ts, claimer_name} oder None."""
+        claims = await self.config.guild(guild).ticket_claims() or {}
+        return claims.get(str(channel_id))
+
+    async def _ticket_set_claim(self, guild: discord.Guild, channel_id: int, claimer: discord.Member):
+        """Setzt den Claim-Status für ein Ticket."""
+        claims = await self.config.guild(guild).ticket_claims() or {}
+        claims[str(channel_id)] = {
+            "claimer_id": claimer.id,
+            "claim_ts": _now_ts(),
+            "claimer_name": claimer.display_name,
+        }
+        await self.config.guild(guild).ticket_claims.set(claims)
+        # Auch Topic aktualisieren (für Transcript/Info), aber robuster
+        try:
+            channel = guild.get_channel(channel_id)
+            if channel and hasattr(channel, "topic"):
+                topic = channel.topic or ""
+                # Alte Claimed-Einträge entfernen
+                topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
+                topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
+                new_topic = f"{topic_clean} • Claimed by: {claimer.id}"
+                await channel.edit(topic=new_topic, reason=f"Ticket claimed by {claimer.display_name}")
+        except (discord.Forbidden, discord.HTTPException):
+            pass  # nicht kritisch, Claim ist in Config gespeichert
+
+    async def _ticket_clear_claim(self, guild: discord.Guild, channel_id: int):
+        """Entfernt den Claim-Status für ein Ticket."""
+        claims = await self.config.guild(guild).ticket_claims() or {}
+        if str(channel_id) in claims:
+            del claims[str(channel_id)]
+            await self.config.guild(guild).ticket_claims.set(claims)
+        # Auch Topic aktualisieren
+        try:
+            channel = guild.get_channel(channel_id)
+            if channel and hasattr(channel, "topic"):
+                topic = channel.topic or ""
+                topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
+                topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
+                if topic_clean != topic:
+                    await channel.edit(topic=topic_clean, reason="Ticket unclaimed")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def _ticket_remove_claim_on_close(self, guild: discord.Guild, channel_id: int):
+        """Cleanup: Entfernt Claim-Status wenn Ticket geschlossen wird."""
+        await self._ticket_clear_claim(guild, channel_id)
+
     async def _create_ticket(self, interaction: discord.Interaction, subject: str, requester: discord.Member):
         """Erstellt einen Ticket-Channel für einen User."""
         guild = interaction.guild
@@ -5846,17 +6420,20 @@ class SupportCog(commands.Cog):
         await self._ticket_add_active(guild, requester.id, ticket_channel.id)
 
         # Welcome-Embed
-        welcome_msg = await self.config.guild(guild).ticket_welcome_message() or "Willkommen zu deinem Ticket!"
+        welcome_msg = await self.config.guild(guild).ticket_welcome_message() or "Willkommen zu deinem Ticket! Ein Teammitglied wird sich gleich um dein Anliegen kümmern."
         claim_enabled = await self.config.guild(guild).ticket_claim_enabled()
 
+        # Description sauber aufbauen — subject ist bereits der User-Text, welcome_msg kommt dazu
+        desc_lines = [f"Hallo {requester.mention}!"]
+        if subject and subject.strip():
+            # Subject auf 1000 Zeichen begrenzen für die Description
+            subject_short = subject.strip()[:1000]
+            desc_lines.append(f"**Anliegen:**\n{subject_short}")
+        desc_lines.append("")  # Leerzeile
+        desc_lines.append(welcome_msg)
         embed = discord.Embed(
             title=f"🎫 Ticket #{counter}",
-            description=(
-                f"Hallo {requester.mention}!\n\n"
-                f"**Betreff:** {subject}\n\n"
-                f"{welcome_msg}\n\n"
-                f"Bitte beschreibe dein Problem so detailliert wie möglich."
-            ),
+            description="\n".join(desc_lines),
             color=discord.Color.blurple(),
             timestamp=_now(),
         )
@@ -6047,6 +6624,8 @@ class SupportCog(commands.Cog):
         # Active-Tracking aktualisieren
         if creator_id is not None:
             await self._ticket_remove_active(guild, creator_id, channel.id)
+        # Claim-Status cleanup
+        await self._ticket_clear_claim(guild, channel.id)
 
         # Channel löschen
         try:
@@ -6081,16 +6660,24 @@ class SupportCog(commands.Cog):
         if not await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild):
             await ctx.send("❌ Du brauchst eine Support-Rolle oder Admin-Rechte.")
             return
-        # Channel-Topic aktualisieren
-        topic = ctx.channel.topic or ""
-        # Alten Claimed-Eintrag entfernen
-        topic_clean = re.sub(r" • Claimed by: \d+", "", topic)
-        new_topic = f"{topic_clean} • Claimed by: {ctx.author.id}"
-        try:
-            await ctx.channel.edit(topic=new_topic, reason=f"Ticket claimed by {ctx.author.display_name}")
-        except (discord.Forbidden, discord.HTTPException) as e:
-            await ctx.send(f"❌ Konnte Channel-Topic nicht aktualisieren: `{e}`")
-            return
+        # Prüfen ob schon geclaimt
+        existing_claim = await self._ticket_get_claim(ctx.guild, ctx.channel.id)
+        if existing_claim:
+            existing_claimer_id = existing_claim.get("claimer_id")
+            if existing_claimer_id == ctx.author.id:
+                await ctx.send("ℹ️ Du hast dieses Ticket bereits übernommen.")
+                return
+            existing_claimer = ctx.guild.get_member(existing_claimer_id) or await self.bot.fetch_user(existing_claimer_id)
+            existing_name = existing_claimer.display_name if existing_claimer else f"User {existing_claimer_id}"
+            # Anderer User hat es geclaimt — nur Admins oder Staff können überschreiben
+            is_admin = ctx.author.guild_permissions.manage_channels or ctx.author.guild_permissions.administrator
+            if not is_admin:
+                await ctx.send(f"❌ Dieses Ticket ist bereits von **{existing_name}** übernommen. Nur Admins können es überschreiben.\nWenn nötig: `{ctx.prefix}unclaim` zuerst freigeben.")
+                return
+            # Admin überschreibt
+            await ctx.send(f"⚠️ Du überschreibst den Claim von **{existing_name}**.")
+        # Claim setzen
+        await self._ticket_set_claim(ctx.guild, ctx.channel.id, ctx.author)
         embed = discord.Embed(
             title="✅ Ticket übernommen",
             description=f"{ctx.author.mention} hat dieses Ticket übernommen und ist nun zuständig.",
@@ -6111,31 +6698,27 @@ class SupportCog(commands.Cog):
             await ctx.send("❌ Claim-System ist deaktiviert.")
             return
         # Prüfen ob Ticket überhaupt geclaimt ist
-        topic = ctx.channel.topic or ""
-        m = re.search(r"Claimed by: (\d+)", topic)
-        if not m:
+        existing_claim = await self._ticket_get_claim(ctx.guild, ctx.channel.id)
+        if not existing_claim:
             await ctx.send("ℹ️ Dieses Ticket ist aktuell nicht geclaimt.")
             return
-        claimed_by_id = int(m.group(1))
+        claimed_by_id = existing_claim.get("claimer_id")
         # Berechtigung: nur der Claimer selbst, Admins oder andere Support-Mitglieder können unclaimen
-        is_admin = ctx.author.guild_permissions.manage_channels
+        is_admin = ctx.author.guild_permissions.manage_channels or ctx.author.guild_permissions.administrator
         is_claimer = ctx.author.id == claimed_by_id
         is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
         if not (is_claimer or is_admin or is_staff):
-            await ctx.send("❌ Nur der aktuelle Claimer, Teammitglieder oder Admins können das Ticket freigeben.")
+            claimer = ctx.guild.get_member(claimed_by_id) or await self.bot.fetch_user(claimed_by_id)
+            claimer_name = claimer.display_name if claimer else f"User {claimed_by_id}"
+            await ctx.send(f"❌ Nur **{claimer_name}** (aktueller Claimer), Teammitglieder oder Admins können das Ticket freigeben.")
             return
-        # Claimed-Eintrag aus Topic entfernen
-        topic_clean = re.sub(r" • Claimed by: \d+", "", topic)
-        try:
-            await ctx.channel.edit(topic=topic_clean, reason=f"Ticket unclaimed by {ctx.author.display_name}")
-        except (discord.Forbidden, discord.HTTPException) as e:
-            await ctx.send(f"❌ Konnte Channel-Topic nicht aktualisieren: `{e}`")
-            return
+        # Claim entfernen
+        await self._ticket_clear_claim(ctx.guild, ctx.channel.id)
         embed = discord.Embed(
             title="🔓 Ticket freigegeben",
             description=(
                 f"{ctx.author.mention} hat dieses Ticket wieder freigegeben.\n"
-                f"Es kann nun von jedem Teammitglied übernommen werden (`[p]claim`)."
+                f"Es kann nun von jedem Teammitglied übernommen werden (`[p]claim` oder `✋ Übernehmen` Button)."
             ),
             color=discord.Color.orange(),
             timestamp=_now(),
@@ -6329,11 +6912,20 @@ class SupportCog(commands.Cog):
                 cat_label = f"{cat.get('emoji', '🎫')} {cat.get('name', cat_key)}"
             else:
                 cat_label = cat_key
-        # Claimer
+        # Claimer — aus Config (zuverlässig) statt Topic
         claimer_mention = "Nicht geclaimt"
-        m = re.search(r"Claimed by:\s*(\d+)", topic)
-        if m:
-            claimer_mention = f"<@{m.group(1)}>"
+        claim_time = ""
+        existing_claim = await self._ticket_get_claim(ctx.guild, channel.id)
+        if existing_claim:
+            claimer_id = existing_claim.get("claimer_id")
+            claim_ts = existing_claim.get("claim_ts")
+            claimer_mention = f"<@{claimer_id}>"
+            if claim_ts:
+                try:
+                    claim_dt = _from_ts(claim_ts)
+                    claim_time = _fmt_berlin_full(claim_dt)
+                except Exception:
+                    pass
         # Erstellungszeit
         created_str = _fmt_berlin_full(channel.created_at) if channel.created_at else "?"
         # Letzte Aktivität
@@ -6554,6 +7146,8 @@ class SupportCog(commands.Cog):
         # Active-Tracking
         if creator_id is not None:
             await self._ticket_remove_active(guild, creator_id, channel.id)
+        # Claim-Status cleanup
+        await self._ticket_clear_claim(guild, channel.id)
 
         # Schließen-Nachricht
         try:
@@ -10709,10 +11303,9 @@ class TicketControlView(discord.ui.View):
             if interaction.channel is None or interaction.guild is None:
                 await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
                 return
-            # Berechtigungsprüfung — interaction.user kann User oder Member sein
+            # Member sicherstellen
             member = interaction.user
             if not isinstance(member, discord.Member):
-                # Versuche Member zu holen
                 try:
                     member = interaction.guild.get_member(interaction.user.id)
                 except Exception:
@@ -10720,30 +11313,59 @@ class TicketControlView(discord.ui.View):
                 if member is None:
                     await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
                     return
+            # Berechtigungsprüfung
             is_staff = await self.cog._is_ticket_staff(member, interaction.channel, interaction.guild)
             if not is_staff:
                 await self._safe_respond(interaction, "❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
                 return
-            # Channel-Topic aktualisieren — robust gegen mehrere/mögliche Claim-Einträge
-            channel = interaction.channel
-            topic = channel.topic or ""
-            # ALLE Claimed-Einträge entfernen (egal wie viele, falls durch Race Conditions mehrere entstanden)
-            topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
-            # Doppelte Leerzeichen/Trenner aufräumen
-            topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
-            new_topic = f"{topic_clean} • Claimed by: {interaction.user.id}"
-            try:
-                await channel.edit(topic=new_topic, reason=f"Ticket claimed by {interaction.user.display_name}")
-            except (discord.Forbidden, discord.HTTPException) as e:
-                await self._safe_respond(interaction, f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
-                return
+            # Prüfen ob schon geclaimt (über Config, nicht Topic!)
+            existing_claim = await self.cog._ticket_get_claim(interaction.guild, interaction.channel.id)
+            if existing_claim:
+                existing_claimer_id = existing_claim.get("claimer_id")
+                if existing_claimer_id == member.id:
+                    await self._safe_respond(interaction, "ℹ️ Du hast dieses Ticket bereits übernommen.", ephemeral=True)
+                    return
+                # Anderer User hat es geclaimt — nur Admins können überschreiben
+                is_admin = member.guild_permissions.manage_channels or member.guild_permissions.administrator
+                if not is_admin:
+                    existing_claimer = interaction.guild.get_member(existing_claimer_id)
+                    if existing_claimer is None:
+                        try:
+                            existing_claimer = await self.cog.bot.fetch_user(existing_claimer_id)
+                        except Exception:
+                            existing_claimer = None
+                    existing_name = existing_claimer.display_name if existing_claimer else f"User {existing_claimer_id}"
+                    await self._safe_respond(
+                        interaction,
+                        f"❌ Dieses Ticket ist bereits von **{existing_name}** übernommen.\n"
+                        f"Nur Admins können es überschreiben. Nutze `🔓 Freigeben` falls du der Claimer bist.",
+                        ephemeral=True,
+                    )
+                    return
+                # Admin überschreibt — Info senden
+                existing_claimer = interaction.guild.get_member(existing_claimer_id)
+                if existing_claimer is None:
+                    try:
+                        existing_claimer = await self.cog.bot.fetch_user(existing_claimer_id)
+                    except Exception:
+                        existing_claimer = None
+                existing_name = existing_claimer.display_name if existing_claimer else f"User {existing_claimer_id}"
+                await self._safe_respond(interaction, f"⚠️ Du überschreibst den Claim von **{existing_name}**.", ephemeral=True)
+            # Claim setzen (in Config UND Topic)
+            await self.cog._ticket_set_claim(interaction.guild, interaction.channel.id, member)
             embed = discord.Embed(
                 title="✅ Ticket übernommen",
-                description=f"{interaction.user.mention} hat dieses Ticket übernommen und ist nun zuständig.",
+                description=f"{member.mention} hat dieses Ticket übernommen und ist nun zuständig.",
                 color=discord.Color.green(),
                 timestamp=_now(),
             )
-            await self._safe_respond(interaction, embed=embed)
+            # Öffentliche Nachricht (nicht ephemeral)
+            try:
+                await interaction.channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+            # Bestätigung an den User (ephemeral)
+            await self._safe_respond(interaction, "✅ Du hast das Ticket übernommen.", ephemeral=True)
         except Exception as e:
             log.exception("Fehler in claim_ticket_btn")
             try:
@@ -10779,33 +11401,44 @@ class TicketControlView(discord.ui.View):
                 if member is None:
                     await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
                     return
-            channel = interaction.channel
-            topic = channel.topic or ""
-            m = re.search(r"Claimed by:\s*(\d+)", topic)
-            if not m:
+            # Claim-Status aus Config holen
+            existing_claim = await self.cog._ticket_get_claim(interaction.guild, interaction.channel.id)
+            if not existing_claim:
                 await self._safe_respond(interaction, "ℹ️ Dieses Ticket ist aktuell nicht geclaimt.", ephemeral=True)
                 return
-            claimed_by_id = int(m.group(1))
-            is_claimer = interaction.user.id == claimed_by_id
-            is_staff = await self.cog._is_ticket_staff(member, channel, interaction.guild)
-            if not (is_claimer or is_staff):
-                await self._safe_respond(interaction, "❌ Nur der aktuelle Claimer oder Teammitglieder können freigeben.", ephemeral=True)
+            claimed_by_id = existing_claim.get("claimer_id")
+            is_claimer = member.id == claimed_by_id
+            is_staff = await self.cog._is_ticket_staff(member, interaction.channel, interaction.guild)
+            is_admin = member.guild_permissions.manage_channels or member.guild_permissions.administrator
+            if not (is_claimer or is_staff or is_admin):
+                claimer = interaction.guild.get_member(claimed_by_id)
+                if claimer is None:
+                    try:
+                        claimer = await self.cog.bot.fetch_user(claimed_by_id)
+                    except Exception:
+                        claimer = None
+                claimer_name = claimer.display_name if claimer else f"User {claimed_by_id}"
+                await self._safe_respond(
+                    interaction,
+                    f"❌ Nur **{claimer_name}** (aktueller Claimer), Teammitglieder oder Admins können freigeben.",
+                    ephemeral=True,
+                )
                 return
-            # ALLE Claimed-Einträge aus Topic entfernen
-            topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
-            topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
-            try:
-                await channel.edit(topic=topic_clean, reason=f"Ticket unclaimed by {interaction.user.display_name}")
-            except (discord.Forbidden, discord.HTTPException) as e:
-                await self._safe_respond(interaction, f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
-                return
+            # Claim entfernen (aus Config UND Topic)
+            await self.cog._ticket_clear_claim(interaction.guild, interaction.channel.id)
             embed = discord.Embed(
                 title="🔓 Ticket freigegeben",
-                description=f"{interaction.user.mention} hat dieses Ticket wieder freigegeben.\nEs kann nun von jedem Teammitglied übernommen werden (`✋ Übernehmen`).",
+                description=f"{member.mention} hat dieses Ticket wieder freigegeben.\nEs kann nun von jedem Teammitglied übernommen werden (`✋ Übernehmen`).",
                 color=discord.Color.orange(),
                 timestamp=_now(),
             )
-            await self._safe_respond(interaction, embed=embed)
+            # Öffentliche Nachricht
+            try:
+                await interaction.channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+            # Bestätigung an User
+            await self._safe_respond(interaction, "✅ Du hast das Ticket freigegeben.", ephemeral=True)
         except Exception as e:
             log.exception("Fehler in unclaim_ticket_btn")
             try:
