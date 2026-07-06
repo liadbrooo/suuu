@@ -280,6 +280,9 @@ class SupportCog(commands.Cog):
             # ERWEITERTE FEATURES
             "ticket_survey_enabled": False,  # Auto-Survey nach Schließung
             "ticket_survey_channel": None,  # Channel für Survey-Ergebnisse
+            "ticket_survey_results": {},  # {ticket_num: {user_id, rating, ts}}
+            # CUSTOM EMBED SYSTEM
+            "custom_embeds": {},  # {embed_key: {title, description, color, footer, image, thumbnail, field1_name, field1_value, field2_name, field2_value, message_id, channel_id}}
             "ticket_first_response_reminder_minutes": 0,  # 0 = deaktiviert, sonst: Reminder nach X Min wenn Team nicht reagiert
             "ticket_history": {},  # Runtime: {user_id: [{ticket_num, channel_name, category, opened_ts, closed_ts, closed_by, reason}]}
             "ticket_first_response_tracker": {},  # Runtime: {channel_id: {created_ts, first_response_ts, first_responder_id}}
@@ -5960,6 +5963,32 @@ class SupportCog(commands.Cog):
             history[key] = history[key][-50:]
         await self.config.guild(guild).ticket_history.set(history)
 
+    async def _ticket_send_survey(self, guild: discord.Guild, creator_user, ticket_num: str, category: str = ""):
+        """Sendet eine Zufriedenheits-Survey an den Ticket-Ersteller per DM."""
+        if creator_user is None:
+            return
+        survey_enabled = await self.config.guild(guild).ticket_survey_enabled()
+        if not survey_enabled:
+            return
+        try:
+            embed = discord.Embed(
+                title="📋 Wie war dein Ticket-Erlebnis?",
+                description=(
+                    f"Dein Ticket **#{ticket_num}** auf **{guild.name}** wurde geschlossen.\n\n"
+                    f"Wie zufrieden warst du mit der Unterstützung?\n"
+                    f"Klicke auf einen der Buttons unten um zu bewerten (1-5 Sterne)."
+                ),
+                color=discord.Color.gold(),
+                timestamp=_now(),
+            )
+            if category:
+                embed.add_field(name="📂 Kategorie", value=category, inline=True)
+            embed.set_footer(text=f"Ticket #{ticket_num} • {guild.name}")
+            view = TicketSurveyView(self, guild.id, str(creator_user.id), ticket_num)
+            await creator_user.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException):
+            pass  # DMs könnten deaktiviert sein
+
     @commands.command(name="tickethistory", aliases=["thist", "tickehistory"])
     @commands.guild_only()
     async def ticket_history_cmd(self, ctx: commands.Context, user: discord.User = None):
@@ -6169,6 +6198,217 @@ class SupportCog(commands.Cog):
             except Exception:
                 log.exception("Schwerer Fehler im Ticket-Reminder-Loop")
             await asyncio.sleep(300)  # Alle 5 Minuten prüfen
+
+    # ============================================
+    # CUSTOM EMBED BUILDER & EDITOR
+    # ============================================
+
+    @commands.group(name="embedbuilder", aliases=["ebuilder", "embedb", "customembed"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def embed_builder(self, ctx: commands.Context):
+        """Custom Embed Builder — erstellt und bearbeitet Embeds."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @embed_builder.command(name="create", aliases=["make", "new"])
+    async def embed_builder_create(self, ctx: commands.Context, key: str):
+        """Erstellt ein neues Custom Embed mit einem Modal.
+        Beispiel: `[p]embedbuilder create regeln`"""
+        key = key.lower().strip()
+        if len(key) > 30 or not key.replace("_", "").isalnum():
+            await ctx.send("❌ Key muss alphanumerisch sein (max 30 Zeichen, _ erlaubt).")
+            return
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if key in embeds:
+            await ctx.send(f"❌ Embed `{key}` existiert bereits. Nutze `[p]embedbuilder edit {key}` zum Bearbeiten.")
+            return
+        # Modal öffnen (leere Werte)
+        embed = discord.Embed(
+            title="🛠️ Embed Builder",
+            description=f"Klicke auf den Button um das Embed `{key}` zu erstellen.",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        view = EmbedBuilderStartView(self, key, is_new=True)
+        await ctx.send(embed=embed, view=view)
+
+    @embed_builder.command(name="edit", aliases=["modify", "change"])
+    async def embed_builder_edit(self, ctx: commands.Context, key: str):
+        """Bearbeitet ein bestehendes Custom Embed über ein Modal (mit aktuellen Werten).
+        Beispiel: `[p]embedbuilder edit regeln`"""
+        key = key.lower().strip()
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if key not in embeds:
+            await ctx.send(f"❌ Embed `{key}` existiert nicht. Nutze `[p]embedbuilder create {key}` zum Erstellen.")
+            return
+        # Modal öffnen (mit aktuellen Werten)
+        embed = discord.Embed(
+            title="✏️ Embed Editor",
+            description=f"Klicke auf den Button um das Embed `{key}` zu bearbeiten.",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        view = EmbedBuilderStartView(self, key, is_new=False)
+        await ctx.send(embed=embed, view=view)
+
+    @embed_builder.command(name="send", aliases=["post", "publish"])
+    async def embed_builder_send(self, ctx: commands.Context, key: str, channel: discord.TextChannel = None):
+        """Sendet ein Custom Embed in einen Channel.
+        Beispiel: `[p]embedbuilder send regeln #regeln`"""
+        key = key.lower().strip()
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if key not in embeds:
+            await ctx.send(f"❌ Embed `{key}` existiert nicht.")
+            return
+        if channel is None:
+            channel = ctx.channel
+        embed_data = embeds[key]
+        embed = self._build_custom_embed(embed_data)
+        try:
+            message = await channel.send(embed=embed)
+            # Message-ID speichern für spätere Aktualisierung
+            embeds[key]["message_id"] = message.id
+            embeds[key]["channel_id"] = channel.id
+            await self.config.guild(ctx.guild).custom_embeds.set(embeds)
+            await ctx.send(f"✅ Embed `{key}` gesendet: {message.jump_url}")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Embed nicht senden: `{e}`")
+
+    @embed_builder.command(name="update", aliases=["refresh"])
+    async def embed_builder_update(self, ctx: commands.Context, key: str):
+        """Aktualisiert ein bereits gesendetes Embed (nach Bearbeitung).
+        Beispiel: `[p]embedbuilder update regeln`"""
+        key = key.lower().strip()
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if key not in embeds:
+            await ctx.send(f"❌ Embed `{key}` existiert nicht.")
+            return
+        embed_data = embeds[key]
+        message_id = embed_data.get("message_id")
+        channel_id = embed_data.get("channel_id")
+        if not message_id or not channel_id:
+            await ctx.send(f"❌ Embed `{key}` wurde noch nicht gesendet. Nutze `[p]embedbuilder send {key}`.")
+            return
+        channel = ctx.guild.get_channel(channel_id)
+        if not channel:
+            await ctx.send("❌ Channel existiert nicht mehr.")
+            return
+        try:
+            message = await channel.fetch_message(message_id)
+            embed = self._build_custom_embed(embed_data)
+            await message.edit(embed=embed)
+            await ctx.send(f"✅ Embed `{key}` aktualisiert: {message.jump_url}")
+        except discord.NotFound:
+            await ctx.send("❌ Embed-Nachricht existiert nicht mehr. Nutze `[p]embedbuilder send` zum neu senden.")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Embed nicht aktualisieren: `{e}`")
+
+    @embed_builder.command(name="list")
+    async def embed_builder_list(self, ctx: commands.Context):
+        """Zeigt alle Custom Embeds an."""
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if not embeds:
+            await ctx.send("ℹ️ Keine Custom Embeds vorhanden. Nutze `[p]embedbuilder create <key>`.")
+            return
+        embed = discord.Embed(
+            title="🛠️ Custom Embeds",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        for key, data in embeds.items():
+            title = data.get("title", "Kein Titel")[:50]
+            sent = "✅ Gesendet" if data.get("message_id") else "❌ Nicht gesendet"
+            embed.add_field(name=f"📝 `{key}`", value=f"Titel: {title}\nStatus: {sent}", inline=False)
+        embed.set_footer(text=f"{len(embeds)} Embed(s) gesamt")
+        await ctx.send(embed=embed)
+
+    @embed_builder.command(name="delete", aliases=["remove"])
+    async def embed_builder_delete(self, ctx: commands.Context, key: str):
+        """Löscht ein Custom Embed."""
+        key = key.lower().strip()
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if key not in embeds:
+            await ctx.send(f"❌ Embed `{key}` existiert nicht.")
+            return
+        del embeds[key]
+        await self.config.guild(ctx.guild).custom_embeds.set(embeds)
+        await ctx.send(f"✅ Embed `{key}` gelöscht.")
+
+    @embed_builder.command(name="preview", aliases=["show"])
+    async def embed_builder_preview(self, ctx: commands.Context, key: str):
+        """Zeigt eine Vorschau eines Custom Embeds an."""
+        key = key.lower().strip()
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if key not in embeds:
+            await ctx.send(f"❌ Embed `{key}` existiert nicht.")
+            return
+        embed = self._build_custom_embed(embeds[key])
+        await ctx.send(embed=embed)
+
+    def _build_custom_embed(self, data: dict) -> discord.Embed:
+        """Baut ein Discord Embed aus den gespeicherten Daten."""
+        color_map = {
+            "blurple": discord.Color.blurple(),
+            "red": discord.Color.red(),
+            "green": discord.Color.green(),
+            "yellow": discord.Color.gold(),
+            "orange": discord.Color.orange(),
+            "purple": discord.Color.purple(),
+            "grey": discord.Color.greyple(),
+            "dark_blue": discord.Color.dark_blue(),
+            "dark_green": discord.Color.dark_green(),
+            "dark_red": discord.Color.dark_red(),
+            "random": discord.Color.random(),
+        }
+        color_name = data.get("color", "blurple")
+        color = color_map.get(color_name, discord.Color.blurple())
+        title = data.get("title") or ""
+        description = data.get("description") or ""
+        embed = discord.Embed(
+            title=title[:256] if title else None,
+            description=description[:4096] if description else None,
+            color=color,
+            timestamp=_now(),
+        )
+        # Fields
+        for i in range(1, 4):  # Max 3 Fields
+            fname = data.get(f"field{i}_name")
+            fvalue = data.get(f"field{i}_value")
+            if fname and fvalue:
+                embed.add_field(name=fname[:256], value=fvalue[:1024], inline=False)
+        # Footer
+        footer = data.get("footer")
+        if footer:
+            embed.set_footer(text=footer[:2048])
+        # Image
+        image_url = data.get("image")
+        if image_url:
+            embed.set_image(url=image_url)
+        # Thumbnail
+        thumbnail_url = data.get("thumbnail")
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
+        return embed
+
+    async def _embed_builder_save(self, interaction: discord.Interaction, key: str, data: dict):
+        """Speichert Embed-Daten in der Config."""
+        embeds = await self.config.guild(interaction.guild).custom_embeds() or {}
+        # Falls schon vorhanden: message_id und channel_id beibehalten
+        if key in embeds:
+            data["message_id"] = embeds[key].get("message_id")
+            data["channel_id"] = embeds[key].get("channel_id")
+        embeds[key] = data
+        await self.config.guild(interaction.guild).custom_embeds.set(embeds)
+        # Bestätigung
+        try:
+            await interaction.followup.send(
+                f"✅ Embed `{key}` wurde gespeichert!\n"
+                f"Nutze `[p]embedbuilder send {key}` um es zu senden oder `[p]embedbuilder update {key}` um ein gesendetes Embed zu aktualisieren.",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
 
     # ============================================
     # TEAM-MANAGEMENT SYSTEM
@@ -8406,6 +8646,8 @@ class SupportCog(commands.Cog):
                 "closed_by": requester_member.display_name,
                 "reason": reason[:200],
             })
+            # Survey an Ersteller senden
+            await self._ticket_send_survey(guild, creator_user, str(ticket_num), category_name)
 
         # Channel löschen
         try:
@@ -8991,6 +9233,8 @@ class SupportCog(commands.Cog):
                 "closed_by": ctx.author.display_name,
                 "reason": reason[:200],
             })
+            # Survey an Ersteller senden
+            await self._ticket_send_survey(guild, creator_user, str(ticket_num), category_name)
 
         # Schließen-Nachricht
         try:
@@ -14579,35 +14823,263 @@ class TeamPollButton(discord.ui.Button):
         self.option_index = option_index
 
     async def callback(self, interaction: discord.Interaction):
+        try:
+            # IMMEDIATELY defer to prevent 3-second timeout
+            await interaction.response.defer()
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.followup.send("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            polls = await self.cog.config.guild(interaction.guild).team_polls() or {}
+            if self.poll_id not in polls:
+                await interaction.followup.send("❌ Diese Abstimmung existiert nicht mehr.", ephemeral=True)
+                return
+            poll = polls[self.poll_id]
+            if not poll.get("active", True):
+                await interaction.followup.send("❌ Diese Abstimmung ist bereits beendet.", ephemeral=True)
+                return
+            options = poll.get("options", [])
+            if self.option_index >= len(options):
+                await interaction.followup.send("❌ Ungültige Option.", ephemeral=True)
+                return
+            # Alte Stimme entfernen falls vorhanden
+            for opt in options:
+                if interaction.user.id in opt.get("votes", []):
+                    opt["votes"] = [v for v in opt.get("votes", []) if v != interaction.user.id]
+            # Neue Stimme hinzufügen
+            options[self.option_index]["votes"] = options[self.option_index].get("votes", []) + [interaction.user.id]
+            poll["options"] = options
+            polls[self.poll_id] = poll
+            await self.cog.config.guild(interaction.guild).team_polls.set(polls)
+            # Embed aktualisieren via edit_original_response
+            embed = await self.cog._team_build_poll_embed(poll, self.poll_id, interaction.guild)
+            try:
+                await interaction.edit_original_response(embed=embed)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+            await interaction.followup.send(f"✅ Deine Stimme für **{options[self.option_index].get('text', '?')}** wurde gezählt.", ephemeral=True)
+        except Exception as e:
+            log.exception("Fehler in TeamPollButton callback")
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
+
+class TicketSurveyView(discord.ui.View):
+    """View für die Ticket-Zufriedenheits-Survey mit 5 Bewertungs-Buttons."""
+
+    def __init__(self, cog, guild_id: int, user_id: str, ticket_num: str):
+        super().__init__(timeout=600)  # 10 Min Timeout
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.ticket_num = ticket_num
+
+    @discord.ui.button(label="1", style=discord.ButtonStyle.danger, emoji="⭐", custom_id="survey_1")
+    async def rating_1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_rating(interaction, 1)
+
+    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, emoji="⭐", custom_id="survey_2")
+    async def rating_2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_rating(interaction, 2)
+
+    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, emoji="⭐", custom_id="survey_3")
+    async def rating_3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_rating(interaction, 3)
+
+    @discord.ui.button(label="4", style=discord.ButtonStyle.primary, emoji="⭐", custom_id="survey_4")
+    async def rating_4(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_rating(interaction, 4)
+
+    @discord.ui.button(label="5", style=discord.ButtonStyle.success, emoji="⭐", custom_id="survey_5")
+    async def rating_5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_rating(interaction, 5)
+
+    async def _handle_rating(self, interaction: discord.Interaction, rating: int):
+        # Nur der ursprüngliche User darf bewerten
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("❌ Diese Survey ist nicht für dich.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        # Ergebnis speichern
+        try:
+            guild = self.cog.bot.get_guild(self.guild_id)
+            if guild is None:
+                return
+            results = await self.cog.config.guild(guild).ticket_survey_results() or {}
+            results[self.ticket_num] = {
+                "user_id": int(self.user_id),
+                "rating": rating,
+                "ts": _now_ts(),
+            }
+            await self.cog.config.guild(guild).ticket_survey_results.set(results)
+            # Ergebnis in Survey-Channel senden
+            survey_ch_id = await self.cog.config.guild(guild).ticket_survey_channel()
+            if survey_ch_id:
+                survey_ch = guild.get_channel(survey_ch_id)
+                if survey_ch:
+                    stars = "⭐" * rating + "⚫" * (5 - rating)
+                    result_embed = discord.Embed(
+                        title=f"📋 Survey-Ergebnis — Ticket #{self.ticket_num}",
+                        description=f"Bewertung: {stars} ({rating}/5)",
+                        color=discord.Color.gold() if rating >= 4 else (discord.Color.orange() if rating >= 3 else discord.Color.red()),
+                        timestamp=_now(),
+                    )
+                    result_embed.add_field(name="👤 Bewertet von", value=f"<@{self.user_id}>", inline=True)
+                    result_embed.add_field(name="📅 Am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+                    result_embed.set_footer(text=f"Ticket #{self.ticket_num} • {guild.name}")
+                    try:
+                        await survey_ch.send(embed=result_embed)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+        except Exception:
+            log.exception("Fehler beim Speichern der Survey-Antwort")
+        # Buttons entfernen und danke sagen
+        thank_embed = discord.Embed(
+            title="✅ Danke für dein Feedback!",
+            description=f"Du hast mit **{rating}/5 ⭐** bewertet.\nDein Feedback hilft uns den Support zu verbessern!",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        try:
+            await interaction.edit_original_response(embed=thank_embed, view=None)
+        except (discord.HTTPException, discord.NotFound):
+            pass
+
+
+class EmbedBuilderStartView(discord.ui.View):
+    """View mit Button um das Embed-Builder Modal zu öffnen."""
+
+    def __init__(self, cog, key: str, is_new: bool = True):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.key = key
+        self.is_new = is_new
+
+    @discord.ui.button(label="Embed bearbeiten" if not True else "Embed erstellen/bearbeiten", style=discord.ButtonStyle.primary, emoji="📝", custom_id="embed_builder_start")
+    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
             return
-        polls = await self.cog.config.guild(interaction.guild).team_polls() or {}
-        if self.poll_id not in polls:
-            await interaction.response.send_message("❌ Diese Abstimmung existiert nicht mehr.", ephemeral=True)
-            return
-        poll = polls[self.poll_id]
-        if not poll.get("active", True):
-            await interaction.response.send_message("❌ Diese Abstimmung ist bereits beendet.", ephemeral=True)
-            return
-        options = poll.get("options", [])
-        if self.option_index >= len(options):
-            await interaction.response.send_message("❌ Ungültige Option.", ephemeral=True)
-            return
-        # Prüfen ob User schon abgestimmt hat
-        for opt in options:
-            if interaction.user.id in opt.get("votes", []):
-                # Stimme ändern: vorherige entfernen
-                opt["votes"] = [v for v in opt.get("votes", []) if v != interaction.user.id]
-        # Neue Stimme hinzufügen
-        options[self.option_index]["votes"] = options[self.option_index].get("votes", []) + [interaction.user.id]
-        poll["options"] = options
-        polls[self.poll_id] = poll
-        await self.cog.config.guild(interaction.guild).team_polls.set(polls)
-        # Embed aktualisieren
-        embed = await self.cog._team_build_poll_embed(poll, self.poll_id, interaction.guild)
-        await interaction.response.edit_message(embed=embed)
-        await interaction.followup.send(f"✅ Deine Stimme für **{options[self.option_index].get('text', '?')}** wurde gezählt.", ephemeral=True)
+        # Aktuelle Embed-Daten laden (für Edit-Modus mit Prefill)
+        embeds = await self.cog.config.guild(interaction.guild).custom_embeds() or {}
+        existing = embeds.get(self.key, {})
+        modal = EmbedBuilderModal(self.cog, self.key, existing)
+        await interaction.response.send_modal(modal)
+
+
+class EmbedBuilderModal(discord.ui.Modal):
+    """Modal zum Erstellen/Bearbeiten eines Custom Embeds.
+    Beim Bearbeiten sind die aktuellen Werte vorausgefüllt."""
+
+    def __init__(self, cog, key: str, existing_data: dict = None):
+        title = f"📝 Embed: {key}" if existing_data else f"🆕 Neues Embed: {key}"
+        if len(title) > 45:
+            title = title[:45]
+        super().__init__(title=title, timeout=600)
+        self.cog = cog
+        self.key = key
+        self.existing_data = existing_data or {}
+        # Feld 1: Titel
+        self.title_input = discord.ui.TextInput(
+            label="Titel",
+            placeholder="Titel des Embeds...",
+            required=False,
+            max_length=256,
+            default=self.existing_data.get("title") or None,
+            custom_id="embed_title",
+        )
+        self.add_item(self.title_input)
+        # Feld 2: Beschreibung
+        self.description_input = discord.ui.TextInput(
+            label="Beschreibung (Haupttext)",
+            placeholder="Haupttext des Embeds...",
+            required=False,
+            max_length=1500,
+            style=discord.TextStyle.paragraph,
+            default=self.existing_data.get("description") or None,
+            custom_id="embed_description",
+        )
+        self.add_item(self.description_input)
+        # Feld 3: Farbe
+        self.color_input = discord.ui.TextInput(
+            label="Farbe (blurple, red, green, orange, purple, grey, random)",
+            placeholder="blurple",
+            required=False,
+            max_length=20,
+            default=self.existing_data.get("color") or None,
+            custom_id="embed_color",
+        )
+        self.add_item(self.color_input)
+        # Feld 4: Footer
+        self.footer_input = discord.ui.TextInput(
+            label="Footer-Text (optional)",
+            placeholder="Text unten im Embed...",
+            required=False,
+            max_length=500,
+            default=self.existing_data.get("footer") or None,
+            custom_id="embed_footer",
+        )
+        self.add_item(self.footer_input)
+        # Feld 5: Field 1 (Name|Value)
+        field1_default = None
+        if self.existing_data.get("field1_name") or self.existing_data.get("field1_value"):
+            field1_default = f"{self.existing_data.get('field1_name', '')}|{self.existing_data.get('field1_value', '')}"
+        self.field1_input = discord.ui.TextInput(
+            label="Field 1 (Name|Wert) — mit | trennen",
+            placeholder="z.B. Regel 1|Kein Spam",
+            required=False,
+            max_length=1200,
+            style=discord.TextStyle.paragraph,
+            default=field1_default,
+            custom_id="embed_field1",
+        )
+        self.add_item(self.field1_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        # Daten sammeln
+        data = {
+            "title": self.title_input.value.strip() if self.title_input.value else "",
+            "description": self.description_input.value.strip() if self.description_input.value else "",
+            "color": self.color_input.value.strip().lower() if self.color_input.value else "blurple",
+            "footer": self.footer_input.value.strip() if self.footer_input.value else "",
+        }
+        # Field 1 parsen (Format: Name|Wert)
+        if self.field1_input.value and self.field1_input.value.strip():
+            parts = self.field1_input.value.strip().split("|", 1)
+            if len(parts) == 2:
+                data["field1_name"] = parts[0].strip()[:256]
+                data["field1_value"] = parts[1].strip()[:1024]
+            else:
+                data["field1_name"] = "Info"
+                data["field1_value"] = parts[0].strip()[:1024]
+        # Vorhandene Field 2 & 3 beibehalten falls nicht im Modal bearbeitet
+        for i in [2, 3]:
+            if self.existing_data.get(f"field{i}_name"):
+                data[f"field{i}_name"] = self.existing_data[f"field{i}_name"]
+            if self.existing_data.get(f"field{i}_value"):
+                data[f"field{i}_value"] = self.existing_data[f"field{i}_value"]
+        # Vorhandene Image/Thumbnail beibehalten
+        if self.existing_data.get("image"):
+            data["image"] = self.existing_data["image"]
+        if self.existing_data.get("thumbnail"):
+            data["thumbnail"] = self.existing_data["thumbnail"]
+        # Speichern
+        await self.cog._embed_builder_save(interaction, self.key, data)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im EmbedBuilderModal", exc_info=error)
 
 
 async def setup(bot: Red):
