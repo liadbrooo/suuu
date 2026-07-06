@@ -4177,63 +4177,214 @@ class SupportCog(commands.Cog):
         
         await ctx.send(f"✅ Feedback-Panel wurde in {channel.mention} erstellt!")
 
+    def _get_discord_status_emoji(self, member: discord.Member) -> str:
+        """Gibt das Emoji für den Discord-Status eines Members zurück."""
+        status = str(member.status) if member.status else "offline"
+        status_map = {
+            "online": "🟢",
+            "idle": "🟡",
+            "dnd": "🔴",
+            "offline": "⚫",
+        }
+        return status_map.get(status, "⚫")
+
+    def _get_discord_status_text(self, member: discord.Member) -> str:
+        """Gibt den Text für den Discord-Status zurück."""
+        status = str(member.status) if member.status else "offline"
+        status_map = {
+            "online": "Online",
+            "idle": "Abwesend",
+            "dnd": "Nicht stören",
+            "offline": "Offline",
+        }
+        return status_map.get(status, "Offline")
+
     async def update_team_panel(self, channel: discord.TextChannel, guild: discord.Guild) -> bool:
         """Erstellt oder aktualisiert das Team-Übersichts-Panel.
 
+        Zeigt alle Teammitglieder nach Rollen-Hierarchie sortiert, mit Discord-Status,
+        Duty-Status und schöner Formatierung.
+
         Returns True on success, False on failure.
-        Shared between the `teampanel` command and `supportset createteampanel`.
         """
         role_id = await self.config.guild(guild).role()
-        # Read-only — never spawn a duty role as a side effect of a panel refresh.
         duty_role = await self.get_duty_role(guild)
+        wl_role_id = await self.config.guild(guild).whitelist_role()
 
-        team_members = []
-        on_duty_count = 0
-        off_duty_count = 0
-
+        # Sammle alle Teammitglieder aus Basis-Rolle + Whitelist-Rolle
+        all_team_members = set()
+        base_role = None
         if role_id:
             base_role = guild.get_role(role_id)
             if base_role:
-                # Single Config.all_members call instead of N per-member reads.
-                all_members = await self.config.all_members(guild)
-                for m in sorted(base_role.members, key=lambda x: x.display_name.lower()):
-                    is_duty = bool(all_members.get(m.id, {}).get("on_duty")) and (
-                        duty_role is None or m.get_role(duty_role.id) is not None
-                    )
-                    status_emoji = "🟢" if is_duty else "🔴"
-                    if is_duty:
-                        on_duty_count += 1
-                    else:
-                        off_duty_count += 1
-                    team_members.append(f"{status_emoji} {m.display_name}")
+                all_team_members.update(base_role.members)
+        wl_role = None
+        if wl_role_id:
+            wl_role = guild.get_role(wl_role_id)
+            if wl_role:
+                all_team_members.update(wl_role.members)
+
+        # Duty-Daten laden
+        all_members_data = await self.config.all_members(guild)
+        on_duty_count = 0
+        total_members = len(all_team_members)
+
+        # Mitglieder nach Rollen-Hierarchie gruppieren
+        # Wir sammeln alle Rollen die Teammitglieder haben und sortieren nach Position
+        role_groups = {}  # {role_id: [members]}
+        ungrouped = []  # Mitglieder ohne spezifische Team-Rolle
+
+        # Sammle alle relevanten Rollen (Support-Rolle, Whitelist-Rolle, + Admin/Mod Rollen)
+        relevant_roles = []
+        if base_role:
+            relevant_roles.append(base_role)
+        if wl_role:
+            relevant_roles.append(wl_role)
+        # Auch Rollen mit Manage Guild/Ban/Kick als Team-Rollen erkennen
+        for role in guild.roles:
+            if role.id in [r.id for r in relevant_roles]:
+                continue
+            if role.is_default() or role.is_bot_managed() or role.is_integration():
+                continue
+            perms = role.permissions
+            if perms.administrator or perms.manage_guild or perms.ban_members or perms.kick_members or perms.moderate_members:
+                if any(role in m.roles for m in all_team_members):
+                    relevant_roles.append(role)
+
+        # Sortiere relevante Rollen nach Hierarchie (höchste zuerst)
+        relevant_roles.sort(key=lambda r: r.position, reverse=True)
+
+        # Weise Mitglieder zu Rollen zu (jeder Member kommt nur in seine höchste Rolle)
+        assigned = set()
+        for role in relevant_roles:
+            role_members = []
+            for m in all_team_members:
+                if m.id in assigned:
+                    continue
+                if role in m.roles:
+                    role_members.append(m)
+                    assigned.add(m.id)
+            if role_members:
+                # Sortiere innerhalb der Rolle nach Display-Name, aber Online-Status zuerst
+                role_members.sort(key=lambda x: (
+                    0 if str(x.status) == "online" else (1 if str(x.status) == "idle" else (2 if str(x.status) == "dnd" else 3)),
+                    x.display_name.lower()
+                ))
+                role_groups[role.id] = (role, role_members)
+
+        # Unassigned Mitglieder
+        for m in all_team_members:
+            if m.id not in assigned:
+                ungrouped.append(m)
+        if ungrouped:
+            ungrouped.sort(key=lambda x: (
+                0 if str(x.status) == "online" else (1 if str(x.status) == "idle" else (2 if str(x.status) == "dnd" else 3)),
+                x.display_name.lower()
+            ))
+
+        # Embed bauen
+        online_count = sum(1 for m in all_team_members if str(m.status) == "online")
+        idle_count = sum(1 for m in all_team_members if str(m.status) == "idle")
+        dnd_count = sum(1 for m in all_team_members if str(m.status) == "dnd")
+        offline_count = sum(1 for m in all_team_members if str(m.status) == "offline")
+
+        # On-Duty zählen
+        for m in all_team_members:
+            is_duty = bool(all_members_data.get(m.id, {}).get("on_duty")) and (
+                duty_role is None or m.get_role(duty_role.id) is not None
+            )
+            if is_duty:
+                on_duty_count += 1
 
         embed = discord.Embed(
             title="👥 Team Übersicht",
-            description="**Unser Support-Team**\n\nHier siehst du alle Teammitglieder und deren aktuellen Status.",
+            description=(
+                f"**Unser Team** • {total_members} Mitglieder\n\n"
+                f"📊 **Status-Übersicht:**\n"
+                f"🟢 Online: **{online_count}** | 🟡 Abwesend: **{idle_count}** | 🔴 DND: **{dnd_count}** | ⚫ Offline: **{offline_count}**\n"
+                f"🟢 Im Dienst: **{on_duty_count}** | 🔴 Nicht im Dienst: **{total_members - on_duty_count}**"
+            ),
             color=discord.Color.blue(),
             timestamp=_now(),
         )
 
-        if team_members:
-            embed.add_field(name=f"🟢 Im Dienst ({on_duty_count})", value=f"Insgesamt {len(team_members)} Teammitglieder", inline=False)
-            members_text = "\n".join(team_members[:20])
-            if len(team_members) > 20:
-                members_text += f"\n...und {len(team_members) - 20} weitere"
-            embed.add_field(name="📋 Teammitglieder", value=members_text, inline=False)
-        else:
-            embed.add_field(name="Keine Teammitglieder", value="Es wurden noch keine Teammitglieder mit der Support-Basisrolle ausgestattet.", inline=False)
+        # Mitglieder nach Rollen gruppieren und als Fields hinzufügen
+        field_count = 0
+        max_fields = 25  # Discord Embed Limit
 
-        embed.set_footer(text=f"On Duty: {on_duty_count} | Off Duty: {off_duty_count}")
+        for role_id, (role, members) in role_groups.items():
+            if field_count >= max_fields:
+                break
+            if not members:
+                continue
+            # Mitglieder-Liste bauen
+            member_lines = []
+            for m in members:
+                status_emoji = self._get_discord_status_emoji(m)
+                # Duty-Status
+                is_duty = bool(all_members_data.get(m.id, {}).get("on_duty")) and (
+                    duty_role is None or m.get_role(duty_role.id) is not None
+                )
+                duty_label = " • 🟢 Im Dienst" if is_duty else ""
+                # Custom Status (falls vorhanden)
+                custom_status = ""
+                if hasattr(m, "activities") and m.activities:
+                    for activity in m.activities:
+                        if isinstance(activity, discord.CustomActivity):
+                            custom_status = f" • *{activity.name[:50]}*" if activity.name else ""
+                            break
+                member_lines.append(f"{status_emoji} **{m.display_name}**{duty_label}{custom_status}")
+                if len(member_lines) >= 20:  # Max 20 pro Field
+                    if len(members) > 20:
+                        member_lines.append(f"... und {len(members) - 20} weitere")
+                    break
+            embed.add_field(
+                name=f"━━━ {role.name} ({len(members)}) ━━━",
+                value="\n".join(member_lines),
+                inline=False,
+            )
+            field_count += 1
 
+        # Unassigned Mitglieder
+        if ungrouped and field_count < max_fields:
+            member_lines = []
+            for m in ungrouped:
+                status_emoji = self._get_discord_status_emoji(m)
+                is_duty = bool(all_members_data.get(m.id, {}).get("on_duty")) and (
+                    duty_role is None or m.get_role(duty_role.id) is not None
+                )
+                duty_label = " • 🟢 Im Dienst" if is_duty else ""
+                custom_status = ""
+                if hasattr(m, "activities") and m.activities:
+                    for activity in m.activities:
+                        if isinstance(activity, discord.CustomActivity):
+                            custom_status = f" • *{activity.name[:50]}*" if activity.name else ""
+                            break
+                member_lines.append(f"{status_emoji} **{m.display_name}**{duty_label}{custom_status}")
+                if len(member_lines) >= 20:
+                    if len(ungrouped) > 20:
+                        member_lines.append(f"... und {len(ungrouped) - 20} weitere")
+                    break
+            embed.add_field(
+                name=f"━━━ Weitere Teammitglieder ({len(ungrouped)}) ━━━",
+                value="\n".join(member_lines),
+                inline=False,
+            )
+
+        if total_members == 0:
+            embed.add_field(name="❌ Keine Teammitglieder", value="Es wurden keine Teammitglieder gefunden. Konfiguriere eine Support-Rolle mit `[p]supportset role`.", inline=False)
+
+        # Legende im Footer
+        embed.set_footer(text=f"🟢 Online 🟡 Abwesend 🔴 DND ⚫ Offline • Im Dienst: {on_duty_count}/{total_members} • {_fmt_berlin_full(_now())} (MEZ/MESZ)")
+
+        # Nachricht aktualisieren oder neu erstellen
         team_panel_message_id = await self.config.guild(guild).team_panel_message_id()
-
         if team_panel_message_id:
             try:
                 message = await channel.fetch_message(team_panel_message_id)
                 await message.edit(embed=embed)
                 return True
             except discord.NotFound:
-                # Stale ID — clear and create new below.
                 await self.config.guild(guild).team_panel_message_id.set(None)
             except discord.Forbidden:
                 log.warning("Fehlende Rechte beim Editieren des Team-Panels (Guild %s)", guild.id)
