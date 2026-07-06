@@ -1,6 +1,7 @@
 """
 Support & Whitelist Warteraum Cog für RedBot mit On-Duty System & Button-Interface
 Verbesserte Version mit getrennten Panel/Log Channels und besserer UX
+Version: 2.1 (BanSync + Anti-Nuke + Auto-Role-Sync + Setup-Wizard)
 
 Dieser Cog erkennt, wenn ein Nutzer einen Support-Warteraum oder Whitelist-Warteraum betritt oder verlässt
 und sendet eine Nachricht in einem konfigurierten Text-Channel.
