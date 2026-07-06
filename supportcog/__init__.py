@@ -648,16 +648,20 @@ class SupportCog(commands.Cog):
         return await self.get_whitelist_log_channel(guild)
 
     async def get_whitelist_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        """Holt den Log-Channel für Whitelist-Duty-Logs (An-/Abmeldungen)"""
+        """Holt den Log-Channel für Whitelist-Duty-Logs (An-/Abmeldungen).
+
+        PRIMARY resolver for the whitelist domain. Must NOT fall back to
+        get_whitelist_channel — that creates an infinite recursion cycle when
+        neither channel is configured. Callers must handle None.
+        """
         log_channel_id = await self.config.guild(guild).whitelist_log_channel()
-        
+
         if log_channel_id:
             channel = guild.get_channel(log_channel_id)
             if channel and isinstance(channel, discord.TextChannel):
                 return channel
-        
-        # Kein separater Log-Channel gesetzt - Logs landen im Whitelist-Channel
-        return await self.get_whitelist_channel(guild)
+
+        return None
 
     async def get_whitelist_entries_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """Holt den Channel für Whitelist-Einträge (Hinzufügungen/Entfernungen von Spielern)"""
@@ -832,16 +836,21 @@ class SupportCog(commands.Cog):
         return await self.get_log_channel(guild)
 
     async def get_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        """Holt den Log-Channel NUR für Duty-Logs (An/Abmeldungen)"""
+        """Holt den Log-Channel NUR für Duty-Logs (An/Abmeldungen).
+
+        This is the PRIMARY channel resolver for the support domain.
+        It must NOT fall back to get_support_channel — that would create an
+        infinite recursion cycle (support_channel <-> log_channel) when neither
+        is configured. Returning None here is correct; callers must handle it.
+        """
         log_channel_id = await self.config.guild(guild).log_channel()
-        
+
         if log_channel_id:
             channel = guild.get_channel(log_channel_id)
             if channel and isinstance(channel, discord.TextChannel):
                 return channel
-        
-        # Kein separater Log-Channel gesetzt - Logs landen im Support-Channel
-        return await self.get_support_channel(guild)
+
+        return None
 
     async def get_panel_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """Holt den Panel-Channel für das Duty-Interface (Feedback/Call Panels)"""
@@ -1132,7 +1141,7 @@ class SupportCog(commands.Cog):
                 else:
                     embed.add_field(
                         name="🔴 Keine Supporter verfügbar",
-                        value=f"Niemand ist gerade im Dienst!\n*Benutze `[p]supportset panelchannel` und klicke auf 'Duty Starten'*",
+                        value="Niemand ist gerade im Dienst!\n*Benutze `[p]supportset panelchannel` und klicke auf 'Duty Starten'*",
                         inline=True
                     )
                 embed.add_field(name="📍 Channel", value=channel.mention, inline=True)
@@ -3108,7 +3117,7 @@ class SupportCog(commands.Cog):
                     inline=False
                 )
             
-            embed.set_footer(text=f"Verwende [p]wldelnote @User <Nummer> zum Löschen oder 'all' für alle")
+            embed.set_footer(text="Verwende [p]wldelnote @User <Nummer> zum Löschen oder 'all' für alle")
             await ctx.send(embed=embed)
             return
         
@@ -3845,6 +3854,7 @@ class SupportCog(commands.Cog):
         await ctx.send(embed=embed)
 
     @commands.command(name="feedbackpanel", aliases=["feedbackcreate", "createfeedback"])
+    @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def feedbackpanel(self, ctx: commands.Context):
         """
@@ -3852,10 +3862,18 @@ class SupportCog(commands.Cog):
         """
         guild = ctx.guild
         channel = await self.get_feedback_panel_channel(guild)
-        
+
+        # If no feedback panel channel is configured (and no fallbacks), use current channel.
+        # Mirrors supportset createfeedbackpanel which falls back to ctx.channel.
         if not channel:
-            await ctx.send("❌ Kein Feedback-Channel konfiguriert!")
-            return
+            if not isinstance(ctx.channel, discord.TextChannel):
+                await ctx.send("❌ Kein Feedback-Channel konfiguriert und aktueller Channel ist kein Text-Channel!")
+                return
+            channel = ctx.channel
+            await ctx.send(
+                "ℹ️ Kein Feedback-Panel-Channel konfiguriert — verwende aktuellen Channel. "
+                "Setze einen permanenten Channel mit `[p]supportset feedbackpanelchannel`."
+            )
         
         embed = discord.Embed(
             title="💬 Feedback Panel",
@@ -3951,6 +3969,7 @@ class SupportCog(commands.Cog):
         return True
 
     @commands.command(name="teampanel", aliases=["teamupdate", "updateteam"])
+    @commands.guild_only()
     async def teampanel(self, ctx: commands.Context):
         """
         Aktualisiert oder erstellt das Team-Übersichts-Panel.
@@ -3959,9 +3978,17 @@ class SupportCog(commands.Cog):
         guild = ctx.guild
         channel = await self.get_team_channel(guild)
 
+        # If no team channel is configured (and no panel/log channel as fallback),
+        # use the channel the command was invoked in. Mirrors supportset createteampanel.
         if not channel:
-            await ctx.send("❌ Kein Team-Channel konfiguriert!")
-            return
+            if not isinstance(ctx.channel, discord.TextChannel):
+                await ctx.send("❌ Kein Team-Channel konfiguriert und aktueller Channel ist kein Text-Channel!")
+                return
+            channel = ctx.channel
+            await ctx.send(
+                "ℹ️ Kein Team-Channel konfiguriert — verwende aktuellen Channel. "
+                "Setze einen permanenten Channel mit `[p]supportset teamchannel`."
+            )
 
         ok = await self.update_team_panel(channel, guild)
         if ok:
