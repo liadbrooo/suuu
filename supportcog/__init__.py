@@ -6656,94 +6656,178 @@ class SupportCog(commands.Cog):
     @syncset.command(name="syncnow")
     async def syncset_syncnow(self, ctx: commands.Context):
         """Synchronisiert ALLE bestehenden Banns der aktuellen Guild auf alle anderen (einmalig)."""
-        if not await self._sync_should_propagate_from(ctx.guild):
-            await ctx.send("❌ Sync ist nicht aktiviert oder diese Guild darf nicht propagieren.")
-            return
-        if not await self.config.guild(ctx.guild).sync_bans():
-            await ctx.send("❌ Ban-Sync ist deaktiviert. Aktiviere mit `[p]syncset bans True`.")
-            return
-        await ctx.send("⏳ Synchronisiere bestehende Banns... das kann einen Moment dauern.")
-        # Bans abrufen — kompatibel mit discord.py 1.x und 2.x
+        # ALLES in try/except — jeder Fehler wird direkt im Discord angezeigt
         try:
+            if not await self._sync_should_propagate_from(ctx.guild):
+                await ctx.send("❌ Sync ist nicht aktiviert oder diese Guild darf nicht propagieren.")
+                return
+            if not await self.config.guild(ctx.guild).sync_bans():
+                await ctx.send("❌ Ban-Sync ist deaktiviert. Aktiviere mit `[p]syncset bans True`.")
+                return
+            await ctx.send("⏳ Synchronisiere bestehende Banns... das kann einen Moment dauern.")
+
+            # ===== STEP 1: Bans abrufen (ultra-defensiv, alle discord.py-Versionen) =====
+            bans_list = []
             try:
-                bans = await ctx.guild.bans(limit=None)
-            except TypeError:
-                # Alte discord.py-Version ohne limit-Parameter
-                bans = await ctx.guild.bans()
-        except discord.Forbidden:
-            await ctx.send("❌ Fehlende Rechte um Bans abzufragen (Brauche `Ban Members` Berechtigung).")
-            return
-        except discord.HTTPException as e:
-            await ctx.send(f"❌ Konnte Bans nicht abrufen: `{e}`")
-            return
-        # Falls bans ein AsyncIterator ist (manche discord.py-Versionen), in Liste konvertieren
-        import inspect
-        if inspect.isasyncgen(bans):
-            bans = [b async for b in bans]
-        if not bans:
-            await ctx.send("ℹ️ Keine bestehenden Banns auf dieser Guild gefunden.")
-            return
-        # Ziel-Guilds einmalig abrufen (statt pro Ban)
-        targets = await self._sync_target_guilds(ctx.guild)
-        if not targets:
-            await ctx.send("ℹ️ Keine Sync-Targets verfügbar. Stelle sicher dass Sync auf anderen Guilds aktiviert ist.")
-            return
-        total = len(bans)
-        success_count = 0
-        fail_count = 0
-        per_guild_success = {}
-        per_guild_fail = {}
-        for i, ban_entry in enumerate(bans, 1):
-            user = ban_entry.user
-            reason = ban_entry.reason or "Bestehender Ban (SyncNow)"
-            for g in targets:
-                key = self._sync_action_key("ban", user.id, ctx.guild.id)
-                await self._sync_mark_recent(g, key)
-                try:
-                    # Prüfen ob schon gebannt
+                # Variante A: discord.py 1.x — guild.bans() ist eine Coroutine die eine List[BanEntry] zurückgibt
+                # Variante B: discord.py 2.x — guild.bans(limit=...) gibt einen AsyncIterator zurück, muss iteriert werden
+                bans_obj = ctx.guild.bans()
+                # Prüfen ob es awaitable ist
+                import inspect
+                if inspect.isawaitable(bans_obj):
+                    # discord.py 1.x: await coroutine → list
                     try:
-                        existing = await g.fetch_ban(user)
-                        if existing:
+                        bans_list = await bans_obj
+                    except TypeError:
+                        # Manche 2.x Versionen: await gibt async iterator zurück
+                        bans_list = [b async for b in (await bans_obj)]
+                elif inspect.isasyncgen(bans_obj):
+                    # discord.py 2.x ohne await direkt async iterator
+                    bans_list = [b async for b in bans_obj]
+                else:
+                    # Fallback: vielleicht schon eine Liste
+                    bans_list = list(bans_obj)
+            except discord.Forbidden:
+                await ctx.send("❌ Fehlende Rechte um Bans abzufragen (Brauche `Ban Members` Berechtigung).")
+                return
+            except Exception as e:
+                # Letzter Versuch: ohne Argumente
+                try:
+                    raw = ctx.guild.bans()
+                    import inspect as _i
+                    if _i.isawaitable(raw):
+                        bans_list = await raw
+                    elif _i.isasyncgen(raw):
+                        bans_list = [b async for b in raw]
+                    else:
+                        bans_list = list(raw)
+                except Exception as e2:
+                    await ctx.send(f"❌ Konnte Bans nicht abrufen.\nFehler 1: `{type(e).__name__}: {e}`\nFehler 2: `{type(e2).__name__}: {e2}`")
+                    return
+
+            if not bans_list:
+                await ctx.send("ℹ️ Keine bestehenden Banns auf dieser Guild gefunden.")
+                return
+
+            # ===== STEP 2: Ziel-Guilds abrufen =====
+            try:
+                targets = await self._sync_target_guilds(ctx.guild)
+            except Exception as e:
+                await ctx.send(f"❌ Konnte Sync-Targets nicht abrufen: `{type(e).__name__}: {e}`")
+                return
+            if not targets:
+                await ctx.send("ℹ️ Keine Sync-Targets verfügbar. Stelle sicher dass Sync auf anderen Guilds aktiviert ist (`[p]syncset toggle` dort ausführen).")
+                return
+
+            total = len(bans_list)
+            await ctx.send(f"📋 {total} Banns gefunden. Synchronisiere zu {len(targets)} Guild(s)...")
+
+            # ===== STEP 3: Banns synchronisieren =====
+            success_count = 0
+            per_guild_success = {}
+            per_guild_fail = {}
+            per_guild_fail_reasons = {}
+
+            for i, ban_entry in enumerate(bans_list, 1):
+                try:
+                    # ban_entry könnte BanEntry sein oder User
+                    user = getattr(ban_entry, "user", ban_entry)
+                    reason = getattr(ban_entry, "reason", None) or "Bestehender Ban (SyncNow)"
+                    user_id = getattr(user, "id", None)
+                    if user_id is None:
+                        per_guild_fail["unknown"] = per_guild_fail.get("unknown", 0) + 1
+                        continue
+                except Exception:
+                    per_guild_fail["unknown"] = per_guild_fail.get("unknown", 0) + 1
+                    continue
+
+                for g in targets:
+                    try:
+                        key = self._sync_action_key("ban", user_id, ctx.guild.id)
+                        await self._sync_mark_recent(g, key)
+                    except Exception:
+                        pass  # nicht kritisch
+                    try:
+                        # Prüfen ob schon gebannt
+                        already_banned = False
+                        try:
+                            existing = await g.fetch_ban(user)
+                            if existing:
+                                already_banned = True
+                        except discord.NotFound:
+                            pass
+                        except AttributeError:
+                            # Alte discord.py ohne fetch_ban → überspringen
+                            pass
+                        except Exception:
+                            pass
+                        if already_banned:
                             per_guild_success[g.name] = per_guild_success.get(g.name, 0) + 1
                             continue
-                    except discord.NotFound:
-                        pass
-                    except AttributeError:
-                        # Alte discord.py ohne fetch_ban → direkt versuchen zu bannen
-                        pass
+                        # Bannen
+                        try:
+                            await g.ban(user, reason=f"[BanSync von {ctx.guild.name}] {reason}", delete_message_seconds=86400)
+                        except TypeError:
+                            # Alte discord.py ohne delete_message_seconds
+                            await g.ban(user, reason=f"[BanSync von {ctx.guild.name}] {reason}")
+                        per_guild_success[g.name] = per_guild_success.get(g.name, 0) + 1
+                    except discord.Forbidden:
+                        per_guild_fail[g.name] = per_guild_fail.get(g.name, 0) + 1
+                        per_guild_fail_reasons.setdefault(g.name, "Fehlende Rechte")
+                    except discord.HTTPException as e:
+                        per_guild_fail[g.name] = per_guild_fail.get(g.name, 0) + 1
+                        per_guild_fail_reasons.setdefault(g.name, f"HTTP: {e}")
+                    except Exception as e:
+                        per_guild_fail[g.name] = per_guild_fail.get(g.name, 0) + 1
+                        per_guild_fail_reasons.setdefault(g.name, f"{type(e).__name__}: {e}")
+                success_count += 1
+                # Fortschrittsmeldung alle 25 Banns
+                if i % 25 == 0 and i < total:
                     try:
-                        await g.ban(user, reason=f"[BanSync von {ctx.guild.name}] {reason}", delete_message_seconds=86400)
-                    except TypeError:
-                        await g.ban(user, reason=f"[BanSync von {ctx.guild.name}] {reason}")
-                    per_guild_success[g.name] = per_guild_success.get(g.name, 0) + 1
-                except discord.Forbidden:
-                    per_guild_fail[g.name] = per_guild_fail.get(g.name, 0) + 1
-                except discord.HTTPException:
-                    per_guild_fail[g.name] = per_guild_fail.get(g.name, 0) + 1
-            success_count += 1
-            # Fortschrittsmeldung alle 25 Banns
-            if i % 25 == 0 and i < total:
+                        await ctx.send(f"⏳ Fortschritt: {i}/{total} Banns verarbeitet...")
+                    except Exception:
+                        pass
+
+            # ===== STEP 4: Zusammenfassung =====
+            try:
+                embed = discord.Embed(
+                    title="🔄 SyncNow abgeschlossen",
+                    description=f"**{success_count}** Banns von `{ctx.guild.name}` synchronisiert zu **{len(targets)}** Guild(s).",
+                    color=discord.Color.green(),
+                    timestamp=_now(),
+                )
+                if per_guild_success:
+                    success_lines = [f"• `{g}`: {c} Banns" for g, c in sorted(per_guild_success.items())]
+                    embed.add_field(name="✅ Erfolgreich", value="\n".join(success_lines[:15]) or "Keine", inline=False)
+                if per_guild_fail:
+                    fail_lines = [f"• `{g}`: {c} ({per_guild_fail_reasons.get(g, '?')})" for g, c in sorted(per_guild_fail.items())]
+                    embed.add_field(name="❌ Fehlgeschlagen", value="\n".join(fail_lines[:15]) or "Keine", inline=False)
+                embed.set_footer(text=f"SyncNow • {ctx.guild.name} • {total} Banns gesamt")
+                await ctx.send(embed=embed)
+                # Auch ins Sync-Log
                 try:
-                    await ctx.send(f"⏳ Fortschritt: {i}/{total} Banns verarbeitet...")
-                except discord.HTTPException:
+                    await self._sync_log(ctx.guild, f"🔄 SyncNow: {success_count} Banns synchronisiert", embed=embed)
+                except Exception:
                     pass
-        # Zusammenfassungs-Embed (eine Log-Nachricht statt pro Ban)
-        embed = discord.Embed(
-            title="🔄 SyncNow abgeschlossen",
-            description=f"**{success_count}** Banns von `{ctx.guild.name}` synchronisiert zu **{len(targets)}** Guild(s).",
-            color=discord.Color.green(),
-            timestamp=_now(),
-        )
-        if per_guild_success:
-            success_lines = [f"• `{g}`: {c} Banns" for g, c in sorted(per_guild_success.items())]
-            embed.add_field(name=f"✅ Erfolgreich", value="\n".join(success_lines[:15]), inline=False)
-        if per_guild_fail:
-            fail_lines = [f"• `{g}`: {c} Fehler" for g, c in sorted(per_guild_fail.items())]
-            embed.add_field(name=f"❌ Fehlgeschlagen", value="\n".join(fail_lines[:15]), inline=False)
-        embed.set_footer(text=f"SyncNow • {ctx.guild.name} • {total} Banns gesamt")
-        await ctx.send(embed=embed)
-        # Auch ins Sync-Log
-        await self._sync_log(ctx.guild, f"🔄 SyncNow: {success_count} Banns synchronisiert", embed=embed)
+            except Exception as e:
+                # Fallback wenn Embed-Erstellung scheitert
+                await ctx.send(f"✅ SyncNow fertig: {success_count} Banns synchronisiert. (Embed-Fehler: `{e}`)")
+        except Exception as e:
+            # LETZTER FALL: komplett unbekannter Fehler → direkt im Discord anzeigen
+            import traceback
+            tb = traceback.format_exception(type(e), e, e.__traceback__)
+            tb_str = "".join(tb)
+            # Auf 1900 Zeichen begrenzen
+            if len(tb_str) > 1900:
+                tb_str = tb_str[-1900:]
+            try:
+                await ctx.send(f"❌ **Unerwarteter Fehler in syncnow:**\n```\n{type(e).__name__}: {e}\n```\nTraceback:\n```py\n{tb_str}\n```")
+            except Exception:
+                # Wenn selbst das nicht geht
+                try:
+                    await ctx.send(f"❌ Fehler: `{type(e).__name__}: {e}`")
+                except Exception:
+                    pass
 
     @syncset.command(name="test")
     async def syncset_test(self, ctx: commands.Context):
