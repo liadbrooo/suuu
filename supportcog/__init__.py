@@ -14390,13 +14390,23 @@ class TeamApplicationStartView(discord.ui.View):
         super().__init__(timeout=300)
         self.cog = cog
 
-    @discord.ui.button(label="Bewerbung einreichen", style=discord.ButtonStyle.success, emoji="📋", custom_id="team_app_start")
+    @discord.ui.button(label="Bewerbung einreichen", style=discord.ButtonStyle.success, emoji="📋")
     async def start_app(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
-            return
-        modal = TeamApplicationModal(self.cog, interaction.user)
-        await interaction.response.send_modal(modal)
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            modal = TeamApplicationModal(self.cog, interaction.user)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            log.exception("Fehler beim Öffnen des Bewerbungs-Modals")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
 
 
 class TeamApplicationModal(discord.ui.Modal):
@@ -14973,20 +14983,34 @@ class EmbedBuilderStartView(discord.ui.View):
         self.key = key
         self.is_new = is_new
 
-    @discord.ui.button(label="Embed erstellen/bearbeiten", style=discord.ButtonStyle.primary, emoji="📝", custom_id="embed_builder_open")
+    @discord.ui.button(label="Embed erstellen/bearbeiten", style=discord.ButtonStyle.primary, emoji="📝")
     async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
-            return
-        # Permission check
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
-            return
-        # Aktuelle Embed-Daten laden (für Edit-Modus mit Prefill)
-        embeds = await self.cog.config.guild(interaction.guild).custom_embeds() or {}
-        existing = embeds.get(self.key, {})
-        modal = EmbedBuilderModal(self.cog, self.key, existing)
-        await interaction.response.send_modal(modal)
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            # Permission check
+            if not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+                return
+            # Config-Daten laden (schnell, aber abgesichert)
+            try:
+                embeds = await self.cog.config.guild(interaction.guild).custom_embeds() or {}
+                existing = embeds.get(self.key, {})
+            except Exception:
+                existing = {}
+            # Modal erstellen und senden
+            modal = EmbedBuilderModal(self.cog, self.key, existing)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            log.exception("Fehler beim Öffnen des Embed-Builder Modals")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler beim Öffnen: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ Fehler beim Öffnen: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
 
 
 class EmbedBuilderModal(discord.ui.Modal):
