@@ -6224,14 +6224,36 @@ class SupportCog(commands.Cog):
         if key in embeds:
             await ctx.send(f"❌ Embed `{key}` existiert bereits. Nutze `[p]embedbuilder edit {key}` zum Bearbeiten.")
             return
-        # Modal öffnen (leere Werte)
         embed = discord.Embed(
             title="🛠️ Embed Builder",
             description=f"Klicke auf den Button um das Embed `{key}` zu erstellen.",
             color=discord.Color.blurple(),
             timestamp=_now(),
         )
-        view = EmbedBuilderStartView(self, key, is_new=True)
+        view = EmbedBuilderStartView(self, key)
+        await ctx.send(embed=embed, view=view)
+
+    @embed_builder.command(name="createsend", aliases=["csend", "makeandsend"])
+    async def embed_builder_createsend(self, ctx: commands.Context, key: str, channel: discord.TextChannel = None):
+        """Erstellt ein Embed und sendet es sofort in einen Channel.
+        Beispiel: `[p]embedbuilder createsend regeln #regeln`"""
+        key = key.lower().strip()
+        if len(key) > 30 or not key.replace("_", "").isalnum():
+            await ctx.send("❌ Key muss alphanumerisch sein (max 30 Zeichen, _ erlaubt).")
+            return
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if key in embeds:
+            await ctx.send(f"❌ Embed `{key}` existiert bereits. Nutze `[p]embedbuilder editupdate {key}`.")
+            return
+        if channel is None:
+            channel = ctx.channel
+        embed = discord.Embed(
+            title="🛠️ Embed Builder (Create + Send)",
+            description=f"Klicke auf den Button um das Embed `{key}` zu erstellen und in {channel.mention} zu senden.",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        view = EmbedBuilderStartView(self, key, send_channel=channel)
         await ctx.send(embed=embed, view=view)
 
     @embed_builder.command(name="edit", aliases=["modify", "change"])
@@ -6243,20 +6265,40 @@ class SupportCog(commands.Cog):
         if key not in embeds:
             await ctx.send(f"❌ Embed `{key}` existiert nicht. Nutze `[p]embedbuilder create {key}` zum Erstellen.")
             return
-        # Modal öffnen (mit aktuellen Werten)
         embed = discord.Embed(
             title="✏️ Embed Editor",
             description=f"Klicke auf den Button um das Embed `{key}` zu bearbeiten.",
             color=discord.Color.orange(),
             timestamp=_now(),
         )
-        view = EmbedBuilderStartView(self, key, is_new=False)
+        view = EmbedBuilderStartView(self, key)
+        await ctx.send(embed=embed, view=view)
+
+    @embed_builder.command(name="editupdate", aliases=["eupdate", "editandsend"])
+    async def embed_builder_editupdate(self, ctx: commands.Context, key: str, channel: discord.TextChannel = None):
+        """Bearbeitet ein Embed und aktualisiert es sofort (oder sendet neu).
+        Beispiel: `[p]embedbuilder editupdate regeln` (aktualisiert bestehendes)
+        Beispiel: `[p]embedbuilder editupdate regeln #neuerchannel` (sendet neu in Channel)"""
+        key = key.lower().strip()
+        embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+        if key not in embeds:
+            await ctx.send(f"❌ Embed `{key}` existiert nicht. Nutze `[p]embedbuilder create {key}`.")
+            return
+        desc_text = f"Klicke auf den Button um das Embed `{key}` zu bearbeiten und zu aktualisieren."
+        if channel:
+            desc_text += f"\nGesendet wird in {channel.mention}."
+        embed = discord.Embed(
+            title="✏️ Embed Editor (Edit + Update)",
+            description=desc_text,
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        view = EmbedBuilderStartView(self, key, send_channel=channel, force_send=True)
         await ctx.send(embed=embed, view=view)
 
     @embed_builder.command(name="send", aliases=["post", "publish"])
     async def embed_builder_send(self, ctx: commands.Context, key: str, channel: discord.TextChannel = None):
-        """Sendet ein Custom Embed in einen Channel.
-        Beispiel: `[p]embedbuilder send regeln #regeln`"""
+        """Sendet ein Custom Embed in einen Channel."""
         key = key.lower().strip()
         embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
         if key not in embeds:
@@ -6265,10 +6307,9 @@ class SupportCog(commands.Cog):
         if channel is None:
             channel = ctx.channel
         embed_data = embeds[key]
-        embed = self._build_custom_embed(embed_data)
+        embed_obj = self._build_custom_embed(embed_data)
         try:
-            message = await channel.send(embed=embed)
-            # Message-ID speichern für spätere Aktualisierung
+            message = await channel.send(embed=embed_obj)
             embeds[key]["message_id"] = message.id
             embeds[key]["channel_id"] = channel.id
             await self.config.guild(ctx.guild).custom_embeds.set(embeds)
@@ -6278,8 +6319,7 @@ class SupportCog(commands.Cog):
 
     @embed_builder.command(name="update", aliases=["refresh"])
     async def embed_builder_update(self, ctx: commands.Context, key: str):
-        """Aktualisiert ein bereits gesendetes Embed (nach Bearbeitung).
-        Beispiel: `[p]embedbuilder update regeln`"""
+        """Aktualisiert ein bereits gesendetes Embed."""
         key = key.lower().strip()
         embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
         if key not in embeds:
@@ -6297,11 +6337,11 @@ class SupportCog(commands.Cog):
             return
         try:
             message = await channel.fetch_message(message_id)
-            embed = self._build_custom_embed(embed_data)
-            await message.edit(embed=embed)
+            embed_obj = self._build_custom_embed(embed_data)
+            await message.edit(embed=embed_obj)
             await ctx.send(f"✅ Embed `{key}` aktualisiert: {message.jump_url}")
         except discord.NotFound:
-            await ctx.send("❌ Embed-Nachricht existiert nicht mehr. Nutze `[p]embedbuilder send` zum neu senden.")
+            await ctx.send("❌ Embed-Nachricht existiert nicht mehr.")
         except (discord.Forbidden, discord.HTTPException) as e:
             await ctx.send(f"❌ Konnte Embed nicht aktualisieren: `{e}`")
 
@@ -6317,10 +6357,10 @@ class SupportCog(commands.Cog):
             color=discord.Color.blurple(),
             timestamp=_now(),
         )
-        for key, data in embeds.items():
-            title = data.get("title", "Kein Titel")[:50]
+        for k, data in embeds.items():
+            t = data.get("title", "Kein Titel")[:50]
             sent = "✅ Gesendet" if data.get("message_id") else "❌ Nicht gesendet"
-            embed.add_field(name=f"📝 `{key}`", value=f"Titel: {title}\nStatus: {sent}", inline=False)
+            embed.add_field(name=f"📝 `{k}`", value=f"Titel: {t}\nStatus: {sent}", inline=False)
         embed.set_footer(text=f"{len(embeds)} Embed(s) gesamt")
         await ctx.send(embed=embed)
 
@@ -6357,11 +6397,13 @@ class SupportCog(commands.Cog):
         if key not in embeds:
             await ctx.send(f"❌ Embed `{key}` existiert nicht.")
             return
-        embed = self._build_custom_embed(embeds[key])
-        await ctx.send(embed=embed)
+        embed_obj = self._build_custom_embed(embeds[key])
+        await ctx.send(embed=embed_obj)
 
     def _build_custom_embed(self, data: dict) -> discord.Embed:
         """Baut ein Discord Embed aus den gespeicherten Daten."""
+        # Farbe: Name oder Hex-Code
+        color_name = data.get("color", "blurple").strip().lower()
         color_map = {
             "blurple": discord.Color.blurple(),
             "red": discord.Color.red(),
@@ -6375,8 +6417,14 @@ class SupportCog(commands.Cog):
             "dark_red": discord.Color.dark_red(),
             "random": discord.Color.random(),
         }
-        color_name = data.get("color", "blurple")
-        color = color_map.get(color_name, discord.Color.blurple())
+        if color_name.startswith("#") or (len(color_name) == 6 and all(c in "0123456789abcdef" for c in color_name)):
+            # Hex-Code
+            try:
+                color = discord.Color(int(color_name.lstrip("#"), 16))
+            except (ValueError, TypeError):
+                color = discord.Color.blurple()
+        else:
+            color = color_map.get(color_name, discord.Color.blurple())
         title = data.get("title") or ""
         description = data.get("description") or ""
         embed = discord.Embed(
@@ -6385,44 +6433,75 @@ class SupportCog(commands.Cog):
             color=color,
             timestamp=_now(),
         )
-        # Fields
-        for i in range(1, 4):  # Max 3 Fields
+        for i in range(1, 4):
             fname = data.get(f"field{i}_name")
             fvalue = data.get(f"field{i}_value")
             if fname and fvalue:
                 embed.add_field(name=fname[:256], value=fvalue[:1024], inline=False)
-        # Footer
         footer = data.get("footer")
         if footer:
             embed.set_footer(text=footer[:2048])
-        # Image
         image_url = data.get("image")
         if image_url:
             embed.set_image(url=image_url)
-        # Thumbnail
         thumbnail_url = data.get("thumbnail")
         if thumbnail_url:
             embed.set_thumbnail(url=thumbnail_url)
         return embed
 
-    async def _embed_builder_save(self, interaction: discord.Interaction, key: str, data: dict):
-        """Speichert Embed-Daten in der Config."""
-        embeds = await self.config.guild(interaction.guild).custom_embeds() or {}
-        # Falls schon vorhanden: message_id und channel_id beibehalten
+    async def _embed_builder_save_and_send(self, interaction: discord.Interaction, key: str, data: dict, send_channel=None, force_send=False):
+        """Speichert Embed-Daten und sendet/aktualisiert optional."""
+        guild = interaction.guild
+        embeds = await self.config.guild(guild).custom_embeds() or {}
+        # message_id/channel_id beibehalten
         if key in embeds:
             data["message_id"] = embeds[key].get("message_id")
             data["channel_id"] = embeds[key].get("channel_id")
         embeds[key] = data
-        await self.config.guild(interaction.guild).custom_embeds.set(embeds)
-        # Bestätigung
-        try:
-            await interaction.followup.send(
-                f"✅ Embed `{key}` wurde gespeichert!\n"
-                f"Nutze `[p]embedbuilder send {key}` um es zu senden oder `[p]embedbuilder update {key}` um ein gesendetes Embed zu aktualisieren.",
-                ephemeral=True,
-            )
-        except discord.HTTPException:
-            pass
+        await self.config.guild(guild).custom_embeds.set(embeds)
+        embed_obj = self._build_custom_embed(data)
+        # Senden oder aktualisieren?
+        if send_channel is not None:
+            # In spezifischen Channel senden
+            try:
+                message = await send_channel.send(embed=embed_obj)
+                embeds[key]["message_id"] = message.id
+                embeds[key]["channel_id"] = send_channel.id
+                await self.config.guild(guild).custom_embeds.set(embeds)
+                await interaction.followup.send(f"✅ Embed `{key}` gespeichert und gesendet: {message.jump_url}", ephemeral=True)
+                return
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await interaction.followup.send(f"✅ Embed gespeichert, aber Senden fehlgeschlagen: `{e}`", ephemeral=True)
+                return
+        if force_send:
+            # Bestehendes Embed aktualisieren
+            msg_id = data.get("message_id")
+            ch_id = data.get("channel_id")
+            if msg_id and ch_id:
+                ch = guild.get_channel(ch_id)
+                if ch:
+                    try:
+                        msg = await ch.fetch_message(msg_id)
+                        await msg.edit(embed=embed_obj)
+                        await interaction.followup.send(f"✅ Embed `{key}` gespeichert und aktualisiert: {msg.jump_url}", ephemeral=True)
+                        return
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+            # Fallback: neu senden im aktuellen Channel
+            try:
+                message = await interaction.channel.send(embed=embed_obj)
+                embeds[key]["message_id"] = message.id
+                embeds[key]["channel_id"] = interaction.channel.id
+                await self.config.guild(guild).custom_embeds.set(embeds)
+                await interaction.followup.send(f"✅ Embed `{key}` gespeichert und gesendet: {message.jump_url}", ephemeral=True)
+                return
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        # Nur speichern, kein Senden
+        await interaction.followup.send(
+            f"✅ Embed `{key}` gespeichert!\nNutze `[p]embedbuilder send {key}` zum Senden.",
+            ephemeral=True,
+        )
 
     # ============================================
     # TEAM-MANAGEMENT SYSTEM
@@ -14977,11 +15056,12 @@ class TicketSurveyView(discord.ui.View):
 class EmbedBuilderStartView(discord.ui.View):
     """View mit Button um das Embed-Builder Modal zu öffnen."""
 
-    def __init__(self, cog, key: str, is_new: bool = True):
+    def __init__(self, cog, key: str, send_channel=None, force_send=False):
         super().__init__(timeout=300)
         self.cog = cog
         self.key = key
-        self.is_new = is_new
+        self.send_channel = send_channel
+        self.force_send = force_send
 
     @discord.ui.button(label="Embed erstellen/bearbeiten", style=discord.ButtonStyle.primary, emoji="📝")
     async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -14989,101 +15069,88 @@ class EmbedBuilderStartView(discord.ui.View):
             if not isinstance(interaction.user, discord.Member):
                 await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
                 return
-            # Permission check
             if not interaction.user.guild_permissions.manage_guild:
                 await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
                 return
-            # Config-Daten laden (schnell, aber abgesichert)
             try:
                 embeds = await self.cog.config.guild(interaction.guild).custom_embeds() or {}
                 existing = embeds.get(self.key, {})
             except Exception:
                 existing = {}
-            # Modal erstellen und senden
-            modal = EmbedBuilderModal(self.cog, self.key, existing)
+            modal = EmbedBuilderMainModal(self.cog, self.key, existing, self.send_channel, self.force_send)
             await interaction.response.send_modal(modal)
         except Exception as e:
             log.exception("Fehler beim Öffnen des Embed-Builder Modals")
             try:
                 if not interaction.response.is_done():
-                    await interaction.response.send_message(f"❌ Fehler beim Öffnen: `{type(e).__name__}: {e}`", ephemeral=True)
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
                 else:
-                    await interaction.followup.send(f"❌ Fehler beim Öffnen: `{type(e).__name__}: {e}`", ephemeral=True)
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
             except Exception:
                 pass
 
 
-class EmbedBuilderModal(discord.ui.Modal):
-    """Modal zum Erstellen/Bearbeiten eines Custom Embeds.
-    Beim Bearbeiten sind die aktuellen Werte vorausgefüllt."""
+class EmbedBuilderMainModal(discord.ui.Modal):
+    """Haupt-Modal (Teil 1): Titel, Beschreibung, Farbe, Footer, Field 1."""
 
-    def __init__(self, cog, key: str, existing_data: dict = None):
-        title = f"📝 Embed: {key}" if existing_data else f"🆕 Neues Embed: {key}"
-        if len(title) > 45:
-            title = title[:45]
-        super().__init__(title=title, timeout=600)
+    def __init__(self, cog, key: str, existing_data: dict = None, send_channel=None, force_send=False):
+        title_str = f"📝 Embed: {key}" if existing_data else f"🆕 Embed: {key}"
+        if len(title_str) > 45:
+            title_str = title_str[:45]
+        super().__init__(title=title_str, timeout=600)
         self.cog = cog
         self.key = key
         self.existing_data = existing_data or {}
+        self.send_channel = send_channel
+        self.force_send = force_send
 
-        # Hilfsfunktion: default nur setzen wenn nicht None/leer (vermeidet Crashes)
-        def safe_default(val):
-            v = val if val else ""
-            return v if v else None
+        def sd(val):
+            return val if val else None
 
-        # Feld 1: Titel
-        title_default = safe_default(self.existing_data.get("title"))
         self.title_input = discord.ui.TextInput(
             label="Titel",
             placeholder="Titel des Embeds...",
             required=False,
             max_length=256,
-            default=title_default,
+            default=sd(self.existing_data.get("title")),
             custom_id="embed_title",
         )
         self.add_item(self.title_input)
-        # Feld 2: Beschreibung
-        desc_default = safe_default(self.existing_data.get("description"))
         self.description_input = discord.ui.TextInput(
             label="Beschreibung (Haupttext)",
             placeholder="Haupttext des Embeds...",
             required=False,
             max_length=1500,
             style=discord.TextStyle.paragraph,
-            default=desc_default,
-            custom_id="embed_description",
+            default=sd(self.existing_data.get("description")),
+            custom_id="embed_desc",
         )
         self.add_item(self.description_input)
-        # Feld 3: Farbe
-        color_default = safe_default(self.existing_data.get("color"))
         self.color_input = discord.ui.TextInput(
-            label="Farbe (blurple/red/green/orange/purple/grey)",
-            placeholder="blurple",
+            label="Farbe (Name oder #Hex)",
+            placeholder="blurple, red, green, #ff0000, ...",
             required=False,
             max_length=20,
-            default=color_default,
+            default=sd(self.existing_data.get("color")),
             custom_id="embed_color",
         )
         self.add_item(self.color_input)
-        # Feld 4: Footer
-        footer_default = safe_default(self.existing_data.get("footer"))
         self.footer_input = discord.ui.TextInput(
             label="Footer-Text (optional)",
             placeholder="Text unten im Embed...",
             required=False,
             max_length=500,
-            default=footer_default,
+            default=sd(self.existing_data.get("footer")),
             custom_id="embed_footer",
         )
         self.add_item(self.footer_input)
-        # Feld 5: Field 1 (Name|Value)
         field1_default = None
         f1n = self.existing_data.get("field1_name", "")
         f1v = self.existing_data.get("field1_value", "")
         if f1n or f1v:
             field1_default = f"{f1n}|{f1v}"
         self.field1_input = discord.ui.TextInput(
-            label="Field 1 (Name|Wert) — mit | trennen",
+            label="Field 1 (Name|Wert mit | trennen)",
             placeholder="z.B. Regel 1|Kein Spam",
             required=False,
             max_length=1200,
@@ -15095,14 +15162,12 @@ class EmbedBuilderModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        # Daten sammeln
         data = {
             "title": self.title_input.value.strip() if self.title_input.value else "",
             "description": self.description_input.value.strip() if self.description_input.value else "",
             "color": self.color_input.value.strip().lower() if self.color_input.value else "blurple",
             "footer": self.footer_input.value.strip() if self.footer_input.value else "",
         }
-        # Field 1 parsen (Format: Name|Wert)
         if self.field1_input.value and self.field1_input.value.strip():
             parts = self.field1_input.value.strip().split("|", 1)
             if len(parts) == 2:
@@ -15111,19 +15176,24 @@ class EmbedBuilderModal(discord.ui.Modal):
             else:
                 data["field1_name"] = "Info"
                 data["field1_value"] = parts[0].strip()[:1024]
-        # Vorhandene Field 2 & 3 beibehalten falls nicht im Modal bearbeitet
+        # Vorhandene Fields 2 & 3 beibehalten
         for i in [2, 3]:
             if self.existing_data.get(f"field{i}_name"):
                 data[f"field{i}_name"] = self.existing_data[f"field{i}_name"]
             if self.existing_data.get(f"field{i}_value"):
                 data[f"field{i}_value"] = self.existing_data[f"field{i}_value"]
-        # Vorhandene Image/Thumbnail beibehalten
+        # Image/Thumbnail beibehalten
         if self.existing_data.get("image"):
             data["image"] = self.existing_data["image"]
         if self.existing_data.get("thumbnail"):
             data["thumbnail"] = self.existing_data["thumbnail"]
-        # Speichern
-        await self.cog._embed_builder_save(interaction, self.key, data)
+        # Teil 2 Modal öffnen (Image + Thumbnail)
+        modal2 = EmbedBuilderExtraModal(self.cog, self.key, data, self.send_channel, self.force_send)
+        try:
+            await interaction.followup.send_modal(modal2)
+        except (discord.HTTPException, Exception):
+            # Falls followup.send_modal nicht funktioniert, direkt speichern
+            await self.cog._embed_builder_save_and_send(interaction, self.key, data, self.send_channel, self.force_send)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         try:
@@ -15133,7 +15203,91 @@ class EmbedBuilderModal(discord.ui.Modal):
                 await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
         except discord.HTTPException:
             pass
-        log.exception("Fehler im EmbedBuilderModal", exc_info=error)
+        log.exception("Fehler im EmbedBuilderMainModal", exc_info=error)
+
+
+class EmbedBuilderExtraModal(discord.ui.Modal):
+    """Zusatz-Modal (Teil 2): Image URL, Thumbnail URL."""
+
+    def __init__(self, cog, key: str, data: dict, send_channel=None, force_send=False):
+        title_str = f"🖼️ Extras: {key}"
+        if len(title_str) > 45:
+            title_str = title_str[:45]
+        super().__init__(title=title_str, timeout=600)
+        self.cog = cog
+        self.key = key
+        self.data = data
+        self.send_channel = send_channel
+        self.force_send = force_send
+
+        self.image_input = discord.ui.TextInput(
+            label="Bild URL (optional)",
+            placeholder="https://example.com/image.png",
+            required=False,
+            max_length=500,
+            default=data.get("image") if data.get("image") else None,
+            custom_id="embed_image",
+        )
+        self.add_item(self.image_input)
+        self.thumbnail_input = discord.ui.TextInput(
+            label="Thumbnail URL (kleines Bild oben rechts)",
+            placeholder="https://example.com/thumb.png",
+            required=False,
+            max_length=500,
+            default=data.get("thumbnail") if data.get("thumbnail") else None,
+            custom_id="embed_thumb",
+        )
+        self.add_item(self.thumbnail_input)
+        self.field2_input = discord.ui.TextInput(
+            label="Field 2 (Name|Wert mit | trennen)",
+            placeholder="z.B. Regel 2|Sei freundlich",
+            required=False,
+            max_length=1200,
+            style=discord.TextStyle.paragraph,
+            default=f"{data.get('field2_name', '')}|{data.get('field2_value', '')}" if data.get("field2_name") else None,
+            custom_id="embed_field2",
+        )
+        self.add_item(self.field2_input)
+        self.field3_input = discord.ui.TextInput(
+            label="Field 3 (Name|Wert mit | trennen)",
+            placeholder="z.B. Regel 3|Kein Werbung",
+            required=False,
+            max_length=1200,
+            style=discord.TextStyle.paragraph,
+            default=f"{data.get('field3_name', '')}|{data.get('field3_value', '')}" if data.get("field3_name") else None,
+            custom_id="embed_field3",
+        )
+        self.add_item(self.field3_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        # Image/Thumbnail
+        if self.image_input.value and self.image_input.value.strip():
+            self.data["image"] = self.image_input.value.strip()
+        if self.thumbnail_input.value and self.thumbnail_input.value.strip():
+            self.data["thumbnail"] = self.thumbnail_input.value.strip()
+        # Field 2 & 3
+        for field_input, field_num in [(self.field2_input, 2), (self.field3_input, 3)]:
+            if field_input.value and field_input.value.strip():
+                parts = field_input.value.strip().split("|", 1)
+                if len(parts) == 2:
+                    self.data[f"field{field_num}_name"] = parts[0].strip()[:256]
+                    self.data[f"field{field_num}_value"] = parts[1].strip()[:1024]
+                else:
+                    self.data[f"field{field_num}_name"] = "Info"
+                    self.data[f"field{field_num}_value"] = parts[0].strip()[:1024]
+        # Speichern + Senden
+        await self.cog._embed_builder_save_and_send(interaction, self.key, self.data, self.send_channel, self.force_send)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im EmbedBuilderExtraModal", exc_info=error)
 
 
 async def setup(bot: Red):
