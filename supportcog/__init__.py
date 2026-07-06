@@ -4067,7 +4067,7 @@ class SupportCog(commands.Cog):
     # HINWEIS: Der Alias "supportstatistik" wurde entfernt um Konflikte zu vermeiden.
     # Verwende stattdessen "supportstats" oder "stats".
 
-    @commands.command(name="supportstats", aliases=["stats"])
+    @commands.command(name="supportstats", aliases=["supstats"])
     async def supportstats(self, ctx: commands.Context):
         """
         Zeigt Support-Statistiken für diesen Server.
@@ -5641,7 +5641,7 @@ class SupportCog(commands.Cog):
                 lines.append(f"• {staff['name']}: {staff['claimed_count']} geclaimt, {staff['assigned_count']} zugewiesen")
         return "\n".join(lines)
 
-    @commands.command(name="ticketworkload", aliases=["twl", "workload", "auslastung"])
+    @commands.command(name="ticketworkload", aliases=["twl", "twload", "auslastung"])
     @commands.guild_only()
     async def ticket_workload_cmd(self, ctx: commands.Context):
         """Zeigt die aktuelle Ticket-Auslastung an (offene Tickets, Claims, Team-Statistiken)."""
@@ -5678,7 +5678,7 @@ class SupportCog(commands.Cog):
         embed.set_footer(text=f"Ticket-Auslastung • {ctx.guild.name} • {_fmt_berlin_full(_now())} (MEZ/MESZ)")
         await ctx.send(embed=embed)
 
-    @commands.command(name="ticketpriority", aliases=["tprio", "priority"])
+    @commands.command(name="ticketpriority", aliases=["tprio", "tpriority"])
     @commands.guild_only()
     async def ticket_priority_cmd(self, ctx: commands.Context, priority: str = None):
         """Setzt die Priorität des aktuellen Tickets. Optionen: low, normal, high, urgent.
@@ -5716,7 +5716,7 @@ class SupportCog(commands.Cog):
         embed.add_field(name="Geändert von", value=ctx.author.mention, inline=True)
         await ctx.send(embed=embed)
 
-    @commands.command(name="ticketnote", aliases=["tnote", "note"])
+    @commands.command(name="ticketnote", aliases=["tnote", "tnotiz"])
     @commands.guild_only()
     async def ticket_note_cmd(self, ctx: commands.Context, *, note: str = None):
         """Fügt eine interne Notiz zum Ticket hinzu (nur für Team sichtbar).
@@ -5773,7 +5773,7 @@ class SupportCog(commands.Cog):
         await self.config.guild(ctx.guild).ticket_notes.set(notes)
         await ctx.send(f"✅ Notiz hinzugefügt ({len(notes[channel_id_str])} Notiz(en) gesamt).")
 
-    @commands.command(name="ticketassign", aliases=["tassign", "assign"])
+    @commands.command(name="ticketassign", aliases=["tassign", "tassignee"])
     @commands.guild_only()
     async def ticket_assign_cmd(self, ctx: commands.Context, action: str = None, user: discord.Member = None):
         """Weist ein Ticket einem Teammitglied zu (zusätzlich zum Claim).
@@ -6069,7 +6069,7 @@ class SupportCog(commands.Cog):
 
     # --- TEAMBESPRECHUNGEN (MEETINGS) ---
 
-    @commands.group(name="teammeeting", aliases=["tmeeting", "meeting"])
+    @commands.group(name="teammeeting", aliases=["tmeeting", "tmeet"])
     @commands.guild_only()
     async def team_meeting(self, ctx: commands.Context):
         """Verwaltet Teambesprechungen."""
@@ -6120,7 +6120,7 @@ class SupportCog(commands.Cog):
         # Embed mit Info + Buttons
         embed = await self._team_build_meeting_embed(meetings[meeting_id], meeting_id, ctx.guild)
         view = TeamMeetingView(self, meeting_id)
-        msg = await ctx.send(embed=embed, view=view)
+        await ctx.send(embed=embed, view=view)
         # Announcement-Channel
         ann_ch_id = await self.config.guild(ctx.guild).team_meetings_announcement_channel()
         if ann_ch_id:
@@ -6140,7 +6140,6 @@ class SupportCog(commands.Cog):
             await ctx.send("ℹ️ Keine Teambesprechungen geplant.")
             return
         # Nur zukünftige oder aktive
-        now_ts = _now_ts()
         upcoming = []
         for mid, m in meetings.items():
             if m.get("status") in ("planned", "started"):
@@ -6946,7 +6945,7 @@ class SupportCog(commands.Cog):
 
     # --- TEAM-ANKÜNDIGUNGEN ---
 
-    @commands.group(name="teamannounce", aliases=["tannounce", "ankuendigung", "announce"])
+    @commands.group(name="teamannounce", aliases=["tannounce", "ankuendigung", "teamann"])
     @commands.guild_only()
     async def team_announce(self, ctx: commands.Context):
         """Team-Ankündigungen verwalten."""
@@ -7059,7 +7058,7 @@ class SupportCog(commands.Cog):
 
     # --- TEAM-ABSTIMMUNGEN (POLLS) ---
 
-    @commands.group(name="teampoll", aliases=["tpoll", "abstimmung", "poll"])
+    @commands.group(name="teampoll", aliases=["tpoll", "abstimmung", "teamvote"])
     @commands.guild_only()
     async def team_poll(self, ctx: commands.Context):
         """Team-Abstimmungen verwalten."""
@@ -7114,7 +7113,7 @@ class SupportCog(commands.Cog):
         await ctx.send(embed=embed, view=view)
         await ctx.send(f"✅ Abstimmung #{poll_id} erstellt.", delete_after=5)
 
-    @team_poll.command(name="end", aliases=["close", "stop"])
+    @team_poll.command(name="end", aliases=["tend", "tstop"])
     async def team_poll_end(self, ctx: commands.Context, poll_id: str):
         """Beendet eine Team-Abstimmung."""
         polls = await self.config.guild(ctx.guild).team_polls() or {}
@@ -7189,7 +7188,7 @@ class SupportCog(commands.Cog):
 
     # --- TEAM-FEEDBACK ---
 
-    @commands.group(name="teamfeedback", aliases=["tfeedback", "feedback"])
+    @commands.group(name="teamfeedback", aliases=["tfeedback", "teamfb"])
     @commands.guild_only()
     async def team_feedback(self, ctx: commands.Context):
         """Team-Feedback System (für und über Teammitglieder)."""
@@ -8224,6 +8223,7 @@ class SupportCog(commands.Cog):
         if creator_id is not None:
             ticket_num = await self._ticket_get_counter(channel) or "?"
             category_name = ""
+            created_ts = 0
             if channel.topic:
                 m = re.search(r"Category:\s*(\w+)", channel.topic)
                 if m:
@@ -8237,11 +8237,7 @@ class SupportCog(commands.Cog):
                     try:
                         created_ts = int(created_ts_match.group(1))
                     except ValueError:
-                        created_ts = 0
-                else:
-                    created_ts = 0
-            else:
-                created_ts = 0
+                        pass
             await self._ticket_add_to_history(guild, creator_id, {
                 "ticket_num": str(ticket_num),
                 "channel_name": channel.name,
@@ -8311,7 +8307,7 @@ class SupportCog(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name="unclaim", aliases=["unclaimticket", "release"])
+    @commands.command(name="unclaim", aliases=["unclaimticket", "tunclaim"])
     @commands.guild_only()
     async def unclaim_ticket(self, ctx: commands.Context):
         """Gibt ein geclaimtes Ticket wieder ab (Unclaim). Das Ticket ist danach wieder für alle Teammitglieder offen."""
@@ -8487,7 +8483,7 @@ class SupportCog(commands.Cog):
         except discord.HTTPException as e:
             await ctx.send(f"❌ Fehler: `{e}`")
 
-    @commands.command(name="ticketclose", aliases=["tclose", "close"])
+    @commands.command(name="ticketclose", aliases=["tclose", "tclose2"])
     @commands.guild_only()
     async def ticket_close_cmd(self, ctx: commands.Context, *, reason: str = "Kein Grund angegeben"):
         """Schließt das aktuelle Ticket (Text-Befehl-Version)."""
