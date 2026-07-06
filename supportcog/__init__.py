@@ -282,6 +282,33 @@ class SupportCog(commands.Cog):
             "ticket_first_response_reminder_minutes": 0,  # 0 = deaktiviert, sonst: Reminder nach X Min wenn Team nicht reagiert
             "ticket_history": {},  # Runtime: {user_id: [{ticket_num, channel_name, category, opened_ts, closed_ts, closed_by, reason}]}
             "ticket_first_response_tracker": {},  # Runtime: {channel_id: {created_ts, first_response_ts, first_responder_id}}
+
+            # ============================================
+            # TEAM-MANAGEMENT SYSTEM
+            # ============================================
+            "team_meetings": {},  # {meeting_id: {title, description, scheduled_ts, duration_min, created_by, attendees: [user_id], channel_id, status, created_ts}}
+            "team_meetings_counter": 0,
+            "team_meetings_announcement_channel": None,  # Channel für Meeting-Ankündigungen
+            "team_applications": {},  # {app_id: {user_id, username, position, application_text, status: pending|accepted|rejected, submitted_ts, decided_by, decided_ts, decision_reason}}
+            "team_applications_counter": 0,
+            "team_applications_channel": None,  # Channel wo Bewerbungen eingehen
+            "team_applications_review_role": None,  # Rolle die Bewerbungen bearbeiten darf
+            "team_appointments": {},  # {appt_id: {title, description, scheduled_ts, duration_min, type, created_by, attendees: [user_id], reminder_sent}}
+            "team_appointments_counter": 0,
+            "team_appointments_announcement_channel": None,
+            "team_role_requests": {},  # {req_id: {user_id, username, requested_role_id, reason, status, submitted_ts, decided_by, decided_ts}}
+            "team_role_requests_counter": 0,
+            "team_role_requests_channel": None,
+            "team_role_requests_review_role": None,
+            # Weitere Team-Features
+            "team_announcements": {},  # {ann_id: {title, message, author_id, author_name, ts, channel_id, pinned}}
+            "team_announcements_counter": 0,
+            "team_polls": {},  # {poll_id: {question, options: [{text, votes: [user_id]}], author_id, ts, active, channel_id}}
+            "team_polls_counter": 0,
+            "team_feedback": {},  # {feedback_id: {from_user_id, from_name, to_user_id, to_name, rating, text, ts, anonymous}}
+            "team_feedback_counter": 0,
+            "team_interviews": {},  # {interview_id: {app_id, user_id, channel_id, scheduled_ts, status: scheduled|completed|cancelled, notes}}
+            "team_interviews_counter": 0,
             # MULTI-KATEGORIE-SYSTEM
             # ticket_categories: {
             #   "support": {
@@ -426,6 +453,30 @@ class SupportCog(commands.Cog):
         # Background loop: ticket reminder (für Auto-Reminder wenn Team nicht reagiert)
         if not hasattr(self, "_ticket_reminder_task") or self._ticket_reminder_task is None or self._ticket_reminder_task.done():
             self._ticket_reminder_task = asyncio.create_task(self._ticket_reminder_loop())
+        # Background loop: team appointment reminders (15 Min vor Termin)
+        if not hasattr(self, "_team_reminder_task") or self._team_reminder_task is None or self._team_reminder_task.done():
+            self._team_reminder_task = asyncio.create_task(self._team_reminder_loop())
+        # Team-Management persistente Views registrieren
+        try:
+            self.bot.add_view(TeamMeetingView(self, "0"))  # Dummy für Registrierung
+        except Exception:
+            pass
+        try:
+            self.bot.add_view(TeamAppointmentView(self, "0"))
+        except Exception:
+            pass
+        try:
+            self.bot.add_view(TeamApplicationReviewView(self, "0"))
+        except Exception:
+            pass
+        try:
+            self.bot.add_view(TeamRoleReviewView(self, "0"))
+        except Exception:
+            pass
+        try:
+            self.bot.add_view(TeamPollView(self, "0", []))
+        except Exception:
+            pass
 
     async def _ticket_register_persistent_views(self):
         """Registriert persistente Multi-Panel Views nach Guild-Ready."""
@@ -488,6 +539,14 @@ class SupportCog(commands.Cog):
                 pass
             except Exception:
                 log.exception("Fehler beim Stoppen des View-Register-Tasks")
+        if hasattr(self, "_team_reminder_task") and self._team_reminder_task is not None and not self._team_reminder_task.done():
+            self._team_reminder_task.cancel()
+            try:
+                await self._team_reminder_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Fehler beim Stoppen des Team-Reminder-Loops")
 
     async def _ticket_panel_refresh_loop(self):
         """Background loop: aktualisiert das Panel periodisch für Live-Workload-Anzeige.
@@ -6003,6 +6062,1300 @@ class SupportCog(commands.Cog):
             except Exception:
                 log.exception("Schwerer Fehler im Ticket-Reminder-Loop")
             await asyncio.sleep(300)  # Alle 5 Minuten prüfen
+
+    # ============================================
+    # TEAM-MANAGEMENT SYSTEM
+    # ============================================
+
+    # --- TEAMBESPRECHUNGEN (MEETINGS) ---
+
+    @commands.group(name="teammeeting", aliases=["tmeeting", "meeting"])
+    @commands.guild_only()
+    async def team_meeting(self, ctx: commands.Context):
+        """Verwaltet Teambesprechungen."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_meeting.command(name="create", aliases=["add", "plan"])
+    async def team_meeting_create(self, ctx: commands.Context, title: str, date: str, time: str, *, description: str = ""):
+        """Plant eine neue Teambesprechung.
+        Format: `[p]teammeeting create "Wöchentliches Meeting" 25.12.2025 18:00 Besprechung der neuen Features`
+        """
+        # Datum/Zeit parsen (DD.MM.YYYY HH:MM)
+        try:
+            dt_str = f"{date} {time}"
+            scheduled_dt = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
+            # Als Europe/Berlin interpretieren
+            scheduled_dt = scheduled_dt.replace(tzinfo=_BERLIN_TZ)
+            scheduled_ts = int(scheduled_dt.timestamp())
+        except ValueError:
+            await ctx.send("❌ Ungültiges Format. Verwende: `DD.MM.YYYY HH:MM` (z.B. `25.12.2025 18:00`)")
+            return
+        # Prüfen dass Datum in der Zukunft liegt
+        if scheduled_ts <= _now_ts():
+            await ctx.send("❌ Das Datum muss in der Zukunft liegen.")
+            return
+        if len(title) > 200:
+            await ctx.send("❌ Titel zu lang (max 200 Zeichen).")
+            return
+        # Meeting erstellen
+        counter = await self.config.guild(ctx.guild).team_meetings_counter() or 0
+        counter += 1
+        meeting_id = str(counter)
+        meetings = await self.config.guild(ctx.guild).team_meetings() or {}
+        meetings[meeting_id] = {
+            "title": title,
+            "description": description[:1000],
+            "scheduled_ts": scheduled_ts,
+            "duration_min": 60,  # Default 60 Min
+            "created_by": ctx.author.id,
+            "created_by_name": ctx.author.display_name,
+            "attendees": [ctx.author.id],
+            "channel_id": ctx.channel.id,
+            "status": "planned",  # planned, started, ended, cancelled
+            "created_ts": _now_ts(),
+        }
+        await self.config.guild(ctx.guild).team_meetings.set(meetings)
+        await self.config.guild(ctx.guild).team_meetings_counter.set(counter)
+        # Embed mit Info + Buttons
+        embed = await self._team_build_meeting_embed(meetings[meeting_id], meeting_id, ctx.guild)
+        view = TeamMeetingView(self, meeting_id)
+        msg = await ctx.send(embed=embed, view=view)
+        # Announcement-Channel
+        ann_ch_id = await self.config.guild(ctx.guild).team_meetings_announcement_channel()
+        if ann_ch_id:
+            ann_ch = ctx.guild.get_channel(ann_ch_id)
+            if ann_ch and ann_ch.id != ctx.channel.id:
+                try:
+                    await ann_ch.send(embed=embed, view=TeamMeetingView(self, meeting_id))
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        await ctx.send(f"✅ Teambesprechung #{meeting_id} geplant: **{title}** am {_fmt_berlin_full(scheduled_dt)} (MEZ/MESZ)")
+
+    @team_meeting.command(name="list", aliases=["show"])
+    async def team_meeting_list(self, ctx: commands.Context):
+        """Zeigt alle geplanten Teambesprechungen an."""
+        meetings = await self.config.guild(ctx.guild).team_meetings() or {}
+        if not meetings:
+            await ctx.send("ℹ️ Keine Teambesprechungen geplant.")
+            return
+        # Nur zukünftige oder aktive
+        now_ts = _now_ts()
+        upcoming = []
+        for mid, m in meetings.items():
+            if m.get("status") in ("planned", "started"):
+                upcoming.append((mid, m))
+        if not upcoming:
+            await ctx.send("ℹ️ Keine anstehenden Teambesprechungen.")
+            return
+        upcoming.sort(key=lambda x: x[1].get("scheduled_ts", 0))
+        embed = discord.Embed(
+            title="📅 Anstehende Teambesprechungen",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        for mid, m in upcoming[:10]:
+            scheduled_ts = m.get("scheduled_ts", 0)
+            date_str = _fmt_berlin_full(_from_ts(scheduled_ts)) if scheduled_ts else "?"
+            attendees = m.get("attendees", [])
+            status = m.get("status", "planned")
+            status_emoji = "🟢" if status == "planned" else "🟡" if status == "started" else "🔴"
+            embed.add_field(
+                name=f"{status_emoji} #{mid} — {m.get('title', '?')}",
+                value=f"📅 {date_str} (MEZ/MESZ)\n👥 {len(attendees)} angemeldet\n📋 {m.get('description', 'Keine Beschreibung')[:200]}",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(upcoming)} anstehende Besprechung(en)")
+        await ctx.send(embed=embed)
+
+    @team_meeting.command(name="cancel", aliases=["delete"])
+    @commands.guild_only()
+    async def team_meeting_cancel(self, ctx: commands.Context, meeting_id: str):
+        """Sagt eine Teambesprechung ab."""
+        meetings = await self.config.guild(ctx.guild).team_meetings() or {}
+        if meeting_id not in meetings:
+            await ctx.send(f"❌ Besprechung #{meeting_id} nicht gefunden.")
+            return
+        m = meetings[meeting_id]
+        # Nur Ersteller oder Admin
+        is_creator = m.get("created_by") == ctx.author.id
+        is_admin = ctx.author.guild_permissions.manage_guild
+        if not (is_creator or is_admin):
+            await ctx.send("❌ Nur der Ersteller oder Admins können die Besprechung absagen.")
+            return
+        meetings[meeting_id]["status"] = "cancelled"
+        await self.config.guild(ctx.guild).team_meetings.set(meetings)
+        await ctx.send(f"✅ Besprechung #{meeting_id} **{m.get('title')}** abgesagt.")
+
+    @team_meeting.command(name="info")
+    async def team_meeting_info(self, ctx: commands.Context, meeting_id: str):
+        """Zeigt Details zu einer Besprechung an."""
+        meetings = await self.config.guild(ctx.guild).team_meetings() or {}
+        if meeting_id not in meetings:
+            await ctx.send(f"❌ Besprechung #{meeting_id} nicht gefunden.")
+            return
+        embed = await self._team_build_meeting_embed(meetings[meeting_id], meeting_id, ctx.guild)
+        view = TeamMeetingView(self, meeting_id)
+        await ctx.send(embed=embed, view=view)
+
+    async def _team_build_meeting_embed(self, meeting: dict, meeting_id: str, guild: discord.Guild) -> discord.Embed:
+        """Baut das Embed für eine Teambesprechung."""
+        scheduled_ts = meeting.get("scheduled_ts", 0)
+        date_str = _fmt_berlin_full(_from_ts(scheduled_ts)) if scheduled_ts else "?"
+        attendees = meeting.get("attendees", [])
+        status = meeting.get("status", "planned")
+        status_text = {"planned": "🟢 Geplant", "started": "🟡 Läuft", "ended": "🔴 Beendet", "cancelled": "❌ Abgesagt"}.get(status, "🟢 Geplant")
+        embed = discord.Embed(
+            title=f"📅 Teambesprechung #{meeting_id} — {meeting.get('title', '?')}",
+            description=meeting.get("description", "Keine Beschreibung") or "Keine Beschreibung",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="📅 Wann", value=f"{date_str} (MEZ/MESZ)", inline=True)
+        embed.add_field(name="⏱️ Dauer", value=f"{meeting.get('duration_min', 60)} Min", inline=True)
+        embed.add_field(name="📊 Status", value=status_text, inline=True)
+        embed.add_field(name="👤 Organisiert von", value=f"<@{meeting.get('created_by', '?')}>", inline=True)
+        embed.add_field(name="👥 Angemeldet", value=f"{len(attendees)} Teilnehmer", inline=True)
+        # Attendee-Liste
+        if attendees:
+            attendee_lines = []
+            for uid in attendees[:15]:
+                member = guild.get_member(uid)
+                name = member.display_name if member else f"<@{uid}>"
+                attendee_lines.append(f"• {name}")
+            embed.add_field(name="📋 Teilnehmerliste", value="\n".join(attendee_lines), inline=False)
+        embed.set_footer(text=f"Meeting-ID: {meeting_id} • Klicke unten zum An-/Abmelden")
+        return embed
+
+    # --- BEWERBUNGSSYSTEM ---
+
+    @commands.group(name="teamapp", aliases=["bewerbung", "application", "bewerb"])
+    @commands.guild_only()
+    async def team_app(self, ctx: commands.Context):
+        """Bewerbungssystem für das Team."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_app.command(name="submit", aliases=["bewerben", "create"])
+    async def team_app_submit(self, ctx: commands.Context, position: str, *, application_text: str):
+        """Reicht eine Bewerbung für eine Team-Position ein.
+        Beispiel: `[p]teamapp submit Moderator Ich möchte gerne Moderator werden weil...`
+        """
+        if len(position) > 100:
+            await ctx.send("❌ Position zu lang (max 100 Zeichen).")
+            return
+        if len(application_text) < 50:
+            await ctx.send("❌ Bewerbungstext zu kurz (min 50 Zeichen). Erkläre warum du geeignet bist.")
+            return
+        if len(application_text) > 2000:
+            await ctx.send("❌ Bewerbungstext zu lang (max 2000 Zeichen).")
+            return
+        # Bewerbung erstellen
+        counter = await self.config.guild(ctx.guild).team_applications_counter() or 0
+        counter += 1
+        app_id = str(counter)
+        apps = await self.config.guild(ctx.guild).team_applications() or {}
+        apps[app_id] = {
+            "user_id": ctx.author.id,
+            "username": ctx.author.display_name,
+            "position": position,
+            "application_text": application_text,
+            "status": "pending",  # pending, accepted, rejected
+            "submitted_ts": _now_ts(),
+            "decided_by": None,
+            "decided_ts": None,
+            "decision_reason": None,
+        }
+        await self.config.guild(ctx.guild).team_applications.set(apps)
+        await self.config.guild(ctx.guild).team_applications_counter.set(counter)
+        # Bestätigung an Bewerber
+        await ctx.send(f"✅ Deine Bewerbung #{app_id} für **{position}** wurde eingereicht.\nDu wirst benachrichtigt sobald eine Entscheidung vorliegt.")
+        # An Review-Channel senden
+        review_ch_id = await self.config.guild(ctx.guild).team_applications_channel()
+        if review_ch_id:
+            review_ch = ctx.guild.get_channel(review_ch_id)
+            if review_ch:
+                try:
+                    embed = discord.Embed(
+                        title=f"📋 Neue Bewerbung #{app_id}",
+                        description=f"**Position:** {position}\n**Bewerber:** {ctx.author.mention}\n`{ctx.author.id}`",
+                        color=discord.Color.gold(),
+                        timestamp=_now(),
+                    )
+                    embed.add_field(name="📝 Bewerbungstext", value=application_text[:1024], inline=False)
+                    embed.add_field(name="📅 Eingereicht am", value=_fmt_berlin_full(_now()), inline=True)
+                    embed.set_footer(text=f"Bewerbungs-ID: {app_id}")
+                    view = TeamApplicationReviewView(self, app_id)
+                    await review_ch.send(embed=embed, view=view)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+    @team_app.command(name="list")
+    async def team_app_list(self, ctx: commands.Context, status_filter: str = "all"):
+        """Zeigt alle Bewerbungen an. Filter: `all`, `pending`, `accepted`, `rejected`."""
+        # Permission-Check
+        review_role_id = await self.config.guild(ctx.guild).team_applications_review_role()
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        is_admin = ctx.author.guild_permissions.manage_guild
+        if review_role_id:
+            review_role = ctx.guild.get_role(review_role_id)
+            if review_role and ctx.author.get_role(review_role_id) is not None:
+                is_staff = True
+        if not (is_staff or is_admin):
+            # Normale User sehen nur eigene Bewerbungen
+            apps = await self.config.guild(ctx.guild).team_applications() or {}
+            user_apps = {k: v for k, v in apps.items() if v.get("user_id") == ctx.author.id}
+            if not user_apps:
+                await ctx.send("ℹ️ Du hast keine Bewerbungen eingereicht.")
+                return
+            embed = discord.Embed(
+                title="📋 Deine Bewerbungen",
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            for app_id, app in list(user_apps.items())[-10:]:
+                status = app.get("status", "pending")
+                status_emoji = {"pending": "⏳", "accepted": "✅", "rejected": "❌"}.get(status, "⏳")
+                submitted_str = _fmt_berlin_full(_from_ts(app.get("submitted_ts", 0)))
+                embed.add_field(
+                    name=f"{status_emoji} #{app_id} — {app.get('position', '?')}",
+                    value=f"📅 Eingereicht: {submitted_str} (MEZ/MESZ)\nStatus: **{status}**",
+                    inline=False,
+                )
+            await ctx.send(embed=embed)
+            return
+        # Staff: alle Bewerbungen
+        apps = await self.config.guild(ctx.guild).team_applications() or {}
+        if status_filter != "all":
+            apps = {k: v for k, v in apps.items() if v.get("status") == status_filter}
+        if not apps:
+            await ctx.send(f"ℹ️ Keine Bewerbungen mit Status `{status_filter}`.")
+            return
+        embed = discord.Embed(
+            title=f"📋 Bewerbungen (Filter: {status_filter})",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        # Nach Datum sortieren (neueste zuerst)
+        sorted_apps = sorted(apps.items(), key=lambda x: x[1].get("submitted_ts", 0), reverse=True)
+        for app_id, app in sorted_apps[:15]:
+            status = app.get("status", "pending")
+            status_emoji = {"pending": "⏳", "accepted": "✅", "rejected": "❌"}.get(status, "⏳")
+            submitted_str = _fmt_berlin_full(_from_ts(app.get("submitted_ts", 0)))
+            embed.add_field(
+                name=f"{status_emoji} #{app_id} — {app.get('position', '?')}",
+                value=f"👤 {app.get('username', '?')} (`{app.get('user_id', '?')}`)\n📅 {submitted_str} (MEZ/MESZ)",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(apps)} Bewerbung(en) gesamt")
+        await ctx.send(embed=embed)
+
+    @team_app.command(name="info")
+    async def team_app_info(self, ctx: commands.Context, app_id: str):
+        """Zeigt Details zu einer Bewerbung an."""
+        apps = await self.config.guild(ctx.guild).team_applications() or {}
+        if app_id not in apps:
+            await ctx.send(f"❌ Bewerbung #{app_id} nicht gefunden.")
+            return
+        app = apps[app_id]
+        # Permission-Check: eigene Bewerbung oder Staff
+        is_own = app.get("user_id") == ctx.author.id
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        is_admin = ctx.author.guild_permissions.manage_guild
+        review_role_id = await self.config.guild(ctx.guild).team_applications_review_role()
+        if review_role_id:
+            review_role = ctx.guild.get_role(review_role_id)
+            if review_role and ctx.author.get_role(review_role_id) is not None:
+                is_staff = True
+        if not (is_own or is_staff or is_admin):
+            await ctx.send("❌ Du kannst nur deine eigenen Bewerbungen anzeigen.")
+            return
+        status = app.get("status", "pending")
+        status_emoji = {"pending": "⏳", "accepted": "✅", "rejected": "❌"}.get(status, "⏳")
+        embed = discord.Embed(
+            title=f"📋 Bewerbung #{app_id}",
+            description=f"**Position:** {app.get('position', '?')}\n**Bewerber:** <@{app.get('user_id', '?')}> (`{app.get('user_id', '?')}`)\n**Status:** {status_emoji} {status}",
+            color=discord.Color.gold() if status == "pending" else (discord.Color.green() if status == "accepted" else discord.Color.red()),
+            timestamp=_now(),
+        )
+        embed.add_field(name="📝 Bewerbungstext", value=app.get("application_text", "Kein Text")[:1024], inline=False)
+        embed.add_field(name="📅 Eingereicht am", value=_fmt_berlin_full(_from_ts(app.get("submitted_ts", 0))) + " (MEZ/MESZ)", inline=True)
+        if app.get("decided_ts"):
+            embed.add_field(name="📅 Entscheidung am", value=_fmt_berlin_full(_from_ts(app.get("decided_ts", 0))) + " (MEZ/MESZ)", inline=True)
+        if app.get("decided_by"):
+            embed.add_field(name="👤 Entscheidung von", value=f"<@{app.get('decided_by')}>", inline=True)
+        if app.get("decision_reason"):
+            embed.add_field(name="📝 Begründung", value=app.get("decision_reason", "")[:500], inline=False)
+        await ctx.send(embed=embed)
+
+    @team_app.command(name="decide")
+    @commands.guild_only()
+    async def team_app_decide(self, ctx: commands.Context, app_id: str, decision: str, *, reason: str = ""):
+        """Entscheidet über eine Bewerbung. `accept` oder `reject`.
+        Beispiel: `[p]teamapp decide 5 accept Gute Bewerbung, willkommen im Team!`
+        """
+        # Permission-Check
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        is_admin = ctx.author.guild_permissions.manage_guild
+        review_role_id = await self.config.guild(ctx.guild).team_applications_review_role()
+        if review_role_id:
+            review_role = ctx.guild.get_role(review_role_id)
+            if review_role and ctx.author.get_role(review_role_id) is not None:
+                is_staff = True
+        if not (is_staff or is_admin):
+            await ctx.send("❌ Nur Teammitglieder oder Admins können über Bewerbungen entscheiden.")
+            return
+        decision = decision.lower()
+        if decision not in ("accept", "reject", "accepted", "rejected"):
+            await ctx.send("❌ Ungültige Entscheidung. Verwende `accept` oder `reject`.")
+            return
+        apps = await self.config.guild(ctx.guild).team_applications() or {}
+        if app_id not in apps:
+            await ctx.send(f"❌ Bewerbung #{app_id} nicht gefunden.")
+            return
+        app = apps[app_id]
+        if app.get("status") != "pending":
+            await ctx.send(f"❌ Bewerbung #{app_id} wurde bereits entschieden (Status: {app.get('status')}).")
+            return
+        new_status = "accepted" if decision in ("accept", "accepted") else "rejected"
+        app["status"] = new_status
+        app["decided_by"] = ctx.author.id
+        app["decided_ts"] = _now_ts()
+        app["decision_reason"] = reason[:500] if reason else None
+        apps[app_id] = app
+        await self.config.guild(ctx.guild).team_applications.set(apps)
+        # Bewerber benachrichtigen
+        try:
+            user = await self.bot.fetch_user(app.get("user_id"))
+            if user:
+                embed = discord.Embed(
+                    title=f"{'✅ Bewerbung angenommen' if new_status == 'accepted' else '❌ Bewerbung abgelehnt'}",
+                    description=f"Deine Bewerbung für **{app.get('position')}** auf **{ctx.guild.name}** wurde {'angenommen' if new_status == 'accepted' else 'abgelehnt'}.",
+                    color=discord.Color.green() if new_status == "accepted" else discord.Color.red(),
+                    timestamp=_now(),
+                )
+                if reason:
+                    embed.add_field(name="📝 Begründung", value=reason[:500], inline=False)
+                embed.add_field(name="📅 Entscheidung am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+                embed.add_field(name="👤 Entscheidung von", value=ctx.author.mention, inline=True)
+                await user.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await ctx.send(f"✅ Bewerbung #{app_id} wurde **{new_status}**.\nBewerber wurde per DM benachrichtigt.")
+
+    @team_app.command(name="channel")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def team_app_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für neue Bewerbungen (wo Review-Embeds hingehen)."""
+        if channel is None:
+            await self.config.guild(ctx.guild).team_applications_channel.set(None)
+            await ctx.send("✅ Bewerbungs-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_applications_channel.set(channel.id)
+        await ctx.send(f"✅ Bewerbungs-Channel gesetzt auf {channel.mention}.")
+
+    @team_app.command(name="reviewrole")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def team_app_reviewrole(self, ctx: commands.Context, role: discord.Role = None):
+        """Setzt die Rolle die Bewerbungen bearbeiten darf."""
+        if role is None:
+            await self.config.guild(ctx.guild).team_applications_review_role.set(None)
+            await ctx.send("✅ Review-Rolle zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_applications_review_role.set(role.id)
+        await ctx.send(f"✅ Review-Rolle gesetzt auf {role.mention}.")
+
+    # --- TEAMTERMINE (APPOINTMENTS) ---
+
+    @commands.group(name="teamtermin", aliases=["ttermin", "termin", "appointment"])
+    @commands.guild_only()
+    async def team_appointment(self, ctx: commands.Context):
+        """Verwaltet Teamtermine."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_appointment.command(name="create", aliases=["add", "plan"])
+    async def team_appointment_create(self, ctx: commands.Context, title: str, date: str, time: str, *, description: str = ""):
+        """Plant einen neuen Teamtermin.
+        Format: `[p]teamtermin create "Training" 25.12.2025 18:00 Team-Training für neue Member`
+        """
+        try:
+            dt_str = f"{date} {time}"
+            scheduled_dt = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
+            scheduled_dt = scheduled_dt.replace(tzinfo=_BERLIN_TZ)
+            scheduled_ts = int(scheduled_dt.timestamp())
+        except ValueError:
+            await ctx.send("❌ Ungültiges Format. Verwende: `DD.MM.YYYY HH:MM` (z.B. `25.12.2025 18:00`)")
+            return
+        if scheduled_ts <= _now_ts():
+            await ctx.send("❌ Das Datum muss in der Zukunft liegen.")
+            return
+        if len(title) > 200:
+            await ctx.send("❌ Titel zu lang (max 200 Zeichen).")
+            return
+        counter = await self.config.guild(ctx.guild).team_appointments_counter() or 0
+        counter += 1
+        appt_id = str(counter)
+        appts = await self.config.guild(ctx.guild).team_appointments() or {}
+        appts[appt_id] = {
+            "title": title,
+            "description": description[:1000],
+            "scheduled_ts": scheduled_ts,
+            "duration_min": 60,
+            "created_by": ctx.author.id,
+            "created_by_name": ctx.author.display_name,
+            "attendees": [ctx.author.id],
+            "reminder_sent": False,
+            "created_ts": _now_ts(),
+        }
+        await self.config.guild(ctx.guild).team_appointments.set(appts)
+        await self.config.guild(ctx.guild).team_appointments_counter.set(counter)
+        embed = await self._team_build_appointment_embed(appts[appt_id], appt_id, ctx.guild)
+        view = TeamAppointmentView(self, appt_id)
+        await ctx.send(embed=embed, view=view)
+        await ctx.send(f"✅ Teamtermin #{appt_id} geplant: **{title}** am {_fmt_berlin_full(scheduled_dt)} (MEZ/MESZ)")
+
+    @team_appointment.command(name="list", aliases=["show"])
+    async def team_appointment_list(self, ctx: commands.Context):
+        """Zeigt alle anstehenden Teamtermine an."""
+        appts = await self.config.guild(ctx.guild).team_appointments() or {}
+        if not appts:
+            await ctx.send("ℹ️ Keine Teamtermine geplant.")
+            return
+        now_ts = _now_ts()
+        upcoming = [(aid, a) for aid, a in appts.items() if a.get("scheduled_ts", 0) > now_ts - 86400]  # Auch vergangene bis 24h
+        if not upcoming:
+            await ctx.send("ℹ️ Keine anstehenden Teamtermine.")
+            return
+        upcoming.sort(key=lambda x: x[1].get("scheduled_ts", 0))
+        embed = discord.Embed(
+            title="📅 Anstehende Teamtermine",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        for aid, a in upcoming[:10]:
+            scheduled_ts = a.get("scheduled_ts", 0)
+            date_str = _fmt_berlin_full(_from_ts(scheduled_ts)) if scheduled_ts else "?"
+            attendees = a.get("attendees", [])
+            embed.add_field(
+                name=f"📌 #{aid} — {a.get('title', '?')}",
+                value=f"📅 {date_str} (MEZ/MESZ)\n👥 {len(attendees)} angemeldet\n📋 {a.get('description', 'Keine Beschreibung')[:200]}",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(upcoming)} anstehende Termine")
+        await ctx.send(embed=embed)
+
+    @team_appointment.command(name="cancel", aliases=["delete"])
+    async def team_appointment_cancel(self, ctx: commands.Context, appt_id: str):
+        """Sagt einen Teamtermin ab."""
+        appts = await self.config.guild(ctx.guild).team_appointments() or {}
+        if appt_id not in appts:
+            await ctx.send(f"❌ Termin #{appt_id} nicht gefunden.")
+            return
+        a = appts[appt_id]
+        is_creator = a.get("created_by") == ctx.author.id
+        is_admin = ctx.author.guild_permissions.manage_guild
+        if not (is_creator or is_admin):
+            await ctx.send("❌ Nur der Ersteller oder Admins können den Termin absagen.")
+            return
+        del appts[appt_id]
+        await self.config.guild(ctx.guild).team_appointments.set(appts)
+        await ctx.send(f"✅ Termin #{appt_id} **{a.get('title')}** abgesagt.")
+
+    async def _team_build_appointment_embed(self, appt: dict, appt_id: str, guild: discord.Guild) -> discord.Embed:
+        """Baut das Embed für einen Teamtermin."""
+        scheduled_ts = appt.get("scheduled_ts", 0)
+        date_str = _fmt_berlin_full(_from_ts(scheduled_ts)) if scheduled_ts else "?"
+        attendees = appt.get("attendees", [])
+        embed = discord.Embed(
+            title=f"📌 Teamtermin #{appt_id} — {appt.get('title', '?')}",
+            description=appt.get("description", "Keine Beschreibung") or "Keine Beschreibung",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="📅 Wann", value=f"{date_str} (MEZ/MESZ)", inline=True)
+        embed.add_field(name="⏱️ Dauer", value=f"{appt.get('duration_min', 60)} Min", inline=True)
+        embed.add_field(name="👥 Angemeldet", value=f"{len(attendees)} Teilnehmer", inline=True)
+        embed.add_field(name="👤 Organisiert von", value=f"<@{appt.get('created_by', '?')}>", inline=True)
+        if attendees:
+            attendee_lines = []
+            for uid in attendees[:15]:
+                member = guild.get_member(uid)
+                name = member.display_name if member else f"<@{uid}>"
+                attendee_lines.append(f"• {name}")
+            embed.add_field(name="📋 Teilnehmerliste", value="\n".join(attendee_lines), inline=False)
+        embed.set_footer(text=f"Termin-ID: {appt_id} • Klicke unten zum An-/Abmelden")
+        return embed
+
+    # --- ROLLENVERGABE (ROLE REQUESTS) ---
+
+    @commands.group(name="teamrole", aliases=["trole", "rolerequest"])
+    @commands.guild_only()
+    async def team_role(self, ctx: commands.Context):
+        """Antragbasierte Rollenvergabe im Team."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_role.command(name="request", aliases=["antrag", "ask"])
+    async def team_role_request(self, ctx: commands.Context, role: discord.Role, *, reason: str):
+        """Reicht einen Antrag auf eine Rolle ein.
+        Beispiel: `[p]teamrole request @Moderator Ich habe Erfahrung mit...`
+        """
+        if role is None:
+            await ctx.send("❌ Rolle nicht gefunden.")
+            return
+        if len(reason) < 20:
+            await ctx.send("❌ Begründung zu kurz (min 20 Zeichen).")
+            return
+        if len(reason) > 1000:
+            await ctx.send("❌ Begründung zu lang (max 1000 Zeichen).")
+            return
+        # Prüfen ob User die Rolle schon hat
+        if ctx.author.get_role(role.id) is not None:
+            await ctx.send("ℹ️ Du hast diese Rolle bereits.")
+            return
+        counter = await self.config.guild(ctx.guild).team_role_requests_counter() or 0
+        counter += 1
+        req_id = str(counter)
+        reqs = await self.config.guild(ctx.guild).team_role_requests() or {}
+        reqs[req_id] = {
+            "user_id": ctx.author.id,
+            "username": ctx.author.display_name,
+            "requested_role_id": role.id,
+            "requested_role_name": role.name,
+            "reason": reason[:1000],
+            "status": "pending",
+            "submitted_ts": _now_ts(),
+            "decided_by": None,
+            "decided_ts": None,
+            "decision_reason": None,
+        }
+        await self.config.guild(ctx.guild).team_role_requests.set(reqs)
+        await self.config.guild(ctx.guild).team_role_requests_counter.set(counter)
+        await ctx.send(f"✅ Dein Antrag #{req_id} für Rolle {role.mention} wurde eingereicht.")
+        # An Review-Channel senden
+        review_ch_id = await self.config.guild(ctx.guild).team_role_requests_channel()
+        if review_ch_id:
+            review_ch = ctx.guild.get_channel(review_ch_id)
+            if review_ch:
+                try:
+                    embed = discord.Embed(
+                        title=f"🏷️ Rollen-Antrag #{req_id}",
+                        description=f"**Rolle:** {role.mention}\n**Antragsteller:** {ctx.author.mention}\n`{ctx.author.id}`",
+                        color=discord.Color.gold(),
+                        timestamp=_now(),
+                    )
+                    embed.add_field(name="📝 Begründung", value=reason[:1024], inline=False)
+                    embed.add_field(name="📅 Eingereicht am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+                    embed.set_footer(text=f"Antrags-ID: {req_id}")
+                    view = TeamRoleReviewView(self, req_id)
+                    await review_ch.send(embed=embed, view=view)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+    @team_role.command(name="list")
+    async def team_role_list(self, ctx: commands.Context, status_filter: str = "all"):
+        """Zeigt alle Rollen-Anträge an."""
+        # Permission-Check
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        is_admin = ctx.author.guild_permissions.manage_guild
+        review_role_id = await self.config.guild(ctx.guild).team_role_requests_review_role()
+        if review_role_id:
+            review_role = ctx.guild.get_role(review_role_id)
+            if review_role and ctx.author.get_role(review_role_id) is not None:
+                is_staff = True
+        if not (is_staff or is_admin):
+            # Normale User sehen nur eigene Anträge
+            reqs = await self.config.guild(ctx.guild).team_role_requests() or {}
+            user_reqs = {k: v for k, v in reqs.items() if v.get("user_id") == ctx.author.id}
+            if not user_reqs:
+                await ctx.send("ℹ️ Du hast keine Rollen-Anträge eingereicht.")
+                return
+            embed = discord.Embed(
+                title="🏷️ Deine Rollen-Anträge",
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            for req_id, req in list(user_reqs.items())[-10:]:
+                status = req.get("status", "pending")
+                status_emoji = {"pending": "⏳", "accepted": "✅", "rejected": "❌"}.get(status, "⏳")
+                submitted_str = _fmt_berlin_full(_from_ts(req.get("submitted_ts", 0)))
+                embed.add_field(
+                    name=f"{status_emoji} #{req_id} — {req.get('requested_role_name', '?')}",
+                    value=f"📅 Eingereicht: {submitted_str} (MEZ/MESZ)\nStatus: **{status}**",
+                    inline=False,
+                )
+            await ctx.send(embed=embed)
+            return
+        reqs = await self.config.guild(ctx.guild).team_role_requests() or {}
+        if status_filter != "all":
+            reqs = {k: v for k, v in reqs.items() if v.get("status") == status_filter}
+        if not reqs:
+            await ctx.send(f"ℹ️ Keine Anträge mit Status `{status_filter}`.")
+            return
+        embed = discord.Embed(
+            title=f"🏷️ Rollen-Anträge (Filter: {status_filter})",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        sorted_reqs = sorted(reqs.items(), key=lambda x: x[1].get("submitted_ts", 0), reverse=True)
+        for req_id, req in sorted_reqs[:15]:
+            status = req.get("status", "pending")
+            status_emoji = {"pending": "⏳", "accepted": "✅", "rejected": "❌"}.get(status, "⏳")
+            submitted_str = _fmt_berlin_full(_from_ts(req.get("submitted_ts", 0)))
+            embed.add_field(
+                name=f"{status_emoji} #{req_id} — {req.get('requested_role_name', '?')}",
+                value=f"👤 {req.get('username', '?')} (`{req.get('user_id', '?')}`)\n📅 {submitted_str} (MEZ/MESZ)",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(reqs)} Antrag/anträge gesamt")
+        await ctx.send(embed=embed)
+
+    @team_role.command(name="decide")
+    @commands.guild_only()
+    async def team_role_decide(self, ctx: commands.Context, req_id: str, decision: str, *, reason: str = ""):
+        """Entscheidet über einen Rollen-Antrag. `accept` oder `reject`."""
+        # Permission-Check
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        is_admin = ctx.author.guild_permissions.manage_guild
+        review_role_id = await self.config.guild(ctx.guild).team_role_requests_review_role()
+        if review_role_id:
+            review_role = ctx.guild.get_role(review_role_id)
+            if review_role and ctx.author.get_role(review_role_id) is not None:
+                is_staff = True
+        if not (is_staff or is_admin):
+            await ctx.send("❌ Nur Teammitglieder oder Admins können über Anträge entscheiden.")
+            return
+        decision = decision.lower()
+        if decision not in ("accept", "reject", "accepted", "rejected"):
+            await ctx.send("❌ Ungültige Entscheidung. Verwende `accept` oder `reject`.")
+            return
+        reqs = await self.config.guild(ctx.guild).team_role_requests() or {}
+        if req_id not in reqs:
+            await ctx.send(f"❌ Antrag #{req_id} nicht gefunden.")
+            return
+        req = reqs[req_id]
+        if req.get("status") != "pending":
+            await ctx.send(f"❌ Antrag #{req_id} wurde bereits entschieden (Status: {req.get('status')}).")
+            return
+        new_status = "accepted" if decision in ("accept", "accepted") else "rejected"
+        req["status"] = new_status
+        req["decided_by"] = ctx.author.id
+        req["decided_ts"] = _now_ts()
+        req["decision_reason"] = reason[:500] if reason else None
+        reqs[req_id] = req
+        await self.config.guild(ctx.guild).team_role_requests.set(reqs)
+        # Rolle vergeben falls accepted
+        if new_status == "accepted":
+            try:
+                member = ctx.guild.get_member(req.get("user_id"))
+                if member is None:
+                    member = await ctx.guild.fetch_member(req.get("user_id"))
+                if member:
+                    role = ctx.guild.get_role(req.get("requested_role_id"))
+                    if role:
+                        await member.add_roles(role, reason=f"Rollen-Antrag #{req_id} angenommen von {ctx.author.display_name}")
+                    else:
+                        await ctx.send("⚠️ Rolle existiert nicht mehr — Status trotzdem gesetzt.")
+                else:
+                    await ctx.send("⚠️ User nicht mehr auf dem Server — Status trotzdem gesetzt.")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await ctx.send(f"⚠️ Konnte Rolle nicht vergeben: `{e}` — Status trotzdem gesetzt.")
+        # User benachrichtigen
+        try:
+            user = await self.bot.fetch_user(req.get("user_id"))
+            if user:
+                embed = discord.Embed(
+                    title=f"{'✅ Antrag angenommen' if new_status == 'accepted' else '❌ Antrag abgelehnt'}",
+                    description=f"Dein Antrag für Rolle **{req.get('requested_role_name')}** auf **{ctx.guild.name}** wurde {'angenommen' if new_status == 'accepted' else 'abgelehnt'}.",
+                    color=discord.Color.green() if new_status == "accepted" else discord.Color.red(),
+                    timestamp=_now(),
+                )
+                if reason:
+                    embed.add_field(name="📝 Begründung", value=reason[:500], inline=False)
+                embed.add_field(name="📅 Entscheidung am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+                embed.add_field(name="👤 Entscheidung von", value=ctx.author.mention, inline=True)
+                await user.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await ctx.send(f"✅ Antrag #{req_id} wurde **{new_status}**.\nUser wurde per DM benachrichtigt.")
+
+    @team_role.command(name="channel")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def team_role_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für neue Rollen-Anträge."""
+        if channel is None:
+            await self.config.guild(ctx.guild).team_role_requests_channel.set(None)
+            await ctx.send("✅ Antrag-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_role_requests_channel.set(channel.id)
+        await ctx.send(f"✅ Antrag-Channel gesetzt auf {channel.mention}.")
+
+    @team_role.command(name="reviewrole")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def team_role_reviewrole(self, ctx: commands.Context, role: discord.Role = None):
+        """Setzt die Rolle die Anträge bearbeiten darf."""
+        if role is None:
+            await self.config.guild(ctx.guild).team_role_requests_review_role.set(None)
+            await ctx.send("✅ Review-Rolle zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_role_requests_review_role.set(role.id)
+        await ctx.send(f"✅ Review-Rolle gesetzt auf {role.mention}.")
+
+    # --- TEAM-MEETING/APPOINTMENT SETTINGS ---
+
+    @commands.group(name="teamset", aliases=["teamconfig"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def team_set(self, ctx: commands.Context):
+        """Konfiguriert das Team-Management System."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_set.command(name="meetingchannel")
+    async def team_set_meetingchannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Meeting-Ankündigungen."""
+        if channel is None:
+            await self.config.guild(ctx.guild).team_meetings_announcement_channel.set(None)
+            await ctx.send("✅ Meeting-Ankündigungs-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_meetings_announcement_channel.set(channel.id)
+        await ctx.send(f"✅ Meeting-Ankündigungs-Channel gesetzt auf {channel.mention}.")
+
+    @team_set.command(name="appointmentchannel")
+    async def team_set_appointmentchannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Termin-Ankündigungen."""
+        if channel is None:
+            await self.config.guild(ctx.guild).team_appointments_announcement_channel.set(None)
+            await ctx.send("✅ Termin-Ankündigungs-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_appointments_announcement_channel.set(channel.id)
+        await ctx.send(f"✅ Termin-Ankündigungs-Channel gesetzt auf {channel.mention}.")
+
+    @team_set.command(name="show")
+    async def team_set_show(self, ctx: commands.Context):
+        """Zeigt die Team-Management Konfiguration."""
+        g = self.config.guild(ctx.guild)
+        embed = discord.Embed(
+            title="⚙️ Team-Management Konfiguration",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        # Meetings
+        meetings = await g.team_meetings() or {}
+        ann_ch_id = await g.team_meetings_announcement_channel()
+        ann_ch = ctx.guild.get_channel(ann_ch_id) if ann_ch_id else None
+        embed.add_field(name="📅 Meetings", value=f"{len(meetings)} gesamt", inline=True)
+        embed.add_field(name="📅 Meeting-Channel", value=ann_ch.mention if ann_ch else "❌", inline=True)
+        # Applications
+        apps = await g.team_applications() or {}
+        app_ch_id = await g.team_applications_channel()
+        app_ch = ctx.guild.get_channel(app_ch_id) if app_ch_id else None
+        review_role_id = await g.team_applications_review_role()
+        review_role = ctx.guild.get_role(review_role_id) if review_role_id else None
+        embed.add_field(name="📋 Bewerbungen", value=f"{len(apps)} gesamt", inline=True)
+        embed.add_field(name="📋 Bewerbungs-Channel", value=app_ch.mention if app_ch else "❌", inline=True)
+        embed.add_field(name="📋 Review-Rolle", value=review_role.mention if review_role else "❌", inline=True)
+        # Appointments
+        appts = await g.team_appointments() or {}
+        appt_ann_ch_id = await g.team_appointments_announcement_channel()
+        appt_ann_ch = ctx.guild.get_channel(appt_ann_ch_id) if appt_ann_ch_id else None
+        embed.add_field(name="📌 Termine", value=f"{len(appts)} gesamt", inline=True)
+        embed.add_field(name="📌 Termin-Channel", value=appt_ann_ch.mention if appt_ann_ch else "❌", inline=True)
+        # Role Requests
+        reqs = await g.team_role_requests() or {}
+        req_ch_id = await g.team_role_requests_channel()
+        req_ch = ctx.guild.get_channel(req_ch_id) if req_ch_id else None
+        req_review_role_id = await g.team_role_requests_review_role()
+        req_review_role = ctx.guild.get_role(req_review_role_id) if req_review_role_id else None
+        embed.add_field(name="🏷️ Rollen-Anträge", value=f"{len(reqs)} gesamt", inline=True)
+        embed.add_field(name="🏷️ Antrag-Channel", value=req_ch.mention if req_ch else "❌", inline=True)
+        embed.add_field(name="🏷️ Review-Rolle", value=req_review_role.mention if req_review_role else "❌", inline=True)
+        embed.set_footer(text=f"Team-Management • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    # --- BACKGROUND LOOP: TERMIN-ERINNERUNGEN ---
+
+    async def _team_reminder_loop(self):
+        """Background loop: sendet Erinnerungen für anstehende Teamtermine (15 Min vorher)."""
+        await self.bot.wait_until_red_ready()
+        await asyncio.sleep(180)  # 3 Min Startup
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        await self._team_check_appointment_reminders(guild)
+                    except Exception:
+                        log.exception("Fehler in Team-Reminder-Loop für Guild %s", getattr(guild, "id", "?"))
+            except Exception:
+                log.exception("Schwerer Fehler im Team-Reminder-Loop")
+            await asyncio.sleep(300)  # Alle 5 Min prüfen
+
+    async def _team_check_appointment_reminders(self, guild: discord.Guild):
+        """Prüft alle Termine ob eine Erinnerung fällig ist (15 Min vorher)."""
+        appts = await self.config.guild(guild).team_appointments() or {}
+        now_ts = _now_ts()
+        reminder_cutoff = now_ts + 900  # 15 Min in Zukunft
+        for appt_id, appt in appts.items():
+            if appt.get("reminder_sent"):
+                continue
+            scheduled_ts = appt.get("scheduled_ts", 0)
+            if scheduled_ts <= 0:
+                continue
+            # Prüfen ob Termin in den nächsten 15 Min ist
+            if scheduled_ts > reminder_cutoff:
+                continue
+            if scheduled_ts <= now_ts:
+                continue  # Termin ist schon vorbei
+            # Erinnerung senden
+            try:
+                ann_ch_id = await self.config.guild(guild).team_appointments_announcement_channel()
+                ann_ch = guild.get_channel(ann_ch_id) if ann_ch_id else None
+                attendees = appt.get("attendees", [])
+                attendee_mentions = " ".join(f"<@{uid}>" for uid in attendees[:20])
+                embed = discord.Embed(
+                    title="⏰ Termin-Erinnerung",
+                    description=f"**{appt.get('title', '?')}** startet in 15 Minuten!\n\n{appt.get('description', '')}",
+                    color=discord.Color.orange(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="📅 Wann", value=_fmt_berlin_full(_from_ts(scheduled_ts)) + " (MEZ/MESZ)", inline=True)
+                embed.add_field(name="👥 Angemeldet", value=f"{len(attendees)} Teilnehmer", inline=True)
+                if ann_ch:
+                    try:
+                        await ann_ch.send(content=attendee_mentions, embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                # DM an alle Attendees
+                for uid in attendees:
+                    try:
+                        user = guild.get_member(uid) or await self.bot.fetch_user(uid)
+                        if user:
+                            await user.send(embed=embed)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                # Als erinnert markieren
+                appts[appt_id]["reminder_sent"] = True
+                await self.config.guild(guild).team_appointments.set(appts)
+            except Exception:
+                log.exception("Fehler beim Senden der Termin-Erinnerung für %s", appt_id)
+
+    # ============================================
+    # TEAM-ANKÜNDIGUNGEN & ABSTIMMUNGEN & FEEDBACK & INTERVIEWS
+    # ============================================
+
+    # --- TEAM-ANKÜNDIGUNGEN ---
+
+    @commands.group(name="teamannounce", aliases=["tannounce", "ankuendigung", "announce"])
+    @commands.guild_only()
+    async def team_announce(self, ctx: commands.Context):
+        """Team-Ankündigungen verwalten."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_announce.command(name="create", aliases=["send", "post"])
+    @commands.guild_only()
+    async def team_announce_create(self, ctx: commands.Context, title: str, *, message: str):
+        """Erstellt eine Team-Ankündigung.
+        Beispiel: `[p]teamannounce create "Wartungsarbeiten" Am 25.12. gibt es Wartungsarbeiten...`
+        """
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_staff or ctx.author.guild_permissions.manage_guild):
+            await ctx.send("❌ Nur Teammitglieder oder Admins können Ankündigungen erstellen.")
+            return
+        if len(title) > 200:
+            await ctx.send("❌ Titel zu lang (max 200 Zeichen).")
+            return
+        if len(message) > 2000:
+            await ctx.send("❌ Nachricht zu lang (max 2000 Zeichen).")
+            return
+        counter = await self.config.guild(ctx.guild).team_announcements_counter() or 0
+        counter += 1
+        ann_id = str(counter)
+        anns = await self.config.guild(ctx.guild).team_announcements() or {}
+        anns[ann_id] = {
+            "title": title,
+            "message": message,
+            "author_id": ctx.author.id,
+            "author_name": ctx.author.display_name,
+            "ts": _now_ts(),
+            "channel_id": ctx.channel.id,
+            "pinned": False,
+        }
+        await self.config.guild(ctx.guild).team_announcements.set(anns)
+        await self.config.guild(ctx.guild).team_announcements_counter.set(counter)
+        embed = discord.Embed(
+            title=f"📢 Ankündigung #{ann_id} — {title}",
+            description=message,
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="👤 Von", value=ctx.author.mention, inline=True)
+        embed.add_field(name="📅 Am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+        embed.set_footer(text=f"Ankündigungs-ID: {ann_id}")
+        try:
+            ann_msg = await ctx.send(embed=embed)
+            # Pin versuchen
+            try:
+                await ann_msg.pin()
+                anns[ann_id]["pinned"] = True
+                anns[ann_id]["message_id"] = ann_msg.id
+                await self.config.guild(ctx.guild).team_announcements.set(anns)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Ankündigung nicht senden: `{e}`")
+            return
+        await ctx.send(f"✅ Ankündigung #{ann_id} erstellt.", delete_after=5)
+
+    @team_announce.command(name="list")
+    async def team_announce_list(self, ctx: commands.Context):
+        """Zeigt alle Team-Ankündigungen an."""
+        anns = await self.config.guild(ctx.guild).team_announcements() or {}
+        if not anns:
+            await ctx.send("ℹ️ Keine Ankündigungen vorhanden.")
+            return
+        embed = discord.Embed(
+            title="📢 Team-Ankündigungen",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        sorted_anns = sorted(anns.items(), key=lambda x: x[1].get("ts", 0), reverse=True)
+        for ann_id, ann in sorted_anns[:10]:
+            ts_str = _fmt_berlin_full(_from_ts(ann.get("ts", 0))) if ann.get("ts") else "?"
+            embed.add_field(
+                name=f"📢 #{ann_id} — {ann.get('title', '?')}",
+                value=f"👤 {ann.get('author_name', '?')} • 📅 {ts_str} (MEZ/MESZ)\n{ann.get('message', '')[:200]}",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(anns)} Ankündigung(en) gesamt")
+        await ctx.send(embed=embed)
+
+    @team_announce.command(name="delete", aliases=["remove"])
+    async def team_announce_delete(self, ctx: commands.Context, ann_id: str):
+        """Löscht eine Team-Ankündigung."""
+        anns = await self.config.guild(ctx.guild).team_announcements() or {}
+        if ann_id not in anns:
+            await ctx.send(f"❌ Ankündigung #{ann_id} nicht gefunden.")
+            return
+        ann = anns[ann_id]
+        is_author = ann.get("author_id") == ctx.author.id
+        is_admin = ctx.author.guild_permissions.manage_guild
+        if not (is_author or is_admin):
+            await ctx.send("❌ Nur der Ersteller oder Admins können die Ankündigung löschen.")
+            return
+        # Pin entfernen falls vorhanden
+        if ann.get("pinned") and ann.get("message_id"):
+            try:
+                ch = ctx.guild.get_channel(ann.get("channel_id", 0))
+                if ch:
+                    msg = await ch.fetch_message(ann["message_id"])
+                    await msg.unpin()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        del anns[ann_id]
+        await self.config.guild(ctx.guild).team_announcements.set(anns)
+        await ctx.send(f"✅ Ankündigung #{ann_id} gelöscht.")
+
+    # --- TEAM-ABSTIMMUNGEN (POLLS) ---
+
+    @commands.group(name="teampoll", aliases=["tpoll", "abstimmung", "poll"])
+    @commands.guild_only()
+    async def team_poll(self, ctx: commands.Context):
+        """Team-Abstimmungen verwalten."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_poll.command(name="create", aliases=["start", "new"])
+    @commands.guild_only()
+    async def team_poll_create(self, ctx: commands.Context, question: str, *, options_str: str):
+        """Erstellt eine Team-Abstimmung.
+        Trenne Optionen mit `|`. Beispiel:
+        `[p]teampoll create "Welches Event?" LAN-Party | Online-Turnier | Beides`
+        """
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_staff or ctx.author.guild_permissions.manage_guild):
+            await ctx.send("❌ Nur Teammitglieder oder Admins können Abstimmungen erstellen.")
+            return
+        if len(question) > 200:
+            await ctx.send("❌ Frage zu lang (max 200 Zeichen).")
+            return
+        # Optionen splitten
+        options_list = [opt.strip() for opt in options_str.split("|") if opt.strip()]
+        if len(options_list) < 2:
+            await ctx.send("❌ Mindestens 2 Optionen erforderlich. Trenne mit `|`.")
+            return
+        if len(options_list) > 10:
+            await ctx.send("❌ Maximal 10 Optionen erlaubt.")
+            return
+        for opt in options_list:
+            if len(opt) > 80:
+                await ctx.send(f"❌ Option zu lang (max 80 Zeichen): `{opt}`")
+                return
+        # Poll erstellen
+        counter = await self.config.guild(ctx.guild).team_polls_counter() or 0
+        counter += 1
+        poll_id = str(counter)
+        polls = await self.config.guild(ctx.guild).team_polls() or {}
+        polls[poll_id] = {
+            "question": question,
+            "options": [{"text": opt, "votes": []} for opt in options_list],
+            "author_id": ctx.author.id,
+            "author_name": ctx.author.display_name,
+            "ts": _now_ts(),
+            "active": True,
+            "channel_id": ctx.channel.id,
+        }
+        await self.config.guild(ctx.guild).team_polls.set(polls)
+        await self.config.guild(ctx.guild).team_polls_counter.set(counter)
+        # Embed + Buttons
+        embed = await self._team_build_poll_embed(polls[poll_id], poll_id, ctx.guild)
+        view = TeamPollView(self, poll_id, polls[poll_id]["options"])
+        await ctx.send(embed=embed, view=view)
+        await ctx.send(f"✅ Abstimmung #{poll_id} erstellt.", delete_after=5)
+
+    @team_poll.command(name="end", aliases=["close", "stop"])
+    async def team_poll_end(self, ctx: commands.Context, poll_id: str):
+        """Beendet eine Team-Abstimmung."""
+        polls = await self.config.guild(ctx.guild).team_polls() or {}
+        if poll_id not in polls:
+            await ctx.send(f"❌ Abstimmung #{poll_id} nicht gefunden.")
+            return
+        poll = polls[poll_id]
+        is_author = poll.get("author_id") == ctx.author.id
+        is_admin = ctx.author.guild_permissions.manage_guild
+        if not (is_author or is_admin):
+            await ctx.send("❌ Nur der Ersteller oder Admins können die Abstimmung beenden.")
+            return
+        poll["active"] = False
+        polls[poll_id] = poll
+        await self.config.guild(ctx.guild).team_polls.set(polls)
+        embed = await self._team_build_poll_embed(poll, poll_id, ctx.guild)
+        embed.title = f"📊 Abstimmung #{poll_id} — BEENDET"
+        embed.color = discord.Color.greyple()
+        await ctx.send(embed=embed)
+
+    @team_poll.command(name="list")
+    async def team_poll_list(self, ctx: commands.Context):
+        """Zeigt alle Team-Abstimmungen an."""
+        polls = await self.config.guild(ctx.guild).team_polls() or {}
+        if not polls:
+            await ctx.send("ℹ️ Keine Abstimmungen vorhanden.")
+            return
+        embed = discord.Embed(
+            title="📊 Team-Abstimmungen",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        sorted_polls = sorted(polls.items(), key=lambda x: x[1].get("ts", 0), reverse=True)
+        for poll_id, poll in sorted_polls[:10]:
+            status = "🟢 Aktiv" if poll.get("active", True) else "🔴 Beendet"
+            total_votes = sum(len(opt.get("votes", [])) for opt in poll.get("options", []))
+            embed.add_field(
+                name=f"📊 #{poll_id} — {poll.get('question', '?')}",
+                value=f"Status: {status} • {total_votes} Stimme(n) • 👤 {poll.get('author_name', '?')}",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(polls)} Abstimmung(en) gesamt")
+        await ctx.send(embed=embed)
+
+    async def _team_build_poll_embed(self, poll: dict, poll_id: str, guild: discord.Guild) -> discord.Embed:
+        """Baut das Embed für eine Team-Abstimmung."""
+        options = poll.get("options", [])
+        total_votes = sum(len(opt.get("votes", [])) for opt in options)
+        status = "🟢 Aktiv" if poll.get("active", True) else "🔴 Beendet"
+        embed = discord.Embed(
+            title=f"📊 Abstimmung #{poll_id} — {poll.get('question', '?')}",
+            description=f"Status: {status} • {total_votes} Stimme(n) gesamt",
+            color=discord.Color.blurple() if poll.get("active", True) else discord.Color.greyple(),
+            timestamp=_now(),
+        )
+        # Ergebnisse
+        for i, opt in enumerate(options):
+            votes = opt.get("votes", [])
+            vote_count = len(votes)
+            percentage = (vote_count / total_votes * 100) if total_votes > 0 else 0
+            bar_length = int(percentage / 10)
+            bar = "█" * bar_length + "░" * (10 - bar_length)
+            embed.add_field(
+                name=f"Option {i+1}: {opt.get('text', '?')}",
+                value=f"{bar} {vote_count} ({percentage:.0f}%)",
+                inline=False,
+            )
+        embed.add_field(name="👤 Erstellt von", value=f"<@{poll.get('author_id', '?')}>", inline=True)
+        embed.add_field(name="📅 Am", value=_fmt_berlin_full(_from_ts(poll.get("ts", 0))) + " (MEZ/MESZ)", inline=True)
+        embed.set_footer(text=f"Poll-ID: {poll_id} • Klicke unten zum Abstimmen (Stimme kann geändert werden)")
+        return embed
+
+    # --- TEAM-FEEDBACK ---
+
+    @commands.group(name="teamfeedback", aliases=["tfeedback", "feedback"])
+    @commands.guild_only()
+    async def team_feedback(self, ctx: commands.Context):
+        """Team-Feedback System (für und über Teammitglieder)."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_feedback.command(name="give", aliases=["submit", "create"])
+    async def team_feedback_give(self, ctx: commands.Context, member: discord.Member, rating: int, *, text: str):
+        """Gibt Feedback für ein Teammitglied.
+        Beispiel: `[p]teamfeedback give @User 5 Sehr hilfsbereit und zuverlässig`
+        Bewertung: 1-5 (5 = best)
+        """
+        if member.id == ctx.author.id:
+            await ctx.send("❌ Du kannst dir nicht selbst Feedback geben.")
+            return
+        if rating < 1 or rating > 5:
+            await ctx.send("❌ Bewertung muss zwischen 1 und 5 liegen.")
+            return
+        if len(text) < 20:
+            await ctx.send("❌ Feedback-Text zu kurz (min 20 Zeichen).")
+            return
+        if len(text) > 1000:
+            await ctx.send("❌ Feedback-Text zu lang (max 1000 Zeichen).")
+            return
+        counter = await self.config.guild(ctx.guild).team_feedback_counter() or 0
+        counter += 1
+        fb_id = str(counter)
+        fbs = await self.config.guild(ctx.guild).team_feedback() or {}
+        fbs[fb_id] = {
+            "from_user_id": ctx.author.id,
+            "from_name": ctx.author.display_name,
+            "to_user_id": member.id,
+            "to_name": member.display_name,
+            "rating": rating,
+            "text": text[:1000],
+            "ts": _now_ts(),
+        }
+        await self.config.guild(ctx.guild).team_feedback.set(fbs)
+        await self.config.guild(ctx.guild).team_feedback_counter.set(counter)
+        await ctx.send(f"✅ Feedback #{fb_id} für {member.mention} abgegeben.")
+
+    @team_feedback.command(name="view", aliases=["show"])
+    async def team_feedback_view(self, ctx: commands.Context, member: discord.Member = None):
+        """Zeigt Feedback für ein Teammitglied an (standardmäßig für dich selbst).
+        Nur Staff kann Feedback anderer sehen."""
+        if member is None:
+            member = ctx.author
+        elif member.id != ctx.author.id:
+            is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+            if not (is_staff or ctx.author.guild_permissions.manage_guild):
+                await ctx.send("❌ Du kannst nur dein eigenes Feedback sehen. Für andere brauchst du Team-Rechte.")
+                return
+        fbs = await self.config.guild(ctx.guild).team_feedback() or {}
+        user_fbs = {k: v for k, v in fbs.items() if v.get("to_user_id") == member.id}
+        if not user_fbs:
+            await ctx.send(f"ℹ️ Kein Feedback für {member.mention} vorhanden.")
+            return
+        # Durchschnitt berechnen
+        ratings = [fb.get("rating", 0) for fb in user_fbs.values()]
+        avg_rating = sum(ratings) / len(ratings) if ratings else 0
+        embed = discord.Embed(
+            title=f"💬 Feedback für {member.display_name}",
+            description=f"Durchschnittliche Bewertung: {'⭐' * round(avg_rating)} ({avg_rating:.1f}/5)\n{len(user_fbs)} Feedback(s) gesamt",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        for fb_id, fb in list(user_fbs.items())[-5:]:
+            rating_stars = "⭐" * fb.get("rating", 0)
+            ts_str = _fmt_berlin_full(_from_ts(fb.get("ts", 0)))
+            embed.add_field(
+                name=f"#{fb_id} — {rating_stars} ({fb.get('rating', '?')}/5)",
+                value=f"👤 Von: {fb.get('from_name', '?')}\n📅 {ts_str} (MEZ/MESZ)\n📝 {fb.get('text', '')[:500]}",
+                inline=False,
+            )
+        embed.set_footer(text=f"Zeige letzte 5 von {len(user_fbs)} Feedback(s)")
+        await ctx.send(embed=embed)
+
+    # --- TEAM-INTERVIEWS ---
+
+    @commands.group(name="teaminterview", aliases=["tinterview", "interview"])
+    @commands.guild_only()
+    async def team_interview_cmd(self, ctx: commands.Context):
+        """Verwaltet Interview-Termine für Bewerber."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_interview_cmd.command(name="list")
+    async def team_interview_list(self, ctx: commands.Context):
+        """Zeigt alle anstehenden Interviews an."""
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_staff or ctx.author.guild_permissions.manage_guild):
+            await ctx.send("❌ Nur Teammitglieder können Interviews einsehen.")
+            return
+        interviews = await self.config.guild(ctx.guild).team_interviews() or {}
+        if not interviews:
+            await ctx.send("ℹ️ Keine Interviews geplant.")
+            return
+        now_ts = _now_ts()
+        upcoming = [(iid, iv) for iid, iv in interviews.items() if iv.get("scheduled_ts", 0) > now_ts - 3600 and iv.get("status") == "scheduled"]
+        if not upcoming:
+            await ctx.send("ℹ️ Keine anstehenden Interviews.")
+            return
+        upcoming.sort(key=lambda x: x[1].get("scheduled_ts", 0))
+        embed = discord.Embed(
+            title="📅 Anstehende Interviews",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        for iid, iv in upcoming[:10]:
+            scheduled_ts = iv.get("scheduled_ts", 0)
+            date_str = _fmt_berlin_full(_from_ts(scheduled_ts)) if scheduled_ts else "?"
+            ch = ctx.guild.get_channel(iv.get("channel_id", 0))
+            ch_name = ch.mention if ch else "❌"
+            embed.add_field(
+                name=f"📅 #{iid} — {iv.get('position', '?')}",
+                value=f"👤 Bewerber: <@{iv.get('user_id')}>\n📅 {date_str} (MEZ/MESZ)\n📍 {ch_name}",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(upcoming)} anstehende Interview(s)")
+        await ctx.send(embed=embed)
+
+    @team_interview_cmd.command(name="cancel")
+    async def team_interview_cancel(self, ctx: commands.Context, interview_id: str):
+        """Sagt einen Interview-Termin ab."""
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_staff or ctx.author.guild_permissions.manage_guild):
+            await ctx.send("❌ Nur Teammitglieder können Interviews absagen.")
+            return
+        interviews = await self.config.guild(ctx.guild).team_interviews() or {}
+        if interview_id not in interviews:
+            await ctx.send(f"❌ Interview #{interview_id} nicht gefunden.")
+            return
+        interviews[interview_id]["status"] = "cancelled"
+        await self.config.guild(ctx.guild).team_interviews.set(interviews)
+        # Bewerber benachrichtigen
+        try:
+            user = await self.bot.fetch_user(interviews[interview_id].get("user_id"))
+            if user:
+                embed = discord.Embed(
+                    title="❌ Interview abgesagt",
+                    description=f"Dein Interview für **{interviews[interview_id].get('position', '?')}** auf **{ctx.guild.name}** wurde abgesagt.",
+                    color=discord.Color.red(),
+                    timestamp=_now(),
+                )
+                await user.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await ctx.send(f"✅ Interview #{interview_id} abgesagt. Bewerber wurde benachrichtigt.")
+
+    @team_interview_cmd.command(name="complete")
+    async def team_interview_complete(self, ctx: commands.Context, interview_id: str, *, notes: str = ""):
+        """Markiert ein Interview als abgeschlossen (mit optionalen Notizen)."""
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_staff or ctx.author.guild_permissions.manage_guild):
+            await ctx.send("❌ Nur Teammitglieder können Interviews abschließen.")
+            return
+        interviews = await self.config.guild(ctx.guild).team_interviews() or {}
+        if interview_id not in interviews:
+            await ctx.send(f"❌ Interview #{interview_id} nicht gefunden.")
+            return
+        interviews[interview_id]["status"] = "completed"
+        if notes:
+            interviews[interview_id]["notes"] = notes[:1000]
+        interviews[interview_id]["completed_ts"] = _now_ts()
+        await self.config.guild(ctx.guild).team_interviews.set(interviews)
+        await ctx.send(f"✅ Interview #{interview_id} als abgeschlossen markiert.")
 
     # ============================================
     # MULTI-KATEGORIE-CORE-LOGIK
@@ -12477,6 +13830,502 @@ class SyncSlaveModal(discord.ui.Modal):
         except discord.HTTPException:
             pass
         log.exception("Fehler im SyncSlaveModal", exc_info=error)
+
+
+# ============================================
+# TEAM-MANAGEMENT VIEW KLASSEN
+# ============================================
+
+class TeamMeetingView(discord.ui.View):
+    """View für Teambesprechungen mit An-/Abmelde-Buttons."""
+
+    def __init__(self, cog, meeting_id: str):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.meeting_id = meeting_id
+
+    @discord.ui.button(label="Anmelden", style=discord.ButtonStyle.success, emoji="✅", custom_id="team_meeting_join")
+    async def join_meeting(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        meetings = await self.cog.config.guild(interaction.guild).team_meetings() or {}
+        if self.meeting_id not in meetings:
+            await interaction.response.send_message("❌ Diese Besprechung existiert nicht mehr.", ephemeral=True)
+            return
+        meeting = meetings[self.meeting_id]
+        attendees = meeting.get("attendees", [])
+        if interaction.user.id in attendees:
+            await interaction.response.send_message("ℹ️ Du bist bereits angemeldet.", ephemeral=True)
+            return
+        attendees.append(interaction.user.id)
+        meeting["attendees"] = attendees
+        meetings[self.meeting_id] = meeting
+        await self.cog.config.guild(interaction.guild).team_meetings.set(meetings)
+        # Embed aktualisieren
+        embed = await self.cog._team_build_meeting_embed(meeting, self.meeting_id, interaction.guild)
+        await interaction.response.edit_message(embed=embed)
+
+    @discord.ui.button(label="Abmelden", style=discord.ButtonStyle.danger, emoji="❌", custom_id="team_meeting_leave")
+    async def leave_meeting(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        meetings = await self.cog.config.guild(interaction.guild).team_meetings() or {}
+        if self.meeting_id not in meetings:
+            await interaction.response.send_message("❌ Diese Besprechung existiert nicht mehr.", ephemeral=True)
+            return
+        meeting = meetings[self.meeting_id]
+        attendees = meeting.get("attendees", [])
+        if interaction.user.id not in attendees:
+            await interaction.response.send_message("ℹ️ Du bist nicht angemeldet.", ephemeral=True)
+            return
+        # Ersteller kann sich nicht abmelden
+        if meeting.get("created_by") == interaction.user.id:
+            await interaction.response.send_message("❌ Der Ersteller kann sich nicht abmelden.", ephemeral=True)
+            return
+        attendees.remove(interaction.user.id)
+        meeting["attendees"] = attendees
+        meetings[self.meeting_id] = meeting
+        await self.cog.config.guild(interaction.guild).team_meetings.set(meetings)
+        embed = await self.cog._team_build_meeting_embed(meeting, self.meeting_id, interaction.guild)
+        await interaction.response.edit_message(embed=embed)
+
+
+class TeamAppointmentView(discord.ui.View):
+    """View für Teamtermine mit An-/Abmelde-Buttons."""
+
+    def __init__(self, cog, appt_id: str):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.appt_id = appt_id
+
+    @discord.ui.button(label="Anmelden", style=discord.ButtonStyle.success, emoji="✅", custom_id="team_appt_join")
+    async def join_appt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        appts = await self.cog.config.guild(interaction.guild).team_appointments() or {}
+        if self.appt_id not in appts:
+            await interaction.response.send_message("❌ Dieser Termin existiert nicht mehr.", ephemeral=True)
+            return
+        appt = appts[self.appt_id]
+        attendees = appt.get("attendees", [])
+        if interaction.user.id in attendees:
+            await interaction.response.send_message("ℹ️ Du bist bereits angemeldet.", ephemeral=True)
+            return
+        attendees.append(interaction.user.id)
+        appt["attendees"] = attendees
+        appts[self.appt_id] = appt
+        await self.cog.config.guild(interaction.guild).team_appointments.set(appts)
+        embed = await self.cog._team_build_appointment_embed(appt, self.appt_id, interaction.guild)
+        await interaction.response.edit_message(embed=embed)
+
+    @discord.ui.button(label="Abmelden", style=discord.ButtonStyle.danger, emoji="❌", custom_id="team_appt_leave")
+    async def leave_appt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        appts = await self.cog.config.guild(interaction.guild).team_appointments() or {}
+        if self.appt_id not in appts:
+            await interaction.response.send_message("❌ Dieser Termin existiert nicht mehr.", ephemeral=True)
+            return
+        appt = appts[self.appt_id]
+        attendees = appt.get("attendees", [])
+        if interaction.user.id not in attendees:
+            await interaction.response.send_message("ℹ️ Du bist nicht angemeldet.", ephemeral=True)
+            return
+        if appt.get("created_by") == interaction.user.id:
+            await interaction.response.send_message("❌ Der Ersteller kann sich nicht abmelden.", ephemeral=True)
+            return
+        attendees.remove(interaction.user.id)
+        appt["attendees"] = attendees
+        appts[self.appt_id] = appt
+        await self.cog.config.guild(interaction.guild).team_appointments.set(appts)
+        embed = await self.cog._team_build_appointment_embed(appt, self.appt_id, interaction.guild)
+        await interaction.response.edit_message(embed=embed)
+
+
+class TeamApplicationReviewView(discord.ui.View):
+    """View für Bewerbungs-Review mit Annehmen/Ablehnen/Einladen-Buttons."""
+
+    def __init__(self, cog, app_id: str):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.app_id = app_id
+
+    @discord.ui.button(label="Annehmen", style=discord.ButtonStyle.success, emoji="✅", custom_id="team_app_accept")
+    async def accept_app(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._decide(interaction, "accepted")
+
+    @discord.ui.button(label="Ablehnen", style=discord.ButtonStyle.danger, emoji="❌", custom_id="team_app_reject")
+    async def reject_app(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._decide(interaction, "rejected")
+
+    @discord.ui.button(label="Zum Termin einladen", style=discord.ButtonStyle.primary, emoji="📅", custom_id="team_app_interview")
+    async def interview_app(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        # Permission-Check
+        is_staff = await self.cog._is_ticket_staff(interaction.user, interaction.channel, interaction.guild)
+        is_admin = interaction.user.guild_permissions.manage_guild
+        review_role_id = await self.cog.config.guild(interaction.guild).team_applications_review_role()
+        if review_role_id:
+            review_role = interaction.guild.get_role(review_role_id)
+            if review_role and interaction.user.get_role(review_role_id) is not None:
+                is_staff = True
+        if not (is_staff or is_admin):
+            await interaction.response.send_message("❌ Nur Teammitglieder können Bewerbungen zu Terminen einladen.", ephemeral=True)
+            return
+        # Modal öffnen
+        modal = TeamInterviewModal(self.cog, self.app_id)
+        await interaction.response.send_modal(modal)
+
+    async def _decide(self, interaction: discord.Interaction, decision: str):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        # Permission-Check
+        is_staff = await self.cog._is_ticket_staff(interaction.user, interaction.channel, interaction.guild)
+        is_admin = interaction.user.guild_permissions.manage_guild
+        review_role_id = await self.cog.config.guild(interaction.guild).team_applications_review_role()
+        if review_role_id:
+            review_role = interaction.guild.get_role(review_role_id)
+            if review_role and interaction.user.get_role(review_role_id) is not None:
+                is_staff = True
+        if not (is_staff or is_admin):
+            await interaction.response.send_message("❌ Nur Teammitglieder können über Bewerbungen entscheiden.", ephemeral=True)
+            return
+        apps = await self.cog.config.guild(interaction.guild).team_applications() or {}
+        if self.app_id not in apps:
+            await interaction.response.send_message("❌ Diese Bewerbung existiert nicht mehr.", ephemeral=True)
+            return
+        app = apps[self.app_id]
+        if app.get("status") != "pending":
+            await interaction.response.send_message(f"❌ Bewerbung wurde bereits entschieden (Status: {app.get('status')}).", ephemeral=True)
+            return
+        app["status"] = decision
+        app["decided_by"] = interaction.user.id
+        app["decided_ts"] = _now_ts()
+        apps[self.app_id] = app
+        await self.cog.config.guild(interaction.guild).team_applications.set(apps)
+        # Bewerber benachrichtigen
+        try:
+            user = await self.cog.bot.fetch_user(app.get("user_id"))
+            if user:
+                embed = discord.Embed(
+                    title=f"{'✅ Bewerbung angenommen' if decision == 'accepted' else '❌ Bewerbung abgelehnt'}",
+                    description=f"Deine Bewerbung für **{app.get('position')}** auf **{interaction.guild.name}** wurde {'angenommen' if decision == 'accepted' else 'abgelehnt'}.",
+                    color=discord.Color.green() if decision == "accepted" else discord.Color.red(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="📅 Entscheidung am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+                embed.add_field(name="👤 Entscheidung von", value=interaction.user.mention, inline=True)
+                await user.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Embed aktualisieren
+        status_emoji = "✅" if decision == "accepted" else "❌"
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"{status_emoji} Bewerbung #{self.app_id} — {decision}",
+                description=f"**Position:** {app.get('position')}\n**Bewerber:** <@{app.get('user_id')}>\n**Entschieden von:** {interaction.user.mention}",
+                color=discord.Color.green() if decision == "accepted" else discord.Color.red(),
+                timestamp=_now(),
+            ),
+            view=None,
+        )
+
+
+class TeamRoleReviewView(discord.ui.View):
+    """View für Rollen-Antrag Review mit Annehmen/Ablehnen-Buttons."""
+
+    def __init__(self, cog, req_id: str):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.req_id = req_id
+
+    @discord.ui.button(label="Annehmen", style=discord.ButtonStyle.success, emoji="✅", custom_id="team_role_accept")
+    async def accept_req(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._decide(interaction, "accepted")
+
+    @discord.ui.button(label="Ablehnen", style=discord.ButtonStyle.danger, emoji="❌", custom_id="team_role_reject")
+    async def reject_req(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._decide(interaction, "rejected")
+
+    async def _decide(self, interaction: discord.Interaction, decision: str):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        # Permission-Check
+        is_staff = await self.cog._is_ticket_staff(interaction.user, interaction.channel, interaction.guild)
+        is_admin = interaction.user.guild_permissions.manage_guild
+        review_role_id = await self.cog.config.guild(interaction.guild).team_role_requests_review_role()
+        if review_role_id:
+            review_role = interaction.guild.get_role(review_role_id)
+            if review_role and interaction.user.get_role(review_role_id) is not None:
+                is_staff = True
+        if not (is_staff or is_admin):
+            await interaction.response.send_message("❌ Nur Teammitglieder können über Anträge entscheiden.", ephemeral=True)
+            return
+        reqs = await self.cog.config.guild(interaction.guild).team_role_requests() or {}
+        if self.req_id not in reqs:
+            await interaction.response.send_message("❌ Dieser Antrag existiert nicht mehr.", ephemeral=True)
+            return
+        req = reqs[self.req_id]
+        if req.get("status") != "pending":
+            await interaction.response.send_message(f"❌ Antrag wurde bereits entschieden (Status: {req.get('status')}).", ephemeral=True)
+            return
+        req["status"] = decision
+        req["decided_by"] = interaction.user.id
+        req["decided_ts"] = _now_ts()
+        reqs[self.req_id] = req
+        await self.cog.config.guild(interaction.guild).team_role_requests.set(reqs)
+        # Rolle vergeben falls accepted
+        if decision == "accepted":
+            try:
+                member = interaction.guild.get_member(req.get("user_id"))
+                if member is None:
+                    member = await interaction.guild.fetch_member(req.get("user_id"))
+                if member:
+                    role = interaction.guild.get_role(req.get("requested_role_id"))
+                    if role:
+                        await member.add_roles(role, reason=f"Rollen-Antrag #{self.req_id} angenommen von {interaction.user.display_name}")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        # User benachrichtigen
+        try:
+            user = await self.cog.bot.fetch_user(req.get("user_id"))
+            if user:
+                embed = discord.Embed(
+                    title=f"{'✅ Antrag angenommen' if decision == 'accepted' else '❌ Antrag abgelehnt'}",
+                    description=f"Dein Antrag für Rolle **{req.get('requested_role_name')}** auf **{interaction.guild.name}** wurde {'angenommen' if decision == 'accepted' else 'abgelehnt'}.",
+                    color=discord.Color.green() if decision == "accepted" else discord.Color.red(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="📅 Entscheidung am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+                embed.add_field(name="👤 Entscheidung von", value=interaction.user.mention, inline=True)
+                await user.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        status_emoji = "✅" if decision == "accepted" else "❌"
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"{status_emoji} Rollen-Antrag #{self.req_id} — {decision}",
+                description=f"**Rolle:** {req.get('requested_role_name')}\n**Antragsteller:** <@{req.get('user_id')}>\n**Entschieden von:** {interaction.user.mention}",
+                color=discord.Color.green() if decision == "accepted" else discord.Color.red(),
+                timestamp=_now(),
+            ),
+            view=None,
+        )
+
+
+class TeamInterviewModal(discord.ui.Modal):
+    """Modal zum Einladen eines Bewerbers zu einem Interview-Termin."""
+
+    def __init__(self, cog, app_id: str):
+        super().__init__(title="📅 Zum Termin einladen", timeout=300)
+        self.cog = cog
+        self.app_id = app_id
+        self.channel_input = discord.ui.TextInput(
+            label="Channel-ID oder #Mention",
+            placeholder="z.B. #interviews oder 123456789012345678",
+            required=True,
+            max_length=50,
+            custom_id="interview_channel",
+        )
+        self.add_item(self.channel_input)
+        self.date_input = discord.ui.TextInput(
+            label="Datum (DD.MM.YYYY)",
+            placeholder="z.B. 25.12.2025",
+            required=True,
+            min_length=10,
+            max_length=10,
+            custom_id="interview_date",
+        )
+        self.add_item(self.date_input)
+        self.time_input = discord.ui.TextInput(
+            label="Uhrzeit (HH:MM)",
+            placeholder="z.B. 18:00",
+            required=True,
+            min_length=5,
+            max_length=5,
+            custom_id="interview_time",
+        )
+        self.add_item(self.time_input)
+        self.notes_input = discord.ui.TextInput(
+            label="Notizen (optional)",
+            placeholder="Zusätzliche Infos für den Bewerber...",
+            required=False,
+            max_length=500,
+            style=discord.TextStyle.paragraph,
+            custom_id="interview_notes",
+        )
+        self.add_item(self.notes_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Channel parsen
+        channel_str = self.channel_input.value.strip()
+        channel = None
+        # Mention-Format <#123456>
+        m = re.match(r"<#(\d+)>", channel_str)
+        if m:
+            channel_id = int(m.group(1))
+        else:
+            try:
+                channel_id = int(channel_str)
+            except ValueError:
+                await interaction.response.send_message("❌ Ungültiger Channel. Verwende eine Channel-ID oder #Mention.", ephemeral=True)
+                return
+        channel = interaction.guild.get_channel(channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Channel nicht gefunden oder kein Text-Channel.", ephemeral=True)
+            return
+        # Datum/Zeit parsen
+        try:
+            dt_str = f"{self.date_input.value.strip()} {self.time_input.value.strip()}"
+            scheduled_dt = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
+            scheduled_dt = scheduled_dt.replace(tzinfo=_BERLIN_TZ)
+            scheduled_ts = int(scheduled_dt.timestamp())
+        except ValueError:
+            await interaction.response.send_message("❌ Ungültiges Datum/Zeit-Format. Verwende DD.MM.YYYY und HH:MM.", ephemeral=True)
+            return
+        if scheduled_ts <= _now_ts():
+            await interaction.response.send_message("❌ Das Datum muss in der Zukunft liegen.", ephemeral=True)
+            return
+        # Bewerbung laden
+        apps = await self.cog.config.guild(interaction.guild).team_applications() or {}
+        if self.app_id not in apps:
+            await interaction.response.send_message("❌ Bewerbung existiert nicht mehr.", ephemeral=True)
+            return
+        app = apps[self.app_id]
+        # Interview erstellen
+        counter = await self.cog.config.guild(interaction.guild).team_interviews_counter() or 0
+        counter += 1
+        interview_id = str(counter)
+        interviews = await self.cog.config.guild(interaction.guild).team_interviews() or {}
+        notes = self.notes_input.value.strip() if self.notes_input.value else ""
+        interviews[interview_id] = {
+            "app_id": self.app_id,
+            "user_id": app.get("user_id"),
+            "username": app.get("username"),
+            "channel_id": channel.id,
+            "scheduled_ts": scheduled_ts,
+            "status": "scheduled",
+            "notes": notes,
+            "created_by": interaction.user.id,
+            "created_ts": _now_ts(),
+            "position": app.get("position"),
+        }
+        await self.cog.config.guild(interaction.guild).team_interviews.set(interviews)
+        await self.cog.config.guild(interaction.guild).team_interviews_counter.set(counter)
+        # Interview-Embed im Channel posten
+        embed = discord.Embed(
+            title=f"📅 Interview #{interview_id} — {app.get('position', '?')}",
+            description=f"Bewerber: <@{app.get('user_id')}> (`{app.get('user_id')}`)",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="📅 Termin", value=_fmt_berlin_full(scheduled_dt) + " (MEZ/MESZ)", inline=True)
+        embed.add_field(name="📍 Channel", value=channel.mention, inline=True)
+        embed.add_field(name="👤 Eingeladen von", value=interaction.user.mention, inline=True)
+        if notes:
+            embed.add_field(name="📝 Notizen", value=notes[:500], inline=False)
+        embed.add_field(name="📋 Bewerbung", value=f"App-ID: #{self.app_id}\nPosition: {app.get('position', '?')}", inline=False)
+        embed.set_footer(text=f"Interview-ID: {interview_id}")
+        try:
+            await channel.send(content=f"<@{app.get('user_id')}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.response.send_message(f"❌ Konnte Interview-Embed nicht senden: `{e}`", ephemeral=True)
+            return
+        # Bewerber per DM benachrichtigen
+        try:
+            user = await self.cog.bot.fetch_user(app.get("user_id"))
+            if user:
+                dm_embed = discord.Embed(
+                    title="📅 Du wurdest zu einem Interview eingeladen!",
+                    description=f"Deine Bewerbung für **{app.get('position')}** auf **{interaction.guild.name}** wurde positiv aufgenommen!\nDu bist zu einem Interview eingeladen.",
+                    color=discord.Color.green(),
+                    timestamp=_now(),
+                )
+                dm_embed.add_field(name="📅 Termin", value=_fmt_berlin_full(scheduled_dt) + " (MEZ/MESZ)", inline=True)
+                dm_embed.add_field(name="📍 Wo", value=f"{interaction.guild.name} → {channel.name}", inline=True)
+                if notes:
+                    dm_embed.add_field(name="📝 Notizen", value=notes[:500], inline=False)
+                dm_embed.set_footer(text=f"Interview-ID: {interview_id} • Bitte sei pünktlich!")
+                await user.send(embed=dm_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await interaction.response.send_message(f"✅ Interview #{interview_id} geplant: {channel.mention} am {_fmt_berlin_full(scheduled_dt)} (MEZ/MESZ)\nBewerber wurde per DM benachrichtigt.", ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im TeamInterviewModal", exc_info=error)
+
+
+class TeamPollView(discord.ui.View):
+    """View für Team-Abstimmungen mit Button-pro-Option."""
+
+    def __init__(self, cog, poll_id: str, options: list):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.poll_id = poll_id
+        # Dynamisch Buttons pro Option hinzufügen
+        for i, opt in enumerate(options):
+            button = TeamPollButton(self.cog, poll_id, i, opt.get("text", f"Option {i+1}")[:80])
+            self.add_item(button)
+
+
+class TeamPollButton(discord.ui.Button):
+    """Ein Button für eine Abstimmungs-Option."""
+
+    def __init__(self, cog, poll_id: str, option_index: int, label: str):
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.primary,
+            custom_id=f"team_poll_{poll_id}_{option_index}",
+        )
+        self.cog = cog
+        self.poll_id = poll_id
+        self.option_index = option_index
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        polls = await self.cog.config.guild(interaction.guild).team_polls() or {}
+        if self.poll_id not in polls:
+            await interaction.response.send_message("❌ Diese Abstimmung existiert nicht mehr.", ephemeral=True)
+            return
+        poll = polls[self.poll_id]
+        if not poll.get("active", True):
+            await interaction.response.send_message("❌ Diese Abstimmung ist bereits beendet.", ephemeral=True)
+            return
+        options = poll.get("options", [])
+        if self.option_index >= len(options):
+            await interaction.response.send_message("❌ Ungültige Option.", ephemeral=True)
+            return
+        # Prüfen ob User schon abgestimmt hat
+        for opt in options:
+            if interaction.user.id in opt.get("votes", []):
+                # Stimme ändern: vorherige entfernen
+                opt["votes"] = [v for v in opt.get("votes", []) if v != interaction.user.id]
+        # Neue Stimme hinzufügen
+        options[self.option_index]["votes"] = options[self.option_index].get("votes", []) + [interaction.user.id]
+        poll["options"] = options
+        polls[self.poll_id] = poll
+        await self.cog.config.guild(interaction.guild).team_polls.set(polls)
+        # Embed aktualisieren
+        embed = await self.cog._team_build_poll_embed(poll, self.poll_id, interaction.guild)
+        await interaction.response.edit_message(embed=embed)
+        await interaction.followup.send(f"✅ Deine Stimme für **{options[self.option_index].get('text', '?')}** wurde gezählt.", ephemeral=True)
 
 
 async def setup(bot: Red):
