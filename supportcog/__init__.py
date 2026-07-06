@@ -15149,7 +15149,6 @@ class EmbedBuilderMainModal(discord.ui.Modal):
         self.add_item(self.author_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
         data = {
             "title": self.title_input.value.strip() if self.title_input.value else "",
             "description": self.description_input.value.strip() if self.description_input.value else "",
@@ -15157,18 +15156,14 @@ class EmbedBuilderMainModal(discord.ui.Modal):
             "footer": self.footer_input.value.strip() if self.footer_input.value else "",
             "author_name": self.author_input.value.strip() if self.author_input.value else "",
         }
-        # Alle anderen Felder beibehalten
         for k in ["image", "thumbnail", "footer_icon", "author_icon", "author_url",
                    "field1_name", "field1_value", "field2_name", "field2_value",
                    "field3_name", "field3_value"]:
             if self.existing_data.get(k):
                 data[k] = self.existing_data[k]
-        # Modal 2 öffnen
+        # Modal 2 öffnen — NICHT defer(), sondern direkt send_modal()
         modal2 = EmbedBuilderImagesModal(self.cog, self.key, data, self.send_channel, self.force_send)
-        try:
-            await interaction.followup.send_modal(modal2)
-        except Exception:
-            await self.cog._embed_builder_save_and_send(interaction, self.key, data, self.send_channel, self.force_send)
+        await interaction.response.send_modal(modal2)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         try:
@@ -15242,7 +15237,6 @@ class EmbedBuilderImagesModal(discord.ui.Modal):
         self.add_item(self.field1_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
         if self.image_input.value and self.image_input.value.strip():
             self.data["image"] = self.image_input.value.strip()
         if self.thumbnail_input.value and self.thumbnail_input.value.strip():
@@ -15251,7 +15245,6 @@ class EmbedBuilderImagesModal(discord.ui.Modal):
             self.data["footer_icon"] = self.footer_icon_input.value.strip()
         if self.author_icon_input.value and self.author_icon_input.value.strip():
             self.data["author_icon"] = self.author_icon_input.value.strip()
-        # Field 1 parsen
         if self.field1_input.value and self.field1_input.value.strip():
             parts = self.field1_input.value.strip().split("|", 1)
             if len(parts) == 2:
@@ -15260,12 +15253,9 @@ class EmbedBuilderImagesModal(discord.ui.Modal):
             else:
                 self.data["field1_name"] = "Info"
                 self.data["field1_value"] = parts[0].strip()[:1024]
-        # Modal 3 öffnen
+        # Modal 3 öffnen — NICHT defer(), direkt send_modal()
         modal3 = EmbedBuilderFieldsModal(self.cog, self.key, self.data, self.send_channel, self.force_send)
-        try:
-            await interaction.followup.send_modal(modal3)
-        except Exception:
-            await self.cog._embed_builder_save_and_send(interaction, self.key, self.data, self.send_channel, self.force_send)
+        await interaction.response.send_modal(modal3)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         try:
