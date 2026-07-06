@@ -481,6 +481,7 @@ class SupportCog(commands.Cog):
             self.bot.add_view(TeamPollView(self, "0", []))
         except Exception:
             pass
+        # EmbedBuilderStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
         # TeamApplicationStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
 
     async def _ticket_register_persistent_views(self):
@@ -6334,6 +6335,19 @@ class SupportCog(commands.Cog):
         del embeds[key]
         await self.config.guild(ctx.guild).custom_embeds.set(embeds)
         await ctx.send(f"✅ Embed `{key}` gelöscht.")
+
+    @embed_builder.command(name="deleteall")
+    async def embed_builder_deleteall(self, ctx: commands.Context, confirm: str = None):
+        """Löscht ALLE Custom Embeds. Bestätigung mit 'YES'."""
+        if confirm != "YES":
+            embeds = await self.config.guild(ctx.guild).custom_embeds() or {}
+            await ctx.send(
+                f"⚠️ Dies löscht **{len(embeds)} Custom Embed(s)** unwiderruflich.\n"
+                f"Zur Bestätigung: `[p]embedbuilder deleteall YES`"
+            )
+            return
+        await self.config.guild(ctx.guild).custom_embeds.set({})
+        await ctx.send("✅ Alle Custom Embeds wurden gelöscht.")
 
     @embed_builder.command(name="preview", aliases=["show"])
     async def embed_builder_preview(self, ctx: commands.Context, key: str):
@@ -14959,10 +14973,14 @@ class EmbedBuilderStartView(discord.ui.View):
         self.key = key
         self.is_new = is_new
 
-    @discord.ui.button(label="Embed bearbeiten" if not True else "Embed erstellen/bearbeiten", style=discord.ButtonStyle.primary, emoji="📝", custom_id="embed_builder_start")
+    @discord.ui.button(label="Embed erstellen/bearbeiten", style=discord.ButtonStyle.primary, emoji="📝", custom_id="embed_builder_open")
     async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        # Permission check
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
             return
         # Aktuelle Embed-Daten laden (für Edit-Modus mit Prefill)
         embeds = await self.cog.config.guild(interaction.guild).custom_embeds() or {}
@@ -14983,51 +15001,63 @@ class EmbedBuilderModal(discord.ui.Modal):
         self.cog = cog
         self.key = key
         self.existing_data = existing_data or {}
+
+        # Hilfsfunktion: default nur setzen wenn nicht None/leer (vermeidet Crashes)
+        def safe_default(val):
+            v = val if val else ""
+            return v if v else None
+
         # Feld 1: Titel
+        title_default = safe_default(self.existing_data.get("title"))
         self.title_input = discord.ui.TextInput(
             label="Titel",
             placeholder="Titel des Embeds...",
             required=False,
             max_length=256,
-            default=self.existing_data.get("title") or None,
+            default=title_default,
             custom_id="embed_title",
         )
         self.add_item(self.title_input)
         # Feld 2: Beschreibung
+        desc_default = safe_default(self.existing_data.get("description"))
         self.description_input = discord.ui.TextInput(
             label="Beschreibung (Haupttext)",
             placeholder="Haupttext des Embeds...",
             required=False,
             max_length=1500,
             style=discord.TextStyle.paragraph,
-            default=self.existing_data.get("description") or None,
+            default=desc_default,
             custom_id="embed_description",
         )
         self.add_item(self.description_input)
         # Feld 3: Farbe
+        color_default = safe_default(self.existing_data.get("color"))
         self.color_input = discord.ui.TextInput(
             label="Farbe (blurple, red, green, orange, purple, grey, random)",
             placeholder="blurple",
             required=False,
             max_length=20,
-            default=self.existing_data.get("color") or None,
+            default=color_default,
             custom_id="embed_color",
         )
         self.add_item(self.color_input)
         # Feld 4: Footer
+        footer_default = safe_default(self.existing_data.get("footer"))
         self.footer_input = discord.ui.TextInput(
             label="Footer-Text (optional)",
             placeholder="Text unten im Embed...",
             required=False,
             max_length=500,
-            default=self.existing_data.get("footer") or None,
+            default=footer_default,
             custom_id="embed_footer",
         )
         self.add_item(self.footer_input)
         # Feld 5: Field 1 (Name|Value)
         field1_default = None
-        if self.existing_data.get("field1_name") or self.existing_data.get("field1_value"):
-            field1_default = f"{self.existing_data.get('field1_name', '')}|{self.existing_data.get('field1_value', '')}"
+        f1n = self.existing_data.get("field1_name", "")
+        f1v = self.existing_data.get("field1_value", "")
+        if f1n or f1v:
+            field1_default = f"{f1n}|{f1v}"
         self.field1_input = discord.ui.TextInput(
             label="Field 1 (Name|Wert) — mit | trennen",
             placeholder="z.B. Regel 1|Kein Spam",
