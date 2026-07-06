@@ -277,6 +277,12 @@ class SupportCog(commands.Cog):
             "ticket_priorities": {},  # Runtime: {channel_id: "low"|"normal"|"high"|"urgent"} — Priorität pro Ticket
             "ticket_notes": {},  # Runtime: {channel_id: [{author_id, author_name, note, ts}]} — interne Notizen
             "ticket_assignees": {},  # Runtime: {channel_id: [user_id, ...]} — zugewiesene Teammitglieder (zusätzlich zu Claim)
+            # ERWEITERTE FEATURES
+            "ticket_survey_enabled": False,  # Auto-Survey nach Schließung
+            "ticket_survey_channel": None,  # Channel für Survey-Ergebnisse
+            "ticket_first_response_reminder_minutes": 0,  # 0 = deaktiviert, sonst: Reminder nach X Min wenn Team nicht reagiert
+            "ticket_history": {},  # Runtime: {user_id: [{ticket_num, channel_name, category, opened_ts, closed_ts, closed_by, reason}]}
+            "ticket_first_response_tracker": {},  # Runtime: {channel_id: {created_ts, first_response_ts, first_responder_id}}
             # MULTI-KATEGORIE-SYSTEM
             # ticket_categories: {
             #   "support": {
@@ -422,6 +428,9 @@ class SupportCog(commands.Cog):
         # Background loop: ticket panel auto-refresh (für Workload-Anzeige)
         if not hasattr(self, "_ticket_panel_refresh_task") or self._ticket_panel_refresh_task is None or self._ticket_panel_refresh_task.done():
             self._ticket_panel_refresh_task = asyncio.create_task(self._ticket_panel_refresh_loop())
+        # Background loop: ticket reminder (für Auto-Reminder wenn Team nicht reagiert)
+        if not hasattr(self, "_ticket_reminder_task") or self._ticket_reminder_task is None or self._ticket_reminder_task.done():
+            self._ticket_reminder_task = asyncio.create_task(self._ticket_reminder_loop())
 
     async def cog_unload(self):
         """Cleanup beim Entladen - Background-Tasks abbrechen."""
@@ -449,6 +458,14 @@ class SupportCog(commands.Cog):
                 pass
             except Exception:
                 log.exception("Fehler beim Stoppen des Ticket-Panel-Refresh-Loops")
+        if hasattr(self, "_ticket_reminder_task") and self._ticket_reminder_task is not None and not self._ticket_reminder_task.done():
+            self._ticket_reminder_task.cancel()
+            try:
+                await self._ticket_reminder_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Fehler beim Stoppen des Ticket-Reminder-Loops")
 
     async def _ticket_panel_refresh_loop(self):
         """Background loop: aktualisiert das Panel periodisch für Live-Workload-Anzeige.
@@ -5025,50 +5042,6 @@ class SupportCog(commands.Cog):
         embed.set_footer(text=footer)
         return embed
 
-    async def ticketset_createmulti(self, ctx: commands.Context):
-        """Erstellt ein Multi-Kategorie Panel (mehrere Buttons auf einer Nachricht).
-        Voraussetzung: mindestens eine Kategorie ist konfiguriert (category_id + support_role_id)."""
-        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
-        valid_cats = []
-        for key, cat in cats.items():
-            if cat.get("category_id") and cat.get("support_role_id"):
-                valid_cats.append((key, cat))
-        if not valid_cats:
-            await ctx.send(
-                "❌ Keine gültigen Kategorien gefunden. Jede Kategorie braucht:\n"
-                "• `category_id` (Discord-Kategorie) — `[p]ticketset category categoryid <key> <category>`\n"
-                "• `support_role_id` (Support-Rolle) — `[p]ticketset category role <key> @Rolle`"
-            )
-            return
-        if len(valid_cats) > 25:
-            await ctx.send(f"❌ Zu viele Kategorien ({len(valid_cats)}). Discord erlaubt max 25 Buttons pro Nachricht.")
-            return
-        # Panel erstellen (mit Workload falls aktiviert)
-        embed = await self._ticket_build_multi_panel_embed(ctx.guild, valid_cats)
-        view = TicketMultiPanelView(self, valid_cats)
-        # Panel-Channel setzen = aktueller Channel falls Text-Channel
-        channel = ctx.channel if isinstance(ctx.channel, discord.TextChannel) else None
-        if channel is None:
-            await ctx.send("❌ Muss in einem Text-Channel ausgeführt werden.")
-            return
-        try:
-            message = await channel.send(embed=embed, view=view)
-        except (discord.Forbidden, discord.HTTPException) as e:
-            await ctx.send(f"❌ Konnte Panel nicht senden: `{e}`")
-            return
-        # Altes Multi-Panel löschen falls vorhanden
-        old_id = await self.config.guild(ctx.guild).ticket_panel_message_id()
-        if old_id:
-            try:
-                old_msg = await channel.fetch_message(old_id)
-                await old_msg.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-        await self.config.guild(ctx.guild).ticket_panel_message_id.set(message.id)
-        await self.config.guild(ctx.guild).ticket_panel_channel.set(channel.id)
-        await self.config.guild(ctx.guild).ticket_panel_multi_enabled.set(True)
-        await ctx.send(f"✅ Multi-Kategorie Panel erstellt: {message.jump_url}")
-
     @ticketset.command(name="examples", aliases=["autoexamples", "demo"])
     async def ticketset_examples(self, ctx: commands.Context):
         """Erstellt automatisch Beispiel-Kategorien (support, report, bug, bewerbung).
@@ -5782,6 +5755,232 @@ class SupportCog(commands.Cog):
             return
         else:
             await ctx.send("❌ Ungültige Aktion. Verwende: `add`, `remove`, `list`, `clear`")
+
+    # ============================================
+    # TICKET-HISTORY & SURVEY
+    # ============================================
+
+    async def _ticket_add_to_history(self, guild: discord.Guild, user_id: int, ticket_data: dict):
+        """Fügt ein geschlossenes Ticket zur Historie des Users hinzu."""
+        history = await self.config.guild(guild).ticket_history() or {}
+        key = str(user_id)
+        if key not in history:
+            history[key] = []
+        history[key].append(ticket_data)
+        # Max 50 Einträge pro User behalten
+        if len(history[key]) > 50:
+            history[key] = history[key][-50:]
+        await self.config.guild(guild).ticket_history.set(history)
+
+    @commands.command(name="tickethistory", aliases=["thist", "tickehistory"])
+    @commands.guild_only()
+    async def ticket_history_cmd(self, ctx: commands.Context, user: discord.User = None):
+        """Zeigt die Ticket-Historie eines Users an (standardmäßig deine eigene).
+        Nur Teammitglieder können die Historie anderer User sehen."""
+        if user is None:
+            user = ctx.author
+        else:
+            # Wenn User anderes Mitglied abfragt: Staff-Check
+            if user.id != ctx.author.id:
+                is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+                if not is_staff:
+                    await ctx.send("❌ Du kannst nur deine eigene Historie anzeigen. Für andere User brauchst du Team-Rechte.")
+                    return
+        history = await self.config.guild(ctx.guild).ticket_history() or {}
+        user_history = history.get(str(user.id), [])
+        if not user_history:
+            await ctx.send(f"ℹ️ Keine Ticket-Historie für {user.mention}.")
+            return
+        embed = discord.Embed(
+            title=f"📜 Ticket-Historie — {user.display_name}",
+            description=f"Insgesamt **{len(user_history)}** geschlossene Tickets",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        # Letzte 10 Tickets anzeigen
+        for entry in user_history[-10:]:
+            ticket_num = entry.get("ticket_num", "?")
+            channel_name = entry.get("channel_name", "?")
+            category = entry.get("category", "—")
+            opened_ts = entry.get("opened_ts", 0)
+            closed_ts = entry.get("closed_ts", 0)
+            closed_by = entry.get("closed_by", "Unbekannt")
+            reason = entry.get("reason", "Kein Grund")
+            # Zeiten formatieren
+            opened_str = _fmt_berlin_full(_from_ts(opened_ts)) if opened_ts else "?"
+            closed_str = _fmt_berlin_full(_from_ts(closed_ts)) if closed_ts else "?"
+            # Dauer berechnen
+            duration_str = "?"
+            if opened_ts and closed_ts:
+                duration_sec = closed_ts - opened_ts
+                if duration_sec < 60:
+                    duration_str = f"{duration_sec}s"
+                elif duration_sec < 3600:
+                    duration_str = f"{duration_sec // 60}m"
+                else:
+                    duration_str = f"{duration_sec // 3600}h {(duration_sec % 3600) // 60}m"
+            embed.add_field(
+                name=f"🎫 #{ticket_num} — {channel_name}",
+                value=(
+                    f"📂 {category} | ⏱️ {duration_str}\n"
+                    f"📅 {opened_str} → {closed_str}\n"
+                    f"🔒 von {closed_by}: {reason[:100]}"
+                ),
+                inline=False,
+            )
+        if len(user_history) > 10:
+            embed.set_footer(text=f"Zeige letzte 10 von {len(user_history)} Tickets")
+        else:
+            embed.set_footer(text=f"{len(user_history)} Ticket(s) gesamt • Zeiten in Europe/Berlin")
+        await ctx.send(embed=embed)
+
+    @ticketset.group(name="survey", aliases=["umfrage"])
+    async def ticketset_survey(self, ctx: commands.Context):
+        """Konfiguriert die Ticket-Survey (Zufriedenheits-Umfrage nach Schließung)."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @ticketset_survey.command(name="toggle")
+    async def ticketset_survey_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert die Survey nach Ticket-Schließung."""
+        current = await self.config.guild(ctx.guild).ticket_survey_enabled()
+        await self.config.guild(ctx.guild).ticket_survey_enabled.set(not current)
+        status = "✅ aktiviert" if not current else "❌ deaktiviert"
+        await ctx.send(f"📋 Survey nach Schließung ist jetzt **{status}**.")
+
+    @ticketset_survey.command(name="channel")
+    async def ticketset_survey_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Survey-Ergebnisse. Ohne Angabe zurückgesetzt."""
+        if channel is None:
+            await self.config.guild(ctx.guild).ticket_survey_channel.set(None)
+            await ctx.send("✅ Survey-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).ticket_survey_channel.set(channel.id)
+        await ctx.send(f"✅ Survey-Channel gesetzt auf {channel.mention}.")
+
+    @ticketset.group(name="reminder", aliases=["remind"])
+    async def ticketset_reminder(self, ctx: commands.Context):
+        """Konfiguriert den Auto-Reminder wenn Team nicht reagiert."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @ticketset_reminder.command(name="minutes")
+    async def ticketset_reminder_minutes(self, ctx: commands.Context, minutes: int):
+        """Setzt den Auto-Reminder nach X Minuten ohne Team-Antwort (0 = deaktiviert)."""
+        if minutes < 0:
+            await ctx.send("❌ Wert muss ≥ 0 sein (0 = deaktiviert).")
+            return
+        await self.config.guild(ctx.guild).ticket_first_response_reminder_minutes.set(minutes)
+        if minutes == 0:
+            await ctx.send("✅ Auto-Reminder deaktiviert.")
+        else:
+            await ctx.send(f"✅ Auto-Reminder gesetzt auf {minutes} Minuten.")
+
+    @ticketset_reminder.command(name="show")
+    async def ticketset_reminder_show(self, ctx: commands.Context):
+        """Zeigt die aktuellen Reminder-Einstellungen."""
+        minutes = await self.config.guild(ctx.guild).ticket_first_response_reminder_minutes()
+        embed = discord.Embed(
+            title="⏰ Reminder-Einstellungen",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Auto-Reminder", value=f"{minutes} Min" if minutes > 0 else "Deaktiviert", inline=True)
+        await ctx.send(embed=embed)
+
+    async def _ticket_record_first_response(self, guild: discord.Guild, channel_id: int, responder_id: int):
+        """Zeichnet die erste Team-Antwort auf."""
+        tracker = await self.config.guild(guild).ticket_first_response_tracker() or {}
+        key = str(channel_id)
+        if key not in tracker:
+            # Noch keine Antwort aufgezeichnet
+            tracker[key] = {
+                "created_ts": _now_ts(),  # wird beim Ticket-Create gesetzt, hier fallback
+                "first_response_ts": _now_ts(),
+                "first_responder_id": responder_id,
+            }
+            await self.config.guild(guild).ticket_first_response_tracker.set(tracker)
+
+    async def _ticket_check_reminders(self, guild: discord.Guild):
+        """Prüft alle offenen Tickets ob ein Reminder nötig ist."""
+        minutes = await self.config.guild(guild).ticket_first_response_reminder_minutes() or 0
+        if minutes <= 0:
+            return
+        active = await self.config.guild(guild).ticket_active() or {}
+        tracker = await self.config.guild(guild).ticket_first_response_tracker() or {}
+        cutoff_ts = _now_ts() - minutes * 60
+        for user_id_str, channel_ids in active.items():
+            for cid in channel_ids:
+                cid_str = str(cid)
+                channel = guild.get_channel(cid)
+                if channel is None:
+                    continue
+                # Schon geantwortet?
+                if cid_str in tracker and tracker[cid_str].get("first_response_ts"):
+                    continue
+                # Schon erinnert? (wir tracken das mit einem "reminded" flag)
+                if cid_str in tracker and tracker[cid_str].get("reminded"):
+                    continue
+                # Erstellungszeit aus Topic
+                created_ts = None
+                if channel.topic:
+                    m = re.search(r"Created:\s*(\d+)", channel.topic)
+                    if m:
+                        try:
+                            created_ts = int(m.group(1))
+                        except ValueError:
+                            pass
+                if created_ts is None:
+                    continue
+                if created_ts > cutoff_ts:
+                    continue  # Ticket ist noch zu neu
+                # Reminder senden
+                try:
+                    # Support-Rolle ermitteln
+                    support_role = None
+                    topic = channel.topic or ""
+                    m = re.search(r"Category:\s*(\w+)", topic)
+                    if m:
+                        cat_key = m.group(1)
+                        cats = await self.config.guild(guild).ticket_categories() or {}
+                        cat = cats.get(cat_key)
+                        if cat:
+                            role_id = cat.get("support_role_id")
+                            if role_id:
+                                support_role = guild.get_role(role_id)
+                    if support_role is None:
+                        support_role = await self.get_ticket_support_role(guild)
+                    if support_role is None:
+                        continue
+                    embed = discord.Embed(
+                        title="⏰ Auto-Reminder",
+                        description=f"Dieses Ticket wartet seit **{minutes} Minuten** auf eine Antwort!\nBitte kümmere dich darum: {support_role.mention}",
+                        color=discord.Color.orange(),
+                        timestamp=_now(),
+                    )
+                    await channel.send(content=support_role.mention, embed=embed, allowed_mentions=discord.AllowedMentions(roles=[support_role]))
+                    # Als erinnert markieren
+                    if cid_str not in tracker:
+                        tracker[cid_str] = {"created_ts": created_ts}
+                    tracker[cid_str]["reminded"] = True
+                    await self.config.guild(guild).ticket_first_response_tracker.set(tracker)
+                except Exception:
+                    log.exception("Fehler beim Senden des Auto-Reminders")
+
+    async def _ticket_reminder_loop(self):
+        """Background loop: prüft alle X Minuten ob Tickets auf Antwort warten."""
+        await self.bot.wait_until_red_ready()
+        await asyncio.sleep(120)  # 2 Min Startup-Verzögerung
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        await self._ticket_check_reminders(guild)
+                    except Exception:
+                        log.exception("Fehler in Reminder-Loop für Guild %s", getattr(guild, "id", "?"))
+            except Exception:
+                log.exception("Schwerer Fehler im Ticket-Reminder-Loop")
+            await asyncio.sleep(300)  # Alle 5 Minuten prüfen
 
     # ============================================
     # MULTI-KATEGORIE-CORE-LOGIK
@@ -6546,7 +6745,7 @@ class SupportCog(commands.Cog):
                 transcript_html, transcript_txt, creator_user, ticket_num_str = await self._ticket_create_transcript(
                     channel, closed_by=requester_member, reason=reason
                 )
-            except Exception as e:
+            except Exception:
                 log.exception("Transcript-Erstellung fehlgeschlagen")
 
         # Creator ermitteln für DM
@@ -6626,6 +6825,57 @@ class SupportCog(commands.Cog):
             await self._ticket_remove_active(guild, creator_id, channel.id)
         # Claim-Status cleanup
         await self._ticket_clear_claim(guild, channel.id)
+        # First-Response-Tracker cleanup
+        tracker = await self.config.guild(guild).ticket_first_response_tracker() or {}
+        if str(channel.id) in tracker:
+            del tracker[str(channel.id)]
+            await self.config.guild(guild).ticket_first_response_tracker.set(tracker)
+        # Priorität cleanup
+        priorities = await self.config.guild(guild).ticket_priorities() or {}
+        if str(channel.id) in priorities:
+            del priorities[str(channel.id)]
+            await self.config.guild(guild).ticket_priorities.set(priorities)
+        # Notizen cleanup
+        notes = await self.config.guild(guild).ticket_notes() or {}
+        if str(channel.id) in notes:
+            del notes[str(channel.id)]
+            await self.config.guild(guild).ticket_notes.set(notes)
+        # Assignees cleanup
+        assignees = await self.config.guild(guild).ticket_assignees() or {}
+        if str(channel.id) in assignees:
+            del assignees[str(channel.id)]
+            await self.config.guild(guild).ticket_assignees.set(assignees)
+        # History-Eintrag hinzufügen
+        if creator_id is not None:
+            ticket_num = await self._ticket_get_counter(channel) or "?"
+            category_name = ""
+            if channel.topic:
+                m = re.search(r"Category:\s*(\w+)", channel.topic)
+                if m:
+                    cat_key = m.group(1)
+                    cats = await self.config.guild(guild).ticket_categories() or {}
+                    cat = cats.get(cat_key)
+                    if cat:
+                        category_name = cat.get("name", cat_key)
+                created_ts_match = re.search(r"Created:\s*(\d+)", channel.topic)
+                if created_ts_match:
+                    try:
+                        created_ts = int(created_ts_match.group(1))
+                    except ValueError:
+                        created_ts = 0
+                else:
+                    created_ts = 0
+            else:
+                created_ts = 0
+            await self._ticket_add_to_history(guild, creator_id, {
+                "ticket_num": str(ticket_num),
+                "channel_name": channel.name,
+                "category": category_name,
+                "opened_ts": created_ts,
+                "closed_ts": _now_ts(),
+                "closed_by": requester_member.display_name,
+                "reason": reason[:200],
+            })
 
         # Channel löschen
         try:
@@ -6954,10 +7204,26 @@ class SupportCog(commands.Cog):
         embed.add_field(name="🎫 Ticket-ID", value=f"#{ticket_num}", inline=True)
         embed.add_field(name="📂 Kategorie", value=cat_label, inline=True)
         embed.add_field(name="👤 Erstellt von", value=creator_mention, inline=True)
-        embed.add_field(name="✋ Zuständig", value=claimer_mention, inline=True)
+        embed.add_field(name="✋ Zuständig", value=f"{claimer_mention}\n{claim_time}" if claim_time else claimer_mention, inline=True)
         embed.add_field(name="📅 Erstellt am", value=created_str, inline=True)
         embed.add_field(name="💬 Letzte Aktivität", value=last_activity, inline=True)
         embed.add_field(name="📊 Nachrichten", value=msg_count, inline=True)
+        # Priorität
+        priorities = await self.config.guild(ctx.guild).ticket_priorities() or {}
+        current_priority = priorities.get(str(channel.id), "normal")
+        priority_emojis = {"low": "🟢 Niedrig", "normal": "🔵 Normal", "high": "🟠 Hoch", "urgent": "🔴 Dringend"}
+        embed.add_field(name="📋 Priorität", value=priority_emojis.get(current_priority, "🔵 Normal"), inline=True)
+        # Zugewiesene User
+        assignees = await self.config.guild(ctx.guild).ticket_assignees() or {}
+        channel_assignees = assignees.get(str(channel.id), [])
+        if channel_assignees:
+            assignee_mentions = ", ".join(f"<@{uid}>" for uid in channel_assignees[:5])
+            embed.add_field(name="👥 Zugewiesen", value=assignee_mentions, inline=False)
+        # Notizen-Anzahl
+        notes = await self.config.guild(ctx.guild).ticket_notes() or {}
+        channel_notes = notes.get(str(channel.id), [])
+        if channel_notes:
+            embed.add_field(name="📝 Notizen", value=f"{len(channel_notes)} Notiz(en) — `[p]ticketnote` zum Anzeigen", inline=False)
         embed.set_footer(text=f"Ticket-Info • {ctx.guild.name} • Zeiten in Europe/Berlin")
         await ctx.send(embed=embed)
 
@@ -8991,6 +9257,31 @@ class SupportCog(commands.Cog):
         for source_role_id in removed:
             if str(source_role_id) in role_map:
                 await self._sync_propagate_role_remove(before.guild, after, source_role_id)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Trackt erste Team-Antwort in Tickets für First-Response-Tracking."""
+        # Basis-Filter
+        if not message.guild:
+            return
+        if message.author.bot:
+            return
+        if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+            return
+        # Prüfen ob es ein Ticket-Channel ist
+        if not (message.channel.name.startswith("ticket-") or self._is_ticket_channel(message.channel)):
+            return
+        # Prüfen ob Author Team-Mitglied ist
+        if not isinstance(message.author, discord.Member):
+            return
+        is_staff = await self._is_ticket_staff(message.author, message.channel, message.guild)
+        if not is_staff:
+            return
+        # First-Response aufzeichnen
+        try:
+            await self._ticket_record_first_response(message.guild, message.channel.id, message.author.id)
+        except Exception:
+            log.exception("Fehler beim Aufzeichnen der First-Response")
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
