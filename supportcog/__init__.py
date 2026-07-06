@@ -7669,7 +7669,7 @@ class SupportCog(commands.Cog):
         )
         if subject and subject.strip():
             welcome_embed.add_field(name="📝 Dein Anliegen", value=subject.strip()[:1024], inline=False)
-        welcome_embed.add_field(name="ℹ️ Hinweis", value="Ein Teammitglied wird sich gleich um dich kümmern. Bitte habe etwas Geduld.\n🔒 Dieses Gespräch wird aufgezeichnet (Transcript) und dir bei Schließung zugesendet.", inline=False)
+        welcome_embed.add_field(name="ℹ️ Hinweis", value="Ein Teammitglied wird sich gleich um dich kümmern. Bitte habe etwas Geduld.\n🔒 Dieses Gespräch wird aufgezeichnet (Transcript), dir bei Schließung zugesendet und gemäß unserem Regelwerk gespeichert.", inline=False)
         welcome_embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
         try:
             await ticket_channel.send(embed=welcome_embed)
@@ -8179,7 +8179,7 @@ class SupportCog(commands.Cog):
         )
         if subject and subject.strip():
             welcome_embed.add_field(name="📝 Dein Anliegen", value=subject.strip()[:1024], inline=False)
-        welcome_embed.add_field(name="ℹ️ Hinweis", value="Ein Teammitglied wird sich gleich um dich kümmern. Bitte habe etwas Geduld.\n🔒 Dieses Gespräch wird aufgezeichnet (Transcript) und dir bei Schließung zugesendet.", inline=False)
+        welcome_embed.add_field(name="ℹ️ Hinweis", value="Ein Teammitglied wird sich gleich um dich kümmern. Bitte habe etwas Geduld.\n🔒 Dieses Gespräch wird aufgezeichnet (Transcript), dir bei Schließung zugesendet und gemäß unserem Regelwerk gespeichert.", inline=False)
         welcome_embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
         try:
             await ticket_channel.send(embed=welcome_embed)
