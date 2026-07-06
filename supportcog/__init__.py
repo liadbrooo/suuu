@@ -4356,7 +4356,7 @@ class SupportCog(commands.Cog):
             f"(Ursprünglich blockiert von {blocked_by.display_name if blocked_by else 'Unbekannt'})"
         )
 
-    @commands.command(name="supportblocklist", aliases=["sblocklist", "blocklist"])
+    @commands.command(name="supportblocklist", aliases=["sblocklist", "supblocklist"])
     @commands.guild_only()
     async def support_blocklist(self, ctx: commands.Context):
         """Zeigt alle blockierten User an."""
