@@ -214,6 +214,24 @@ class SupportCog(commands.Cog):
             "ticket_support_role": None,  # Rolle die Tickets bearbeiten kann
             "ticket_log_channel": None,  # Channel für Ticket-Erstellungs/Schließungs-Logs
             "ticket_counter": 0,  # Laufende Nummer für Ticket-Namen (ticket-001, ticket-002, ...)
+            # Erweiterte Ticket-Optionen
+            "ticket_welcome_message": "Willkommen zu deinem Ticket! Ein Teammitglied wird sich gleich um dich kümmern.",
+            "ticket_panel_emoji": "🎫",
+            "ticket_panel_color": "blurple",  # blurple, red, green, grey
+            "ticket_panel_title": "🎫 Ticket erstellen",
+            "ticket_panel_description": "Brauchst du Hilfe? Klicke auf den Button unten um ein Ticket zu erstellen.",
+            "ticket_modal_enabled": True,
+            "ticket_modal_question": "Worum geht es in deinem Ticket?",
+            "ticket_modal_placeholder": "Kurze Beschreibung deines Anliegens...",
+            "ticket_dm_on_close": False,
+            "ticket_auto_close_hours": 0,  # 0 = deaktiviert
+            "ticket_transcript": True,  # Sende Transcript bei Schließung in den Log-Channel
+            "ticket_user_can_close": True,  # User darf eigenes Ticket schließen
+            "ticket_claim_enabled": True,  # Claim-System aktiv
+            "ticket_blacklist": [],  # Liste von User-IDs die keine Tickets erstellen dürfen
+            "ticket_max_open": 1,  # Maximal gleichzeitig offene Tickets pro User
+            "ticket_active": {},  # Runtime: {user_id: [channel_ids]} — aktuell offene Tickets
+            "ticket_panel_button_text": "Ticket erstellen",
 
             # AWAY AUTO-RETURN
             "away_auto_return_minutes": 15,  # Auto-Revert von "away" zu "available" nach X Min (0 = deaktiviert)
@@ -325,10 +343,14 @@ class SupportCog(commands.Cog):
         self.bot.add_view(PersistentWhitelistGrantView(self))  # Persistente View für Whitelist-Rollenvergabe
         # Ticket-System persistente Views
         self.bot.add_view(TicketPanelView(self))
+        self.bot.add_view(TicketControlView(self, claim_enabled=True))
         self.bot.add_view(TicketCloseView(self))
         # Background loop: auto-expire duty sessions + temp whitelists
         if self._duty_expiry_task is None or self._duty_expiry_task.done():
             self._duty_expiry_task = asyncio.create_task(self._background_sweep_loop())
+        # Background loop: ticket auto-close
+        if not hasattr(self, "_ticket_auto_close_task") or self._ticket_auto_close_task is None or self._ticket_auto_close_task.done():
+            self._ticket_auto_close_task = asyncio.create_task(self._ticket_auto_close_loop())
 
     async def cog_unload(self):
         """Cleanup beim Entladen - Background-Tasks abbrechen."""
@@ -340,6 +362,14 @@ class SupportCog(commands.Cog):
                 pass
             except Exception:
                 log.exception("Fehler beim Stoppen des Background-Sweep-Loops")
+        if hasattr(self, "_ticket_auto_close_task") and self._ticket_auto_close_task is not None and not self._ticket_auto_close_task.done():
+            self._ticket_auto_close_task.cancel()
+            try:
+                await self._ticket_auto_close_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Fehler beim Stoppen des Ticket-Auto-Close-Loops")
 
     async def _background_sweep_loop(self):
         """Background loop that periodically:
@@ -4124,6 +4154,20 @@ class SupportCog(commands.Cog):
         role_id = await g.ticket_support_role()
         log_ch_id = await g.ticket_log_channel()
         counter = await g.ticket_counter()
+        welcome_msg = await g.ticket_welcome_message()
+        modal_enabled = await g.ticket_modal_enabled()
+        dm_on_close = await g.ticket_dm_on_close()
+        auto_close_h = await g.ticket_auto_close_hours()
+        transcript = await g.ticket_transcript()
+        user_can_close = await g.ticket_user_can_close()
+        claim_enabled = await g.ticket_claim_enabled()
+        max_open = await g.ticket_max_open()
+        panel_color = await g.ticket_panel_color()
+        panel_emoji = await g.ticket_panel_emoji()
+        panel_title = await g.ticket_panel_title()
+        button_text = await g.ticket_panel_button_text()
+        blacklist = await g.ticket_blacklist() or []
+        active = await g.ticket_active() or {}
 
         cat = ctx.guild.get_channel(cat_id) if cat_id else None
         panel_ch = ctx.guild.get_channel(panel_ch_id) if panel_ch_id else None
@@ -4140,6 +4184,20 @@ class SupportCog(commands.Cog):
         embed.add_field(name="Support-Rolle", value=role.mention if role else "❌ Nicht gesetzt", inline=True)
         embed.add_field(name="Log-Channel", value=log_ch.mention if log_ch else "❌ Nicht gesetzt", inline=True)
         embed.add_field(name="Ticket-Counter", value=str(counter), inline=True)
+        embed.add_field(name="Offene Tickets", value=str(sum(len(v) for v in active.values())), inline=True)
+        embed.add_field(name="Max. offen/User", value=str(max_open), inline=True)
+        embed.add_field(name="Panel-Color", value=panel_color, inline=True)
+        embed.add_field(name="Panel-Emoji", value=panel_emoji or "Kein", inline=True)
+        embed.add_field(name="Modal aktiviert", value="✅" if modal_enabled else "❌", inline=True)
+        embed.add_field(name="DM bei Schließen", value="✅" if dm_on_close else "❌", inline=True)
+        embed.add_field(name="Auto-Close (h)", value=str(auto_close_h) or "0", inline=True)
+        embed.add_field(name="Transcript", value="✅" if transcript else "❌", inline=True)
+        embed.add_field(name="User darf schließen", value="✅" if user_can_close else "❌", inline=True)
+        embed.add_field(name="Claim-System", value="✅" if claim_enabled else "❌", inline=True)
+        embed.add_field(name="Blacklist", value=f"{len(blacklist)} User", inline=True)
+        embed.add_field(name="Panel-Titel", value=panel_title, inline=False)
+        embed.add_field(name="Button-Text", value=button_text, inline=True)
+        embed.add_field(name="Welcome-Message", value=welcome_msg[:200], inline=False)
         embed.set_footer(text=f"{ctx.guild.name}")
         await ctx.send(embed=embed)
 
@@ -4151,7 +4209,6 @@ class SupportCog(commands.Cog):
         if not channel:
             await ctx.send("❌ Kein Ticket-Panel-Channel konfiguriert. Nutze `[p]ticketset panelchannel`.")
             return
-        # Prüfen, dass Kategorie + Support-Rolle gesetzt sind
         category = await self.get_ticket_category(guild)
         support_role = await self.get_ticket_support_role(guild)
         if not category:
@@ -4161,6 +4218,155 @@ class SupportCog(commands.Cog):
             await ctx.send("❌ Keine Ticket-Support-Rolle konfiguriert. Nutze `[p]ticketset supportrole`.")
             return
 
+        # Konfigurierbares Embed
+        title = await self.config.guild(guild).ticket_panel_title()
+        description = await self.config.guild(guild).ticket_panel_description()
+        color_name = await self.config.guild(guild).ticket_panel_color()
+        emoji = await self.config.guild(guild).ticket_panel_emoji()
+
+        color_map = {
+            "blurple": discord.Color.blurple(),
+            "red": discord.Color.red(),
+            "green": discord.Color.green(),
+            "grey": discord.Color.greyple(),
+            "orange": discord.Color.orange(),
+        }
+        color = color_map.get(color_name, discord.Color.blurple())
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Ticket-System • Klicke auf den Button")
+        view = TicketPanelView(self)
+        try:
+            message = await channel.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte das Ticket-Panel nicht posten: `{e}`")
+            return
+        # Altes Panel löschen falls vorhanden
+        old_id = await self.config.guild(guild).ticket_panel_message_id()
+        if old_id:
+            try:
+                old_msg = await channel.fetch_message(old_id)
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        await self.config.guild(guild).ticket_panel_message_id.set(message.id)
+        await ctx.send(f"✅ Ticket-Panel in {channel.mention} erstellt!")
+
+    # ============================================
+    # ERWEITERTE TICKET-SETUP-BEFEHLE
+    # ============================================
+
+    @ticketset.command(name="setup")
+    async def ticketset_setup(self, ctx: commands.Context):
+        """Interaktiver Setup-Wizard für das Ticket-System (mit Buttons)."""
+        view = TicketSetupWizardView(self, ctx.guild)
+        embed = view.build_embed()
+        await ctx.send(embed=embed, view=view)
+
+    @ticketset.command(name="quickstart")
+    async def ticketset_quickstart(self, ctx: commands.Context):
+        """Ein-Klick-Setup mit empfohlenen Defaults.
+        Setzt automatisch: Kategorie (erstellt falls fehlt), Support-Rolle, Panel-Channel,
+        Log-Channel und erstellt das Ticket-Panel."""
+        guild = ctx.guild
+        g = self.config.guild(guild)
+
+        # 1. Support-Rolle: vorhandene mit Manage Channels oder erstellen
+        support_role_id = await g.ticket_support_role()
+        support_role = guild.get_role(support_role_id) if support_role_id else None
+        if not support_role:
+            try:
+                support_role = await guild.create_role(
+                    name="🎫 Ticket Support",
+                    reason="Auto-created by ticketset quickstart",
+                )
+                await g.ticket_support_role.set(support_role.id)
+            except discord.Forbidden:
+                await ctx.send("❌ Brauche `Manage Roles` um Support-Rolle zu erstellen.")
+                return
+            except discord.HTTPException as e:
+                await ctx.send(f"❌ Konnte Rolle nicht erstellen: `{e}`")
+                return
+
+        # 2. Kategorie: vorhandene oder erstellen
+        cat_id = await g.ticket_category()
+        category = guild.get_channel(cat_id) if cat_id else None
+        if not category or not isinstance(category, discord.CategoryChannel):
+            try:
+                category = await guild.create_category(
+                    name="🎫 Tickets",
+                    reason="Auto-created by ticketset quickstart",
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                        guild.me: discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True,
+                            read_message_history=True, manage_channels=True,
+                        ),
+                        support_role: discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True,
+                            read_message_history=True, attach_files=True,
+                        ),
+                    },
+                )
+                await g.ticket_category.set(category.id)
+            except discord.Forbidden:
+                await ctx.send("❌ Brauche `Manage Channels` um Kategorie zu erstellen.")
+                return
+            except discord.HTTPException as e:
+                await ctx.send(f"❌ Konnte Kategorie nicht erstellen: `{e}`")
+                return
+
+        # 3. Panel-Channel = aktueller Channel (falls Text-Channel)
+        panel_ch_id = await g.ticket_panel_channel()
+        panel_ch = guild.get_channel(panel_ch_id) if panel_ch_id else None
+        if not panel_ch and isinstance(ctx.channel, discord.TextChannel):
+            panel_ch = ctx.channel
+            await g.ticket_panel_channel.set(panel_ch.id)
+        elif not panel_ch:
+            try:
+                panel_ch = await guild.create_text_channel(
+                    name="ticket-panel",
+                    category=None,
+                    reason="Auto-created by ticketset quickstart",
+                )
+                await g.ticket_panel_channel.set(panel_ch.id)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await ctx.send(f"❌ Konnte Panel-Channel nicht erstellen: `{e}`")
+                return
+
+        # 4. Log-Channel erstellen falls nicht vorhanden
+        log_ch_id = await g.ticket_log_channel()
+        log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
+        if not log_ch:
+            try:
+                log_ch = await guild.create_text_channel(
+                    name="ticket-logs",
+                    category=category,
+                    reason="Auto-created by ticketset quickstart",
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                        support_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+                        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                    },
+                )
+                await g.ticket_log_channel.set(log_ch.id)
+            except (discord.Forbidden, discord.HTTPException):
+                pass  # nicht kritisch
+
+        # 5. Defaults für erweiterte Optionen
+        await g.ticket_modal_enabled.set(True)
+        await g.ticket_dm_on_close.set(False)
+        await g.ticket_transcript.set(True)
+        await g.ticket_user_can_close.set(True)
+        await g.ticket_claim_enabled.set(True)
+        await g.ticket_max_open.set(1)
+
+        # 6. Panel erstellen
         embed = discord.Embed(
             title="🎫 Ticket erstellen",
             description=(
@@ -4174,20 +4380,238 @@ class SupportCog(commands.Cog):
         embed.set_footer(text="Ticket-System • Klicke auf den Button")
         view = TicketPanelView(self)
         try:
-            message = await channel.send(embed=embed, view=view)
-        except (discord.Forbidden, discord.HTTPException):
-            await ctx.send("❌ Konnte das Ticket-Panel nicht in diesem Channel posten.")
+            message = await panel_ch.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Panel-Nachricht nicht senden: `{e}`")
             return
         # Altes Panel löschen falls vorhanden
-        old_id = await self.config.guild(guild).ticket_panel_message_id()
+        old_id = await g.ticket_panel_message_id()
         if old_id:
             try:
-                old_msg = await channel.fetch_message(old_id)
+                old_msg = await panel_ch.fetch_message(old_id)
                 await old_msg.delete()
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
-        await self.config.guild(guild).ticket_panel_message_id.set(message.id)
-        await ctx.send(f"✅ Ticket-Panel in {channel.mention} erstellt!")
+        await g.ticket_panel_message_id.set(message.id)
+
+        # 7. Zusammenfassung
+        result_embed = discord.Embed(
+            title="✅ Ticket-System QuickStart fertig!",
+            description=(
+                f"**Support-Rolle:** {support_role.mention}\n"
+                f"**Kategorie:** {category.name}\n"
+                f"**Panel-Channel:** {panel_ch.mention}\n"
+                f"**Log-Channel:** {log_ch.mention if log_ch else '❌ (nicht erstellt)'}\n"
+                f"**Panel-Nachricht:** [Klick]({message.jump_url})\n\n"
+                f"**Aktivierte Features:**\n"
+                f"• ✅ Modal (User muss Anliegen beschreiben)\n"
+                f"• ✅ Transcript bei Schließen\n"
+                f"• ✅ User darf eigenes Ticket schließen\n"
+                f"• ✅ Claim-System (Team kann Tickets übernehmen)\n"
+                f"• ✅ Max. 1 offenes Ticket pro User\n"
+                f"• ❌ Auto-Close (deaktiviert — mit `[p]ticketset autoclose 24` aktivieren)\n"
+                f"• ❌ DM bei Schließen (mit `[p]ticketset dm True` aktivieren)\n\n"
+                f"💡 Mit `[p]ticketset setup` kannst du alles weitere anpassen."
+            ),
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        await ctx.send(embed=result_embed)
+
+    @ticketset.command(name="welcome")
+    async def ticketset_welcome(self, ctx: commands.Context, *, message: str):
+        """Setzt die Willkommensnachricht die User im neuen Ticket sehen."""
+        if len(message) > 1500:
+            await ctx.send("❌ Nachricht zu lang (max 1500 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).ticket_welcome_message.set(message)
+        await ctx.send("✅ Willkommensnachricht gesetzt.")
+
+    @ticketset.command(name="paneltitle")
+    async def ticketset_paneltitle(self, ctx: commands.Context, *, title: str):
+        """Setzt den Titel des Panel-Embeds."""
+        if len(title) > 200:
+            await ctx.send("❌ Titel zu lang (max 200 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).ticket_panel_title.set(title)
+        await ctx.send(f"✅ Panel-Titel gesetzt auf: `{title}`.\nMit `[p]ticketset createpanel` Panel aktualisieren.")
+
+    @ticketset.command(name="paneldescription", aliases=["paneldesc"])
+    async def ticketset_paneldescription(self, ctx: commands.Context, *, description: str):
+        """Setzt die Beschreibung des Panel-Embeds."""
+        if len(description) > 1500:
+            await ctx.send("❌ Beschreibung zu lang (max 1500 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).ticket_panel_description.set(description)
+        await ctx.send("✅ Panel-Beschreibung gesetzt.\nMit `[p]ticketset createpanel` Panel aktualisieren.")
+
+    @ticketset.command(name="panelcolor")
+    async def ticketset_panelcolor(self, ctx: commands.Context, color: str):
+        """Setzt die Farbe des Panel-Embeds. Verfügbare Farben: blurple, red, green, grey, orange."""
+        color = color.lower()
+        if color not in ("blurple", "red", "green", "grey", "orange"):
+            await ctx.send("❌ Ungültige Farbe. Verwende: `blurple`, `red`, `green`, `grey`, `orange`.")
+            return
+        await self.config.guild(ctx.guild).ticket_panel_color.set(color)
+        await ctx.send(f"✅ Panel-Farbe gesetzt auf: `{color}`.\nMit `[p]ticketset createpanel` Panel aktualisieren.")
+
+    @ticketset.command(name="panelemoji")
+    async def ticketset_panelemoji(self, ctx: commands.Context, emoji: str):
+        """Setzt das Emoji auf dem Panel-Button."""
+        if len(emoji) > 50:
+            await ctx.send("❌ Emoji zu lang.")
+            return
+        await self.config.guild(ctx.guild).ticket_panel_emoji.set(emoji)
+        await ctx.send(f"✅ Panel-Emoji gesetzt auf: {emoji}\nMit `[p]ticketset createpanel` Panel aktualisieren.")
+
+    @ticketset.command(name="buttontext")
+    async def ticketset_buttontext(self, ctx: commands.Context, *, text: str):
+        """Setzt den Text auf dem Panel-Button."""
+        if len(text) > 80:
+            await ctx.send("❌ Text zu lang (max 80 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).ticket_panel_button_text.set(text)
+        await ctx.send(f"✅ Button-Text gesetzt auf: `{text}`\nMit `[p]ticketset createpanel` Panel aktualisieren.")
+
+    @ticketset.command(name="modal")
+    async def ticketset_modal(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert das Modal (User muss Anliegen beschreiben)."""
+        await self.config.guild(ctx.guild).ticket_modal_enabled.set(enabled)
+        await ctx.send(f"✅ Modal {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @ticketset.command(name="modalquestion")
+    async def ticketset_modalquestion(self, ctx: commands.Context, *, question: str):
+        """Setzt die Frage die im Modal gestellt wird."""
+        if len(question) > 45:
+            await ctx.send("❌ Frage zu lang (max 45 Zeichen — Discord Modal-Limit).")
+            return
+        await self.config.guild(ctx.guild).ticket_modal_question.set(question)
+        await ctx.send("✅ Modal-Frage gesetzt.")
+
+    @ticketset.command(name="modalplaceholder")
+    async def ticketset_modalplaceholder(self, ctx: commands.Context, *, placeholder: str):
+        """Setzt den Placeholder-Text im Modal."""
+        if len(placeholder) > 100:
+            await ctx.send("❌ Placeholder zu lang (max 100 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).ticket_modal_placeholder.set(placeholder)
+        await ctx.send("✅ Modal-Placeholder gesetzt.")
+
+    @ticketset.command(name="dm")
+    async def ticketset_dm(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert DM an User bei Ticket-Schließung."""
+        await self.config.guild(ctx.guild).ticket_dm_on_close.set(enabled)
+        await ctx.send(f"✅ DM bei Schließen {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @ticketset.command(name="autoclose", aliases=["autoclosehours"])
+    async def ticketset_autoclose(self, ctx: commands.Context, hours: int):
+        """Setzt Auto-Close für inaktive Tickets in Stunden (0 = deaktiviert)."""
+        if hours < 0:
+            await ctx.send("❌ Wert muss ≥ 0 sein (0 = deaktiviert).")
+            return
+        await self.config.guild(ctx.guild).ticket_auto_close_hours.set(hours)
+        if hours == 0:
+            await ctx.send("✅ Auto-Close deaktiviert.")
+        else:
+            await ctx.send(f"✅ Auto-Close gesetzt auf {hours} Stunden.")
+
+    @ticketset.command(name="transcript")
+    async def ticketset_transcript(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert Transcripts bei Schließung."""
+        await self.config.guild(ctx.guild).ticket_transcript.set(enabled)
+        await ctx.send(f"✅ Transcript {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @ticketset.command(name="userclose", aliases=["selfclose"])
+    async def ticketset_userclose(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert ob User ihr eigenes Ticket schließen dürfen."""
+        await self.config.guild(ctx.guild).ticket_user_can_close.set(enabled)
+        await ctx.send(f"✅ User-Close {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @ticketset.command(name="claim")
+    async def ticketset_claim(self, ctx: commands.Context, enabled: bool):
+        """Aktiviert/deaktiviert das Claim-System."""
+        await self.config.guild(ctx.guild).ticket_claim_enabled.set(enabled)
+        await ctx.send(f"✅ Claim-System {'aktiviert' if enabled else 'deaktiviert'}.")
+
+    @ticketset.command(name="maxopen", aliases=["maxtickets"])
+    async def ticketset_maxopen(self, ctx: commands.Context, count: int):
+        """Setzt die maximal gleichzeitig offenen Tickets pro User."""
+        if count < 1:
+            await ctx.send("❌ Wert muss ≥ 1 sein.")
+            return
+        await self.config.guild(ctx.guild).ticket_max_open.set(count)
+        await ctx.send(f"✅ Max. offene Tickets pro User gesetzt auf {count}.")
+
+    @ticketset.command(name="blacklist")
+    async def ticketset_blacklist(self, ctx: commands.Context, action: str, user: discord.User):
+        """Fügt User zur Ticket-Blacklist hinzu/entfernt ihn. `add` oder `remove`."""
+        bl = await self.config.guild(ctx.guild).ticket_blacklist() or []
+        if action.lower() == "add":
+            if user.id not in bl:
+                bl.append(user.id)
+            await self.config.guild(ctx.guild).ticket_blacklist.set(bl)
+            await ctx.send(f"✅ {user.mention} kann keine Tickets mehr erstellen.")
+        elif action.lower() == "remove":
+            if user.id in bl:
+                bl.remove(user.id)
+            await self.config.guild(ctx.guild).ticket_blacklist.set(bl)
+            await ctx.send(f"✅ {user.mention} kann wieder Tickets erstellen.")
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
+
+    # ============================================
+    # ERWEITERTE TICKET-CORE-LOGIK
+    # ============================================
+
+    async def _ticket_get_creator(self, channel: discord.TextChannel) -> Optional[int]:
+        """Extrahiert die User-ID des Ticket-Erstellers aus dem Channel-Topic."""
+        if not channel.topic:
+            return None
+        m = re.search(r"User: (\d+)", channel.topic)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
+        return None
+
+    async def _ticket_get_counter(self, channel: discord.TextChannel) -> Optional[int]:
+        """Extrahiert die Ticket-Nummer aus dem Channel-Topic."""
+        if not channel.topic:
+            return None
+        m = re.search(r"Ticket #(\d+)", channel.topic)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
+        return None
+
+    async def _ticket_user_open_count(self, guild: discord.Guild, user_id: int) -> int:
+        """Gibt die Anzahl aktuell offener Tickets eines Users zurück."""
+        active = await self.config.guild(guild).ticket_active() or {}
+        return len(active.get(str(user_id), []))
+
+    async def _ticket_add_active(self, guild: discord.Guild, user_id: int, channel_id: int):
+        """Registriert ein offenes Ticket."""
+        active = await self.config.guild(guild).ticket_active() or {}
+        key = str(user_id)
+        if key not in active:
+            active[key] = []
+        if channel_id not in active[key]:
+            active[key].append(channel_id)
+        await self.config.guild(guild).ticket_active.set(active)
+
+    async def _ticket_remove_active(self, guild: discord.Guild, user_id: int, channel_id: int):
+        """Entfernt ein geschlossenes Ticket aus dem Tracking."""
+        active = await self.config.guild(guild).ticket_active() or {}
+        key = str(user_id)
+        if key in active:
+            if channel_id in active[key]:
+                active[key].remove(channel_id)
+            if not active[key]:
+                del active[key]
+            await self.config.guild(guild).ticket_active.set(active)
 
     async def _create_ticket(self, interaction: discord.Interaction, subject: str, requester: discord.Member):
         """Erstellt einen Ticket-Channel für einen User."""
@@ -4201,22 +4625,55 @@ class SupportCog(commands.Cog):
             )
             return
 
+        # Blacklist prüfen
+        blacklist = await self.config.guild(guild).ticket_blacklist() or []
+        if requester.id in blacklist:
+            await interaction.response.send_message(
+                "❌ Du bist aktuell vom Ticket-System ausgeschlossen und kannst keine Tickets erstellen.",
+                ephemeral=True,
+            )
+            return
+
+        # Max-Open-Check
+        max_open = await self.config.guild(guild).ticket_max_open() or 1
+        current_open = await self._ticket_user_open_count(guild, requester.id)
+        if current_open >= max_open:
+            await interaction.response.send_message(
+                f"❌ Du hast bereits {current_open} offene Ticket(s). Maximum ist {max_open}.\n"
+                f"Bitte schließe zuerst ein bestehendes Ticket.",
+                ephemeral=True,
+            )
+            return
+
+        # Response bereits gesendet? Sonst deferred response
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
         # Ticket-Nummer hochzählen
         counter = await self.config.guild(guild).ticket_counter() or 0
         counter += 1
         await self.config.guild(guild).ticket_counter.set(counter)
         ticket_name = f"ticket-{counter:04d}"
 
-        # Berechtigungen: nur requester + support_role + admins dürfen sehen/schreiben
+        # Berechtigungen
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            requester: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
-            support_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
+            requester: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                attach_files=True, embed_links=True,
+            ),
+            support_role: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                attach_files=True, embed_links=True, manage_messages=True,
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                manage_channels=True, manage_messages=True,
+            ),
         }
-        # Bot-Owner / Admins dürfen auch
-        if guild.me.top_role:
-            overwrites[guild.me.top_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
         try:
             ticket_channel = await guild.create_text_channel(
@@ -4224,28 +4681,34 @@ class SupportCog(commands.Cog):
                 category=category,
                 overwrites=overwrites,
                 reason=f"Ticket #{counter} von {requester.display_name}",
-                topic=f"Ticket #{counter} • User: {requester.id} • Betreff: {subject[:200]}",
+                topic=f"Ticket #{counter} • User: {requester.id} • Betreff: {subject[:200]} • Created: {_now_ts()}",
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Mir fehlen die Rechte, um einen Ticket-Channel zu erstellen.",
                 ephemeral=True,
             )
             return
         except discord.HTTPException as e:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ Konnte Ticket-Channel nicht erstellen: `{e}`",
                 ephemeral=True,
             )
             return
 
-        # Begrüßungs-Embed im Ticket-Channel
+        # Active-Tracking aktualisieren
+        await self._ticket_add_active(guild, requester.id, ticket_channel.id)
+
+        # Welcome-Embed
+        welcome_msg = await self.config.guild(guild).ticket_welcome_message() or "Willkommen zu deinem Ticket!"
+        claim_enabled = await self.config.guild(guild).ticket_claim_enabled()
+
         embed = discord.Embed(
             title=f"🎫 Ticket #{counter}",
             description=(
                 f"Hallo {requester.mention}!\n\n"
                 f"**Betreff:** {subject}\n\n"
-                f"Ein Teammitglied wird sich gleich um dein Anliegen kümmern.\n"
+                f"{welcome_msg}\n\n"
                 f"Bitte beschreibe dein Problem so detailliert wie möglich."
             ),
             color=discord.Color.blurple(),
@@ -4253,14 +4716,16 @@ class SupportCog(commands.Cog):
         )
         embed.add_field(name="🎫 Ticket-ID", value=f"#{counter}", inline=True)
         embed.add_field(name="👤 Erstellt von", value=f"{requester.mention}\n`{requester.id}`", inline=True)
+        embed.add_field(name="📊 Status", value="🟡 Offen", inline=True)
         embed.set_footer(text="Nutze den 'Ticket schließen' Button wenn dein Anliegen geklärt ist.")
 
-        close_view = TicketCloseView(self)
+        # View mit Close + Claim + Add-User-Buttons
+        view = TicketControlView(self, claim_enabled=claim_enabled)
         try:
             await ticket_channel.send(
-                content=f"{support_role.mention} {requester.mention}",
+                content=f"🎫 {support_role.mention} | {requester.mention}",
                 embed=embed,
-                view=close_view,
+                view=view,
                 allowed_mentions=discord.AllowedMentions(roles=[support_role], users=[requester]),
             )
         except discord.HTTPException:
@@ -4279,61 +4744,123 @@ class SupportCog(commands.Cog):
                 )
                 log_embed.add_field(name="👤 Von", value=f"{requester.mention}\n`{requester.id}`", inline=True)
                 log_embed.add_field(name="🎫 ID", value=f"#{counter}", inline=True)
-                log_embed.add_field(name="📝 Betreff", value=subject[:500], inline=False)
+                log_embed.add_field(name="📝 Betreff", value=subject[:1024], inline=False)
+                log_embed.add_field(name="🔗 Channel", value=ticket_channel.mention, inline=True)
+                log_embed.set_footer(text=f"Ticket-System • {guild.name}")
                 await log_channel.send(embed=log_embed)
             except discord.HTTPException:
                 pass
 
-        await interaction.response.send_message(
-            f"✅ Dein Ticket wurde erstellt: {ticket_channel.mention}",
-            ephemeral=True,
-        )
-
-    async def _close_ticket(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        """Schließt einen Ticket-Channel (mit Bestätigung)."""
-        guild = interaction.guild
-        # Prüfen ob es ein Ticket ist (Name fängt mit "ticket-" an)
-        if not channel.name.startswith("ticket-"):
-            await interaction.response.send_message(
-                "❌ Dieser Channel ist kein Ticket-Channel.",
+        try:
+            await interaction.followup.send(
+                f"✅ Dein Ticket wurde erstellt: {ticket_channel.mention}",
                 ephemeral=True,
             )
+        except discord.HTTPException:
+            pass
+
+    async def _close_ticket(self, interaction: discord.Interaction, channel: discord.TextChannel, *, reason: str = "Kein Grund angegeben"):
+        """Schließt einen Ticket-Channel (mit Transcript + Log)."""
+        guild = interaction.guild
+        if not channel.name.startswith("ticket-"):
+            try:
+                await interaction.response.send_message(
+                    "❌ Dieser Channel ist kein Ticket-Channel.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
             return
         support_role = await self.get_ticket_support_role(guild)
         requester_member = interaction.user
         if not isinstance(requester_member, discord.Member):
-            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            try:
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            except discord.HTTPException:
+                pass
             return
-        # Berechtigung: Support-Rolle oder manage_channels
+
+        # Berechtigungsprüfung
         is_support = support_role is not None and requester_member.get_role(support_role.id) is not None
         is_admin = requester_member.guild_permissions.manage_channels
-        # Ticket-Ersteller darf auch schließen (sofern erkennbar aus dem Topic)
-        is_creator = False
-        if channel.topic and f"User: {requester_member.id}" in channel.topic:
-            is_creator = True
+        creator_id = await self._ticket_get_creator(channel)
+        is_creator = creator_id is not None and requester_member.id == creator_id
+        user_can_close = await self.config.guild(guild).ticket_user_can_close()
+
+        if is_creator and not user_can_close and not (is_support or is_admin):
+            try:
+                await interaction.response.send_message(
+                    "❌ User dürfen ihre Tickets nicht selbst schließen. Bitte ein Teammitglied bitten.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
         if not (is_support or is_admin or is_creator):
-            await interaction.response.send_message(
-                "❌ Du bist nicht berechtigt, dieses Ticket zu schließen.",
-                ephemeral=True,
-            )
+            try:
+                await interaction.response.send_message(
+                    "❌ Du bist nicht berechtigt, dieses Ticket zu schließen.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
             return
 
-        await interaction.response.defer(ephemeral=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
 
-        # Log-Eintrag VOR dem Löschen (sonst ist der Channel weg)
+        # Transcript erstellen (vor dem Löschen!)
+        transcript_text = ""
+        transcript_enabled = await self.config.guild(guild).ticket_transcript()
+        if transcript_enabled:
+            try:
+                messages = []
+                try:
+                    async for msg in channel.history(limit=None, oldest_first=True):
+                        messages.append(msg)
+                except (discord.Forbidden, discord.HTTPException):
+                    messages = []
+                if messages:
+                    lines = []
+                    lines.append(f"Transcript für Ticket #{await self._ticket_get_counter(channel) or '?'}")
+                    lines.append(f"Channel: #{channel.name}")
+                    lines.append(f"Erstellt am: {discord.utils.format_dt(_now(), 'F')}")
+                    lines.append(f"Geschlossen von: {requester_member} ({requester_member.id})")
+                    lines.append(f"Grund: {reason}")
+                    lines.append("=" * 60)
+                    lines.append("")
+                    for msg in messages:
+                        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if msg.created_at else "?"
+                        author = msg.author.display_name if msg.author else "Unbekannt"
+                        content = msg.content or ""
+                        if msg.attachments:
+                            content += " " + " ".join(f"[Attachment: {a.filename}]" for a in msg.attachments)
+                        if msg.embeds:
+                            content += f" [{len(msg.embeds)} Embeds]"
+                        lines.append(f"[{ts}] {author}: {content}")
+                    transcript_text = "\n".join(lines)
+            except Exception as e:
+                log.exception("Transcript-Erstellung fehlgeschlagen")
+                transcript_text = f"Transcript-Fehler: {e}"
+
+        # Creator ermitteln für DM
+        creator_mention = "Unbekannt"
+        creator_user = None
+        if creator_id is not None:
+            creator_mention = f"<@{creator_id}>"
+            try:
+                creator_user = await self.bot.fetch_user(creator_id)
+            except (discord.NotFound, discord.HTTPException):
+                creator_user = None
+
+        # Log-Eintrag VOR dem Löschen
         log_channel_id = await self.config.guild(guild).ticket_log_channel()
         log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
         if log_channel:
             try:
-                # Versuche den Ersteller aus dem Topic zu extrahieren
-                creator_mention = "Unbekannt"
-                if channel.topic:
-                    m = re.search(r"User: (\d+)", channel.topic)
-                    if m:
-                        try:
-                            creator_mention = f"<@{int(m.group(1))}>"
-                        except ValueError:
-                            pass
                 log_embed = discord.Embed(
                     title="🎫 Ticket geschlossen",
                     description=f"Ticket-Channel: `{channel.name}` (gelöscht)",
@@ -4342,17 +4869,421 @@ class SupportCog(commands.Cog):
                 )
                 log_embed.add_field(name="👤 Geschlossen von", value=f"{requester_member.mention}\n`{requester_member.id}`", inline=True)
                 log_embed.add_field(name="🎫 Ersteller", value=creator_mention, inline=True)
-                await log_channel.send(embed=log_embed)
+                log_embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+                # Transcript als File anhängen
+                if transcript_text:
+                    try:
+                        import io
+                        ticket_num = await self._ticket_get_counter(channel) or "?"
+                        filename = f"transcript-ticket-{ticket_num}.txt"
+                        file_obj = discord.File(io.StringIO(transcript_text), filename=filename)
+                        await log_channel.send(embed=log_embed, file=file_obj)
+                    except (discord.Forbidden, discord.HTTPException):
+                        await log_channel.send(embed=log_embed)
+                else:
+                    await log_channel.send(embed=log_embed)
             except discord.HTTPException:
                 pass
 
+        # DM an Ersteller
+        dm_enabled = await self.config.guild(guild).ticket_dm_on_close()
+        if dm_enabled and creator_user:
+            try:
+                dm_embed = discord.Embed(
+                    title="🎫 Dein Ticket wurde geschlossen",
+                    description=(
+                        f"Dein Ticket auf **{guild.name}** wurde geschlossen.\n\n"
+                        f"**Geschlossen von:** {requester_member.display_name}\n"
+                        f"**Grund:** {reason[:500]}"
+                    ),
+                    color=discord.Color.red(),
+                    timestamp=_now(),
+                )
+                if transcript_text:
+                    try:
+                        import io
+                        ticket_num = await self._ticket_get_counter(channel) or "?"
+                        filename = f"transcript-ticket-{ticket_num}.txt"
+                        file_obj = discord.File(io.StringIO(transcript_text), filename=filename)
+                        await creator_user.send(embed=dm_embed, file=file_obj)
+                    except (discord.Forbidden, discord.HTTPException):
+                        await creator_user.send(embed=dm_embed)
+                else:
+                    await creator_user.send(embed=dm_embed)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        # Active-Tracking aktualisieren
+        if creator_id is not None:
+            await self._ticket_remove_active(guild, creator_id, channel.id)
+
         # Channel löschen
         try:
-            await channel.delete(reason=f"Ticket geschlossen von {requester_member.display_name}")
+            await channel.delete(reason=f"Ticket geschlossen von {requester_member.display_name}: {reason[:100]}")
         except discord.Forbidden:
-            await interaction.followup.send("❌ Mir fehlen die Rechte, um den Channel zu löschen.", ephemeral=True)
+            try:
+                await interaction.followup.send("❌ Mir fehlen die Rechte, um den Channel zu löschen.", ephemeral=True)
+            except discord.HTTPException:
+                pass
         except discord.HTTPException as e:
-            await interaction.followup.send(f"❌ Konnte Channel nicht löschen: `{e}`", ephemeral=True)
+            try:
+                await interaction.followup.send(f"❌ Konnte Channel nicht löschen: `{e}`", ephemeral=True)
+            except discord.HTTPException:
+                pass
+
+    # ============================================
+    # TICKET-STAFF-BEFEHLE
+    # ============================================
+
+    @commands.command(name="claim", aliases=["claimticket"])
+    @commands.guild_only()
+    async def claim_ticket(self, ctx: commands.Context):
+        """Übernimmt ein Ticket (Claim-System). Zeigt anderen Teammitgliedern dass du zuständig bist."""
+        if not ctx.channel.name.startswith("ticket-"):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        claim_enabled = await self.config.guild(ctx.guild).ticket_claim_enabled()
+        if not claim_enabled:
+            await ctx.send("❌ Claim-System ist deaktiviert.")
+            return
+        support_role = await self.get_ticket_support_role(ctx.guild)
+        if not support_role or ctx.author.get_role(support_role.id) is None:
+            if not ctx.author.guild_permissions.manage_channels:
+                await ctx.send("❌ Du brauchst die Support-Rolle oder Admin-Rechte.")
+                return
+        # Channel-Topic aktualisieren
+        topic = ctx.channel.topic or ""
+        # Alten Claimed-Eintrag entfernen
+        topic_clean = re.sub(r" • Claimed by: \d+", "", topic)
+        new_topic = f"{topic_clean} • Claimed by: {ctx.author.id}"
+        try:
+            await ctx.channel.edit(topic=new_topic, reason=f"Ticket claimed by {ctx.author.display_name}")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Channel-Topic nicht aktualisieren: `{e}`")
+            return
+        embed = discord.Embed(
+            title="✅ Ticket übernommen",
+            description=f"{ctx.author.mention} hat dieses Ticket übernommen und ist nun zuständig.",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        await ctx.send(embed=embed)
+
+    @commands.command(name="ticketadd", aliases=["tadd", "adduser"])
+    @commands.guild_only()
+    async def ticket_add(self, ctx: commands.Context, user: discord.Member):
+        """Fügt einen User zum aktuellen Ticket-Channel hinzu."""
+        if not ctx.channel.name.startswith("ticket-"):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        support_role = await self.get_ticket_support_role(ctx.guild)
+        is_support = support_role and ctx.author.get_role(support_role.id) is not None
+        is_admin = ctx.author.guild_permissions.manage_channels
+        creator_id = await self._ticket_get_creator(ctx.channel)
+        is_creator = creator_id == ctx.author.id
+        if not (is_support or is_admin or is_creator):
+            await ctx.send("❌ Du bist nicht berechtigt, User hinzuzufügen.")
+            return
+        try:
+            await ctx.channel.set_permissions(
+                user,
+                view_channel=True, send_messages=True,
+                read_message_history=True, attach_files=True,
+                reason=f"Hinzugefügt von {ctx.author.display_name}",
+            )
+            await ctx.send(f"✅ {user.mention} wurde zum Ticket hinzugefügt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Mir fehlen die Rechte um Permissions zu setzen.")
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+
+    @commands.command(name="ticketremove", aliases=["tremove", "removeuser"])
+    @commands.guild_only()
+    async def ticket_remove(self, ctx: commands.Context, user: discord.Member):
+        """Entfernt einen User aus dem aktuellen Ticket-Channel."""
+        if not ctx.channel.name.startswith("ticket-"):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        support_role = await self.get_ticket_support_role(ctx.guild)
+        is_support = support_role and ctx.author.get_role(support_role.id) is not None
+        is_admin = ctx.author.guild_permissions.manage_channels
+        creator_id = await self._ticket_get_creator(ctx.channel)
+        is_creator = creator_id == ctx.author.id
+        if not (is_support or is_admin or is_creator):
+            await ctx.send("❌ Du bist nicht berechtigt, User zu entfernen.")
+            return
+        if user.id == creator_id:
+            await ctx.send("❌ Du kannst den Ticket-Ersteller nicht entfernen.")
+            return
+        try:
+            await ctx.channel.set_permissions(
+                user,
+                overwrite=None,
+                reason=f"Entfernt von {ctx.author.display_name}",
+            )
+            await ctx.send(f"✅ {user.mention} wurde aus dem Ticket entfernt.")
+        except discord.Forbidden:
+            await ctx.send("❌ Mir fehlen die Rechte um Permissions zu setzen.")
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+
+    @commands.command(name="ticketrename", aliases=["trename", "renameticket"])
+    @commands.guild_only()
+    async def ticket_rename(self, ctx: commands.Context, *, new_name: str):
+        """Benennt den aktuellen Ticket-Channel um."""
+        if not ctx.channel.name.startswith("ticket-"):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        if len(new_name) > 100:
+            await ctx.send("❌ Name zu lang (max 100 Zeichen).")
+            return
+        support_role = await self.get_ticket_support_role(ctx.guild)
+        is_support = support_role and ctx.author.get_role(support_role.id) is not None
+        is_admin = ctx.author.guild_permissions.manage_channels
+        creator_id = await self._ticket_get_creator(ctx.channel)
+        is_creator = creator_id == ctx.author.id
+        if not (is_support or is_admin or is_creator):
+            await ctx.send("❌ Du bist nicht berechtigt, das Ticket umzubenennen.")
+            return
+        # "ticket-" Prefix erzwingen
+        if not new_name.startswith("ticket-"):
+            new_name = f"ticket-{new_name}"
+        try:
+            await ctx.channel.edit(name=new_name.lower().replace(" ", "-"), reason=f"Umbenannt von {ctx.author.display_name}")
+            await ctx.send(f"✅ Ticket umbenannt zu: `{new_name}`")
+        except discord.Forbidden:
+            await ctx.send("❌ Mir fehlen die Rechte um den Channel umzubenennen.")
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+
+    @commands.command(name="ticketclose", aliases=["tclose", "close"])
+    @commands.guild_only()
+    async def ticket_close_cmd(self, ctx: commands.Context, *, reason: str = "Kein Grund angegeben"):
+        """Schließt das aktuelle Ticket (Text-Befehl-Version)."""
+        if not ctx.channel.name.startswith("ticket-"):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        support_role = await self.get_ticket_support_role(ctx.guild)
+        is_support = support_role and ctx.author.get_role(support_role.id) is not None
+        is_admin = ctx.author.guild_permissions.manage_channels
+        creator_id = await self._ticket_get_creator(ctx.channel)
+        is_creator = creator_id == ctx.author.id
+        user_can_close = await self.config.guild(ctx.guild).ticket_user_can_close()
+        if is_creator and not user_can_close and not (is_support or is_admin):
+            await ctx.send("❌ User dürfen ihre Tickets nicht selbst schließen.")
+            return
+        if not (is_support or is_admin or is_creator):
+            await ctx.send("❌ Du bist nicht berechtigt, dieses Ticket zu schließen.")
+            return
+        # Wir rufen die gleiche Logik auf, aber mit einem Fake-Interaction-Objekt
+        # Da _close_ticket interaction.response etc. braucht, bauen wir eine Wrapper-Klasse
+        await self._close_ticket_via_command(ctx, reason)
+
+    async def _close_ticket_via_command(self, ctx: commands.Context, reason: str):
+        """Schließt ein Ticket via Text-Befehl (ohne Interaction)."""
+        guild = ctx.guild
+        channel = ctx.channel
+        if not isinstance(channel, discord.TextChannel):
+            await ctx.send("❌ Nur in Text-Channels verfügbar.")
+            return
+
+        # Transcript erstellen
+        transcript_text = ""
+        transcript_enabled = await self.config.guild(guild).ticket_transcript()
+        if transcript_enabled:
+            try:
+                messages = []
+                async for msg in channel.history(limit=None, oldest_first=True):
+                    messages.append(msg)
+                if messages:
+                    lines = []
+                    ticket_num = await self._ticket_get_counter(channel) or "?"
+                    lines.append(f"Transcript für Ticket #{ticket_num}")
+                    lines.append(f"Channel: #{channel.name}")
+                    lines.append(f"Geschlossen von: {ctx.author} ({ctx.author.id})")
+                    lines.append(f"Grund: {reason}")
+                    lines.append("=" * 60)
+                    lines.append("")
+                    for msg in messages:
+                        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if msg.created_at else "?"
+                        author = msg.author.display_name if msg.author else "Unbekannt"
+                        content = msg.content or ""
+                        if msg.attachments:
+                            content += " " + " ".join(f"[Attachment: {a.filename}]" for a in msg.attachments)
+                        lines.append(f"[{ts}] {author}: {content}")
+                    transcript_text = "\n".join(lines)
+            except Exception:
+                log.exception("Transcript-Erstellung fehlgeschlagen")
+
+        creator_id = await self._ticket_get_creator(channel)
+        creator_user = None
+        creator_mention = "Unbekannt"
+        if creator_id is not None:
+            creator_mention = f"<@{creator_id}>"
+            try:
+                creator_user = await self.bot.fetch_user(creator_id)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        # Log
+        log_channel_id = await self.config.guild(guild).ticket_log_channel()
+        log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
+        if log_channel:
+            try:
+                log_embed = discord.Embed(
+                    title="🎫 Ticket geschlossen",
+                    description=f"Ticket-Channel: `{channel.name}` (gelöscht)",
+                    color=discord.Color.red(),
+                    timestamp=_now(),
+                )
+                log_embed.add_field(name="👤 Geschlossen von", value=f"{ctx.author.mention}\n`{ctx.author.id}`", inline=True)
+                log_embed.add_field(name="🎫 Ersteller", value=creator_mention, inline=True)
+                log_embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+                if transcript_text:
+                    try:
+                        import io
+                        ticket_num = await self._ticket_get_counter(channel) or "?"
+                        filename = f"transcript-ticket-{ticket_num}.txt"
+                        file_obj = discord.File(io.StringIO(transcript_text), filename=filename)
+                        await log_channel.send(embed=log_embed, file=file_obj)
+                    except (discord.Forbidden, discord.HTTPException):
+                        await log_channel.send(embed=log_embed)
+                else:
+                    await log_channel.send(embed=log_embed)
+            except discord.HTTPException:
+                pass
+
+        # DM
+        dm_enabled = await self.config.guild(guild).ticket_dm_on_close()
+        if dm_enabled and creator_user:
+            try:
+                dm_embed = discord.Embed(
+                    title="🎫 Dein Ticket wurde geschlossen",
+                    description=(
+                        f"Dein Ticket auf **{guild.name}** wurde geschlossen.\n\n"
+                        f"**Geschlossen von:** {ctx.author.display_name}\n"
+                        f"**Grund:** {reason[:500]}"
+                    ),
+                    color=discord.Color.red(),
+                    timestamp=_now(),
+                )
+                if transcript_text:
+                    try:
+                        import io
+                        ticket_num = await self._ticket_get_counter(channel) or "?"
+                        filename = f"transcript-ticket-{ticket_num}.txt"
+                        file_obj = discord.File(io.StringIO(transcript_text), filename=filename)
+                        await creator_user.send(embed=dm_embed, file=file_obj)
+                    except (discord.Forbidden, discord.HTTPException):
+                        await creator_user.send(embed=dm_embed)
+                else:
+                    await creator_user.send(embed=dm_embed)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        # Active-Tracking
+        if creator_id is not None:
+            await self._ticket_remove_active(guild, creator_id, channel.id)
+
+        # Schließen-Nachricht
+        try:
+            await ctx.send(f"🎫 Ticket wird in 3 Sekunden geschlossen... Grund: {reason[:200]}")
+        except discord.HTTPException:
+            pass
+        await asyncio.sleep(3)
+        try:
+            await channel.delete(reason=f"Ticket geschlossen von {ctx.author.display_name}: {reason[:100]}")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            try:
+                await ctx.send(f"❌ Konnte Channel nicht löschen: `{e}`")
+            except discord.HTTPException:
+                pass
+
+    # Auto-Close Loop für inaktive Tickets
+    async def _ticket_auto_close_loop(self):
+        """Background task: schließt inaktive Tickets automatisch."""
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        await self._ticket_auto_close_sweep(guild)
+                    except Exception:
+                        log.exception("Auto-Close Loop Fehler in Guild %s", getattr(guild, "id", "?"))
+            except Exception:
+                log.exception("Schwerer Fehler im Ticket-Auto-Close-Loop")
+            await asyncio.sleep(1800)  # Alle 30 Minuten
+
+    async def _ticket_auto_close_sweep(self, guild: discord.Guild):
+        """Führt den Auto-Close-Sweep für eine Guild aus."""
+        hours = await self.config.guild(guild).ticket_auto_close_hours() or 0
+        if hours <= 0:
+            return
+        active = await self.config.guild(guild).ticket_active() or {}
+        if not active:
+            return
+        cutoff_ts = _now_ts() - hours * 3600
+        # Kopie zum Iterieren, da wir active verändern
+        for user_id_str, channel_ids in list(active.items()):
+            for channel_id in list(channel_ids):
+                channel = guild.get_channel(channel_id)
+                if channel is None:
+                    # Channel existiert nicht mehr → cleanup
+                    try:
+                        channel_ids.remove(channel_id)
+                        await self.config.guild(guild).ticket_active.set(active)
+                    except Exception:
+                        pass
+                    continue
+                # Erstellungszeit aus Topic extrahieren
+                created_ts = None
+                if channel.topic:
+                    m = re.search(r"Created: (\d+)", channel.topic)
+                    if m:
+                        try:
+                            created_ts = int(m.group(1))
+                        except ValueError:
+                            pass
+                if created_ts is None:
+                    continue  # Keine Created-Zeit im Topic → überspringen
+                if created_ts >= cutoff_ts:
+                    continue  # Ticket ist jünger als cutoff
+                # Letzte Nachricht prüfen (nur schließen wenn auch letzte Nachricht alt ist)
+                last_msg_ts = None
+                try:
+                    async for msg in channel.history(limit=1):
+                        if msg.created_at:
+                            last_msg_ts = msg.created_at.replace(tzinfo=timezone.utc).timestamp() if msg.created_at.tzinfo is None else msg.created_at.timestamp()
+                        break
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                if last_msg_ts is not None and last_msg_ts >= cutoff_ts:
+                    continue  # Letzte Nachricht ist neuer als cutoff
+                # Auto-Close durchführen
+                try:
+                    embed = discord.Embed(
+                        title="⏰ Auto-Close",
+                        description=f"Dieses Ticket wurde automatisch geschlossen (Inaktivität > {hours}h).",
+                        color=discord.Color.orange(),
+                        timestamp=_now(),
+                    )
+                    try:
+                        await channel.send(embed=embed)
+                    except discord.HTTPException:
+                        pass
+                    await asyncio.sleep(2)
+                    try:
+                        await channel.delete(reason=f"Auto-Close: Inaktivität > {hours}h")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    # Cleanup
+                    try:
+                        user_id_int = int(user_id_str)
+                        await self._ticket_remove_active(guild, user_id_int, channel_id)
+                    except (ValueError, Exception):
+                        pass
+                except Exception:
+                    log.exception("Auto-Close fehlgeschlagen für Channel %s", channel_id)
 
     # ============================================
     # SUPPORT BLOCKLIST
@@ -6099,8 +7030,43 @@ class SupportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
-        """Erkennt Kicks (via Audit Log) und synchronisiert."""
+        """Erkennt Kicks (via Audit Log) und synchronisiert + schließt offene Tickets des Users."""
         await self._antinuke_track(member.guild, "kick")
+        # Ticket-Auto-Close wenn User die Guild verlässt
+        try:
+            active = await self.config.guild(member.guild).ticket_active() or {}
+            user_tickets = active.get(str(member.id), [])
+            for channel_id in list(user_tickets):
+                channel = member.guild.get_channel(channel_id)
+                if channel is None:
+                    continue
+                try:
+                    # Auto-Close mit Begründung
+                    embed = discord.Embed(
+                        title="⏰ Auto-Close (User verlassen)",
+                        description=f"Dieses Ticket wurde automatisch geschlossen da {member.mention} den Server verlassen hat.",
+                        color=discord.Color.orange(),
+                        timestamp=_now(),
+                    )
+                    try:
+                        await channel.send(embed=embed)
+                    except discord.HTTPException:
+                        pass
+                    await asyncio.sleep(2)
+                    try:
+                        await channel.delete(reason=f"Auto-Close: User {member} hat die Guild verlassen")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    # Cleanup
+                    try:
+                        await self._ticket_remove_active(member.guild, member.id, channel_id)
+                    except Exception:
+                        pass
+                except Exception:
+                    log.exception("Auto-Close bei Member-Remove fehlgeschlagen")
+        except Exception:
+            log.exception("Ticket-Auto-Close bei on_member_remove fehlgeschlagen")
+        # Sync-Teil
         if not await self._sync_should_propagate_from(member.guild):
             return
         if not await self.config.guild(member.guild).sync_kicks():
@@ -8237,6 +9203,9 @@ class TicketPanelView(discord.ui.View):
     def __init__(self, cog: SupportCog):
         super().__init__(timeout=None)
         self.cog = cog
+        # Button-Text und Emoji aus Config holen wäre hier synchron nicht möglich,
+        # deshalb nutzen wir die Default-Werte. Über `[p]ticketset createpanel` wird
+        # die View neu erzeugt und das Panel aktualisiert.
 
     @discord.ui.button(
         label="Ticket erstellen",
@@ -8249,7 +9218,15 @@ class TicketPanelView(discord.ui.View):
         if not isinstance(member, discord.Member):
             await interaction.response.send_message("❌ Nur Server-Mitglieder können Tickets erstellen.", ephemeral=True)
             return
-        # Blocklist-Check (selbe Liste wie Support)
+        # Ticket-Blacklist prüfen
+        blacklist = await self.cog.config.guild(interaction.guild).ticket_blacklist() or []
+        if member.id in blacklist:
+            await interaction.response.send_message(
+                "❌ Du bist aktuell vom Ticket-System ausgeschlossen und kannst keine Tickets erstellen.",
+                ephemeral=True,
+            )
+            return
+        # Support-Blocklist auch prüfen (rückwärtskompatibel)
         blocklist = await self.cog.config.guild(interaction.guild).support_blocklist() or {}
         if str(member.id) in blocklist:
             await interaction.response.send_message(
@@ -8257,16 +9234,24 @@ class TicketPanelView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        modal = TicketModal(self.cog)
-        await interaction.response.send_modal(modal)
+        modal_enabled = await self.cog.config.guild(interaction.guild).ticket_modal_enabled()
+        if modal_enabled:
+            modal = TicketModal(self.cog)
+            await interaction.response.send_modal(modal)
+        else:
+            # Direkt Ticket erstellen ohne Modal
+            await self.cog._create_ticket(interaction, "Kein Betreff angegeben (Modal deaktiviert)", member)
 
 
 class TicketModal(discord.ui.Modal):
-    """Modal zur Eingabe des Ticket-Betreffs."""
+    """Modal zur Eingabe des Ticket-Betreffs (dynamisch aus Config)."""
 
     def __init__(self, cog: SupportCog):
+        # Title kann nicht async geladen werden → wir nutzen Default
+        # Die Question/Placeholder werden dynamisch in on_submit behandelt
         super().__init__(title="🎫 Ticket erstellen", timeout=600)
         self.cog = cog
+        # Default-Werte (werden bei Bedarf überschrieben)
         self.subject_input = discord.ui.TextInput(
             label="Worum geht es?",
             placeholder="Kurze Beschreibung deines Anliegens...",
@@ -8308,12 +9293,13 @@ class TicketModal(discord.ui.Modal):
         log.exception("Fehler im TicketModal", exc_info=error)
 
 
-class TicketCloseView(discord.ui.View):
-    """Persistente View mit 'Ticket schließen'-Button, die in jedem Ticket-Channel gesendet wird."""
+class TicketControlView(discord.ui.View):
+    """Persistente View im Ticket-Channel mit Close/Claim-Buttons."""
 
-    def __init__(self, cog: SupportCog):
+    def __init__(self, cog: SupportCog, claim_enabled: bool = True):
         super().__init__(timeout=None)
         self.cog = cog
+        self.claim_enabled = claim_enabled
 
     @discord.ui.button(
         label="Ticket schließen",
@@ -8325,7 +9311,369 @@ class TicketCloseView(discord.ui.View):
         if interaction.channel is None:
             await interaction.response.send_message("❌ Dieser Button kann nur in einem Channel verwendet werden.", ephemeral=True)
             return
-        await self.cog._close_ticket(interaction, interaction.channel)
+        # Close-Reason Modal öffnen
+        modal = TicketCloseReasonModal(self.cog, interaction.channel)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Übernehmen",
+        style=discord.ButtonStyle.success,
+        emoji="✋",
+        custom_id="ticket_claim",
+    )
+    async def claim_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.claim_enabled:
+            await interaction.response.send_message("❌ Claim-System ist deaktiviert.", ephemeral=True)
+            return
+        if interaction.channel is None:
+            await interaction.response.send_message("❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        support_role = await self.cog.get_ticket_support_role(interaction.guild)
+        is_support = support_role and interaction.user.get_role(support_role.id) is not None
+        is_admin = interaction.user.guild_permissions.manage_channels
+        if not (is_support or is_admin):
+            await interaction.response.send_message("❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
+            return
+        # Channel-Topic aktualisieren
+        channel = interaction.channel
+        topic = channel.topic or ""
+        import re as _re
+        topic_clean = _re.sub(r" • Claimed by: \d+", "", topic)
+        new_topic = f"{topic_clean} • Claimed by: {interaction.user.id}"
+        try:
+            await channel.edit(topic=new_topic, reason=f"Ticket claimed by {interaction.user.display_name}")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.response.send_message(f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="✅ Ticket übernommen",
+            description=f"{interaction.user.mention} hat dieses Ticket übernommen und ist nun zuständig.",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+
+class TicketCloseReasonModal(discord.ui.Modal):
+    """Modal zur Eingabe eines Schließ-Grundes."""
+
+    def __init__(self, cog: SupportCog, channel: discord.TextChannel):
+        super().__init__(title="🎫 Ticket schließen", timeout=300)
+        self.cog = cog
+        self.channel = channel
+        self.reason_input = discord.ui.TextInput(
+            label="Grund für Schließung",
+            placeholder="Warum wird dieses Ticket geschlossen?",
+            required=False,
+            max_length=500,
+            style=discord.TextStyle.paragraph,
+            custom_id="close_reason",
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = self.reason_input.value.strip() if self.reason_input.value else "Kein Grund angegeben"
+        await self.cog._close_ticket(interaction, self.channel, reason=reason)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im TicketCloseReasonModal", exc_info=error)
+
+
+class TicketCloseView(discord.ui.View):
+    """Legacy persistente View mit 'Ticket schließen'-Button (für Abwärtskompatibilität)."""
+
+    def __init__(self, cog: SupportCog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="Ticket schließen",
+        style=discord.ButtonStyle.danger,
+        emoji="🔒",
+        custom_id="ticket_close_legacy",
+    )
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.channel is None:
+            await interaction.response.send_message("❌ Dieser Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+            return
+        # Close-Reason Modal öffnen
+        modal = TicketCloseReasonModal(self.cog, interaction.channel)
+        await interaction.response.send_modal(modal)
+
+
+class TicketSetupWizardView(discord.ui.View):
+    """Interaktiver Setup-Wizard für das Ticket-System."""
+
+    def __init__(self, cog, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="🎫 Ticket-System Setup Wizard",
+            description=(
+                "Willkommen beim Einrichtungsassistenten!\n\n"
+                "**Schnellstart:**\n"
+                "🚀 `QuickStart` — Erstellt alles automatisch (Rolle, Kategorie, Channel, Panel)\n\n"
+                "**Manuell konfigurieren:**\n"
+                "⚙️ `Toggle` — Aktiviert/deaktiviert das System\n"
+                "📋 `Config` — Zeigt die aktuelle Konfiguration\n"
+                "🎨 `CreatePanel` — Erstellt das Panel in dem Channel in dem du diesen Befehl ausgeführt hast\n"
+                "❌ `Abbrechen` — Bricht den Wizard ab"
+            ),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Ticket Setup Wizard • Klicke eine Option")
+        return embed
+
+    @discord.ui.button(label="QuickStart", style=discord.ButtonStyle.success, emoji="🚀", custom_id="ticket_wiz_quickstart")
+    async def quickstart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+            return
+        # QuickStart Logik (ähnlich wie ticketset_quickstart, aber via Button)
+        guild = self.guild
+        g = self.cog.config.guild(guild)
+        try:
+            # 1. Support-Rolle erstellen falls nicht vorhanden
+            support_role_id = await g.ticket_support_role()
+            support_role = guild.get_role(support_role_id) if support_role_id else None
+            if not support_role:
+                try:
+                    support_role = await guild.create_role(
+                        name="🎫 Ticket Support",
+                        reason="Auto-created by ticket setup wizard",
+                    )
+                    await g.ticket_support_role.set(support_role.id)
+                except discord.Forbidden:
+                    await interaction.response.send_message("❌ Brauche `Manage Roles` um Support-Rolle zu erstellen.", ephemeral=True)
+                    return
+
+            # 2. Kategorie erstellen
+            cat_id = await g.ticket_category()
+            category = guild.get_channel(cat_id) if cat_id else None
+            if not category or not isinstance(category, discord.CategoryChannel):
+                try:
+                    category = await guild.create_category(
+                        name="🎫 Tickets",
+                        reason="Auto-created by ticket setup wizard",
+                        overwrites={
+                            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                            guild.me: discord.PermissionOverwrite(
+                                view_channel=True, send_messages=True,
+                                read_message_history=True, manage_channels=True,
+                            ),
+                            support_role: discord.PermissionOverwrite(
+                                view_channel=True, send_messages=True,
+                                read_message_history=True, attach_files=True,
+                            ),
+                        },
+                    )
+                    await g.ticket_category.set(category.id)
+                except discord.Forbidden:
+                    await interaction.response.send_message("❌ Brauche `Manage Channels` um Kategorie zu erstellen.", ephemeral=True)
+                    return
+
+            # 3. Panel-Channel = aktueller Channel
+            if isinstance(interaction.channel, discord.TextChannel):
+                panel_ch = interaction.channel
+                await g.ticket_panel_channel.set(panel_ch.id)
+            else:
+                try:
+                    panel_ch = await guild.create_text_channel(name="ticket-panel", reason="Auto-created")
+                    await g.ticket_panel_channel.set(panel_ch.id)
+                except (discord.Forbidden, discord.HTTPException):
+                    await interaction.response.send_message("❌ Konnte Panel-Channel nicht erstellen.", ephemeral=True)
+                    return
+
+            # 4. Log-Channel erstellen
+            log_ch_id = await g.ticket_log_channel()
+            log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
+            log_ch_label = "❌"
+            if not log_ch:
+                try:
+                    log_ch = await guild.create_text_channel(
+                        name="ticket-logs",
+                        category=category,
+                        reason="Auto-created",
+                        overwrites={
+                            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                            support_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+                            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                        },
+                    )
+                    await g.ticket_log_channel.set(log_ch.id)
+                    log_ch_label = log_ch.mention
+                except (discord.Forbidden, discord.HTTPException):
+                    log_ch_label = "❌ (fehlgeschlagen)"
+            else:
+                log_ch_label = log_ch.mention
+
+            # 5. Defaults
+            await g.ticket_modal_enabled.set(True)
+            await g.ticket_dm_on_close.set(False)
+            await g.ticket_transcript.set(True)
+            await g.ticket_user_can_close.set(True)
+            await g.ticket_claim_enabled.set(True)
+            await g.ticket_max_open.set(1)
+
+            # 6. Panel erstellen
+            embed = discord.Embed(
+                title="🎫 Ticket erstellen",
+                description=(
+                    "Brauchst du Hilfe oder möchtest etwas anfragen?\n\n"
+                    "Klicke auf den Button unten und beschreibe dein Anliegen — "
+                    "ein privater Ticket-Channel wird für dich erstellt."
+                ),
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            embed.set_footer(text="Ticket-System • Klicke auf den Button")
+            view = TicketPanelView(self.cog)
+            try:
+                message = await panel_ch.send(embed=embed, view=view)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await interaction.response.send_message(f"❌ Konnte Panel nicht senden: `{e}`", ephemeral=True)
+                return
+            old_id = await g.ticket_panel_message_id()
+            if old_id:
+                try:
+                    old_msg = await panel_ch.fetch_message(old_id)
+                    await old_msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+            await g.ticket_panel_message_id.set(message.id)
+
+            # 7. Zusammenfassung
+            result_embed = discord.Embed(
+                title="✅ Ticket-System eingerichtet!",
+                description=(
+                    f"**Support-Rolle:** {support_role.mention}\n"
+                    f"**Kategorie:** {category.name}\n"
+                    f"**Panel-Channel:** {panel_ch.mention}\n"
+                    f"**Log-Channel:** {log_ch_label}\n"
+                    f"**Panel-Nachricht:** [Klick]({message.jump_url})\n\n"
+                    f"**Aktivierte Features:**\n"
+                    f"• ✅ Modal (User muss Anliegen beschreiben)\n"
+                    f"• ✅ Transcript bei Schließen\n"
+                    f"• ✅ User darf eigenes Ticket schließen\n"
+                    f"• ✅ Claim-System\n"
+                    f"• ✅ Max. 1 offenes Ticket pro User\n\n"
+                    f"💡 Mit `[p]ticketset show` kannst du alles weitere anpassen."
+                ),
+                color=discord.Color.green(),
+                timestamp=_now(),
+            )
+            await interaction.response.edit_message(embed=result_embed, view=None)
+        except Exception as e:
+            try:
+                await interaction.response.send_message(f"❌ Fehler beim Setup: `{type(e).__name__}: {e}`", ephemeral=True)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Config anzeigen", style=discord.ButtonStyle.secondary, emoji="📋", custom_id="ticket_wiz_config")
+    async def show_config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        g = self.cog.config.guild(self.guild)
+        embed = discord.Embed(title="🎫 Ticket-System Konfiguration", color=discord.Color.blurple(), timestamp=_now())
+        cat_id = await g.ticket_category()
+        cat = self.guild.get_channel(cat_id) if cat_id else None
+        panel_ch_id = await g.ticket_panel_channel()
+        panel_ch = self.guild.get_channel(panel_ch_id) if panel_ch_id else None
+        role_id = await g.ticket_support_role()
+        role = self.guild.get_role(role_id) if role_id else None
+        log_ch_id = await g.ticket_log_channel()
+        log_ch = self.guild.get_channel(log_ch_id) if log_ch_id else None
+        embed.add_field(name="Kategorie", value=cat.name if cat else "❌", inline=True)
+        embed.add_field(name="Panel-Channel", value=panel_ch.mention if panel_ch else "❌", inline=True)
+        embed.add_field(name="Support-Rolle", value=role.mention if role else "❌", inline=True)
+        embed.add_field(name="Log-Channel", value=log_ch.mention if log_ch else "❌", inline=True)
+        embed.add_field(name="Modal", value="✅" if await g.ticket_modal_enabled() else "❌", inline=True)
+        embed.add_field(name="DM bei Close", value="✅" if await g.ticket_dm_on_close() else "❌", inline=True)
+        embed.add_field(name="Transcript", value="✅" if await g.ticket_transcript() else "❌", inline=True)
+        embed.add_field(name="Claim-System", value="✅" if await g.ticket_claim_enabled() else "❌", inline=True)
+        embed.add_field(name="User-Close", value="✅" if await g.ticket_user_can_close() else "❌", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="CreatePanel", style=discord.ButtonStyle.primary, emoji="🎨", custom_id="ticket_wiz_createpanel")
+    async def create_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+            return
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Muss in einem Text-Channel ausgeführt werden.", ephemeral=True)
+            return
+        g = self.cog.config.guild(self.guild)
+        await g.ticket_panel_channel.set(interaction.channel.id)
+        # Prüfen dass alles konfiguriert ist
+        category = await self.cog.get_ticket_category(self.guild)
+        support_role = await self.cog.get_ticket_support_role(self.guild)
+        if not category:
+            await interaction.response.send_message("❌ Keine Kategorie gesetzt. Nutze `[p]ticketset category` zuerst.", ephemeral=True)
+            return
+        if not support_role:
+            await interaction.response.send_message("❌ Keine Support-Rolle gesetzt. Nutze `[p]ticketset supportrole` zuerst.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="🎫 Ticket erstellen",
+            description=(
+                "Brauchst du Hilfe oder möchtest etwas anfragen?\n\n"
+                "Klicke auf den Button unten und beschreibe dein Anliegen — "
+                "ein privater Ticket-Channel wird für dich erstellt."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Ticket-System • Klicke auf den Button")
+        view = TicketPanelView(self.cog)
+        try:
+            message = await interaction.channel.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.response.send_message(f"❌ Konnte Panel nicht posten: `{e}`", ephemeral=True)
+            return
+        old_id = await g.ticket_panel_message_id()
+        if old_id:
+            try:
+                old_msg = await interaction.channel.fetch_message(old_id)
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        await g.ticket_panel_message_id.set(message.id)
+        await interaction.response.send_message(f"✅ Panel erstellt: {message.jump_url}", ephemeral=True)
+
+    @discord.ui.button(label="Abbrechen", style=discord.ButtonStyle.danger, emoji="✖️", custom_id="ticket_wiz_cancel")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message("❌ Dieser Button ist für eine andere Guild.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="❌ Setup abgebrochen",
+                description="Ticket-System wurde nicht verändert.",
+                color=discord.Color.red(),
+            ),
+            view=None,
+        )
 
 
 class SyncSetupWizardView(discord.ui.View):
