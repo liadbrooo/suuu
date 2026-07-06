@@ -15109,43 +15109,31 @@ class EmbedBuilderMainModal(discord.ui.Modal):
         self.send_channel = send_channel
         self.force_send = force_send
 
-        def sd(val):
-            return val if val else None
+        # Helper: only include default if it has a value
+        def make_textinput(label, placeholder, custom_id, max_len=256, style=None, existing_key=None):
+            kwargs = {
+                "label": label,
+                "placeholder": placeholder,
+                "required": False,
+                "max_length": max_len,
+                "custom_id": custom_id,
+            }
+            if style:
+                kwargs["style"] = style
+            val = self.existing_data.get(existing_key) if existing_key else None
+            if val:
+                kwargs["default"] = val
+            return discord.ui.TextInput(**kwargs)
 
-        self.title_input = discord.ui.TextInput(
-            label="Titel", placeholder="Titel des Embeds...",
-            required=False, max_length=256,
-            default=sd(self.existing_data.get("title")), custom_id="eb_title",
-        )
+        self.title_input = make_textinput("Titel", "Titel des Embeds...", "eb_title", 256, existing_key="title")
         self.add_item(self.title_input)
-        self.description_input = discord.ui.TextInput(
-            label="Beschreibung (Haupttext)",
-            placeholder="Haupttext des Embeds...",
-            required=False, max_length=1500,
-            style=discord.TextStyle.paragraph,
-            default=sd(self.existing_data.get("description")), custom_id="eb_desc",
-        )
+        self.description_input = make_textinput("Beschreibung", "Haupttext...", "eb_desc", 1500, discord.TextStyle.paragraph, "description")
         self.add_item(self.description_input)
-        self.color_input = discord.ui.TextInput(
-            label="Farbe (Name oder #Hex)",
-            placeholder="blurple, red, #ff0000, ...",
-            required=False, max_length=20,
-            default=sd(self.existing_data.get("color")), custom_id="eb_color",
-        )
+        self.color_input = make_textinput("Farbe (Name oder #Hex)", "blurple, red, #ff0000", "eb_color", 20, existing_key="color")
         self.add_item(self.color_input)
-        self.footer_input = discord.ui.TextInput(
-            label="Footer-Text (optional)",
-            placeholder="Text unten im Embed...",
-            required=False, max_length=500,
-            default=sd(self.existing_data.get("footer")), custom_id="eb_footer",
-        )
+        self.footer_input = make_textinput("Footer-Text", "Text unten...", "eb_footer", 500, existing_key="footer")
         self.add_item(self.footer_input)
-        self.author_input = discord.ui.TextInput(
-            label="Author-Name (optional, oben im Embed)",
-            placeholder="z.B. Server-Team",
-            required=False, max_length=256,
-            default=sd(self.existing_data.get("author_name")), custom_id="eb_author",
-        )
+        self.author_input = make_textinput("Author-Name", "z.B. Server-Team", "eb_author", 256, existing_key="author_name")
         self.add_item(self.author_input)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -15190,50 +15178,29 @@ class EmbedBuilderImagesModal(discord.ui.Modal):
         self.send_channel = send_channel
         self.force_send = force_send
 
-        self.image_input = discord.ui.TextInput(
-            label="Bild URL (gross, unten im Embed)",
-            placeholder="https://example.com/image.png",
-            required=False, max_length=500,
-            default=data.get("image") if data.get("image") else None,
-            custom_id="eb_image",
-        )
+        def mk(label, placeholder, cid, max_len=500, style=None, key=None):
+            kwargs = {"label": label, "placeholder": placeholder, "required": False, "max_length": max_len, "custom_id": cid}
+            if style:
+                kwargs["style"] = style
+            val = data.get(key) if key else None
+            if val:
+                kwargs["default"] = val
+            return discord.ui.TextInput(**kwargs)
+
+        self.image_input = mk("Bild URL (gross unten)", "https://...", "eb_image", key="image")
         self.add_item(self.image_input)
-        self.thumbnail_input = discord.ui.TextInput(
-            label="Thumbnail URL (klein, oben rechts)",
-            placeholder="https://example.com/thumb.png",
-            required=False, max_length=500,
-            default=data.get("thumbnail") if data.get("thumbnail") else None,
-            custom_id="eb_thumb",
-        )
+        self.thumbnail_input = mk("Thumbnail URL (klein oben)", "https://...", "eb_thumb", key="thumbnail")
         self.add_item(self.thumbnail_input)
-        self.footer_icon_input = discord.ui.TextInput(
-            label="Footer-Icon URL (klein neben Footer)",
-            placeholder="https://example.com/icon.png",
-            required=False, max_length=500,
-            default=data.get("footer_icon") if data.get("footer_icon") else None,
-            custom_id="eb_ficon",
-        )
+        self.footer_icon_input = mk("Footer-Icon URL", "https://...", "eb_ficon", key="footer_icon")
         self.add_item(self.footer_icon_input)
-        self.author_icon_input = discord.ui.TextInput(
-            label="Author-Icon URL (Avatar neben Author)",
-            placeholder="https://example.com/avatar.png",
-            required=False, max_length=500,
-            default=data.get("author_icon") if data.get("author_icon") else None,
-            custom_id="eb_aicon",
-        )
+        self.author_icon_input = mk("Author-Icon URL", "https://...", "eb_aicon", key="author_icon")
         self.add_item(self.author_icon_input)
-        field1_default = None
         f1n = data.get("field1_name", "")
         f1v = data.get("field1_value", "")
+        f1_kwargs = {"label": "Field 1 (Name|Wert mit |)", "placeholder": "Regel 1|Kein Spam", "required": False, "max_length": 1200, "style": discord.TextStyle.paragraph, "custom_id": "eb_f1"}
         if f1n or f1v:
-            field1_default = f"{f1n}|{f1v}"
-        self.field1_input = discord.ui.TextInput(
-            label="Field 1 (Name|Wert mit | trennen)",
-            placeholder="z.B. Regel 1|Kein Spam",
-            required=False, max_length=1200,
-            style=discord.TextStyle.paragraph,
-            default=field1_default, custom_id="eb_f1",
-        )
+            f1_kwargs["default"] = f"{f1n}|{f1v}"
+        self.field1_input = discord.ui.TextInput(**f1_kwargs)
         self.add_item(self.field1_input)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -15282,31 +15249,17 @@ class EmbedBuilderFieldsModal(discord.ui.Modal):
         self.send_channel = send_channel
         self.force_send = force_send
 
-        field2_default = None
-        f2n = data.get("field2_name", "")
-        f2v = data.get("field2_value", "")
-        if f2n or f2v:
-            field2_default = f"{f2n}|{f2v}"
-        self.field2_input = discord.ui.TextInput(
-            label="Field 2 (Name|Wert mit | trennen)",
-            placeholder="z.B. Regel 2|Sei freundlich",
-            required=False, max_length=1200,
-            style=discord.TextStyle.paragraph,
-            default=field2_default, custom_id="eb_f2",
-        )
+        def mk_field(label, placeholder, cid, key_n, key_v):
+            kwargs = {"label": label, "placeholder": placeholder, "required": False, "max_length": 1200, "style": discord.TextStyle.paragraph, "custom_id": cid}
+            n = data.get(key_n, "")
+            v = data.get(key_v, "")
+            if n or v:
+                kwargs["default"] = f"{n}|{v}"
+            return discord.ui.TextInput(**kwargs)
+
+        self.field2_input = mk_field("Field 2 (Name|Wert mit |)", "Regel 2|Sei freundlich", "eb_f2", "field2_name", "field2_value")
         self.add_item(self.field2_input)
-        field3_default = None
-        f3n = data.get("field3_name", "")
-        f3v = data.get("field3_value", "")
-        if f3n or f3v:
-            field3_default = f"{f3n}|{f3v}"
-        self.field3_input = discord.ui.TextInput(
-            label="Field 3 (Name|Wert mit | trennen)",
-            placeholder="z.B. Regel 3|Kein Werbung",
-            required=False, max_length=1200,
-            style=discord.TextStyle.paragraph,
-            default=field3_default, custom_id="eb_f3",
-        )
+        self.field3_input = mk_field("Field 3 (Name|Wert mit |)", "Regel 3|Kein Werbung", "eb_f3", "field3_name", "field3_value")
         self.add_item(self.field3_input)
 
     async def on_submit(self, interaction: discord.Interaction):
