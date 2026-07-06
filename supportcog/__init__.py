@@ -7572,8 +7572,8 @@ class SupportCog(commands.Cog):
         counter = await self.config.guild(guild).ticket_counter() or 0
         counter += 1
         await self.config.guild(guild).ticket_counter.set(counter)
-        # Ticket-Name: <kategorie>-<username> (sanitized)
-        username_clean = re.sub(r"[^a-zA-Z0-9_]", "", requester.display_name.lower())[:20] or str(requester.id)[-6:]
+        # Ticket-Name: <kategorie>-<discord-username> (sanitized)
+        username_clean = re.sub(r"[^a-zA-Z0-9_]", "", requester.name.lower())[:20] or str(requester.id)[-6:]
         ticket_name = f"{cat_key}-{username_clean}"
 
         # Berechtigungen
@@ -8099,7 +8099,7 @@ class SupportCog(commands.Cog):
         counter = await self.config.guild(guild).ticket_counter() or 0
         counter += 1
         await self.config.guild(guild).ticket_counter.set(counter)
-        username_clean = re.sub(r"[^a-zA-Z0-9_]", "", requester.display_name.lower())[:20] or str(requester.id)[-6:]
+        username_clean = re.sub(r"[^a-zA-Z0-9_]", "", requester.name.lower())[:20] or str(requester.id)[-6:]
         ticket_name = f"ticket-{username_clean}"
 
         # Berechtigungen
@@ -13198,11 +13198,13 @@ class TicketControlView(discord.ui.View):
     )
     async def claim_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
+            # IMMEDIATELY defer the interaction to prevent 3-second timeout
+            await interaction.response.defer(ephemeral=True)
             if not self.claim_enabled:
-                await self._safe_respond(interaction, "❌ Claim-System ist deaktiviert.", ephemeral=True)
+                await interaction.followup.send("❌ Claim-System ist deaktiviert.", ephemeral=True)
                 return
             if interaction.channel is None or interaction.guild is None:
-                await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+                await interaction.followup.send("❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
                 return
             # Member sicherstellen
             member = interaction.user
@@ -13212,19 +13214,24 @@ class TicketControlView(discord.ui.View):
                 except Exception:
                     member = None
                 if member is None:
-                    await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
+                    await interaction.followup.send("❌ Nur Server-Mitglieder.", ephemeral=True)
                     return
             # Berechtigungsprüfung
             is_staff = await self.cog._is_ticket_staff(member, interaction.channel, interaction.guild)
             if not is_staff:
-                await self._safe_respond(interaction, "❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
+                await interaction.followup.send("❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
                 return
-            # Prüfen ob schon geclaimt (über Config, nicht Topic!)
+            # Ticket-Ersteller darf NICHT übernehmen!
+            creator_id = await self.cog._ticket_get_creator(interaction.channel)
+            if creator_id is not None and member.id == creator_id:
+                await interaction.followup.send("❌ Du kannst dein eigenes Ticket nicht übernehmen. Bitte warte auf ein Teammitglied.", ephemeral=True)
+                return
+            # Prüfen ob schon geclaimt (über Config)
             existing_claim = await self.cog._ticket_get_claim(interaction.guild, interaction.channel.id)
             if existing_claim:
                 existing_claimer_id = existing_claim.get("claimer_id")
                 if existing_claimer_id == member.id:
-                    await self._safe_respond(interaction, "ℹ️ Du hast dieses Ticket bereits übernommen.", ephemeral=True)
+                    await interaction.followup.send("ℹ️ Du hast dieses Ticket bereits übernommen.", ephemeral=True)
                     return
                 # Anderer User hat es geclaimt — nur Admins können überschreiben
                 is_admin = member.guild_permissions.manage_channels or member.guild_permissions.administrator
@@ -13236,45 +13243,34 @@ class TicketControlView(discord.ui.View):
                         except Exception:
                             existing_claimer = None
                     existing_name = existing_claimer.display_name if existing_claimer else f"User {existing_claimer_id}"
-                    await self._safe_respond(
-                        interaction,
+                    await interaction.followup.send(
                         f"❌ Dieses Ticket ist bereits von **{existing_name}** übernommen.\n"
-                        f"Nur Admins können es überschreiben. Nutze `🔓 Freigeben` falls du der Claimer bist.",
+                        f"Nur Admins können es überschreiben.",
                         ephemeral=True,
                     )
                     return
-                # Admin überschreibt — Info senden
-                existing_claimer = interaction.guild.get_member(existing_claimer_id)
-                if existing_claimer is None:
-                    try:
-                        existing_claimer = await self.cog.bot.fetch_user(existing_claimer_id)
-                    except Exception:
-                        existing_claimer = None
-                existing_name = existing_claimer.display_name if existing_claimer else f"User {existing_claimer_id}"
-                await self._safe_respond(interaction, f"⚠️ Du überschreibst den Claim von **{existing_name}**.", ephemeral=True)
-            # Claim setzen (in Config UND Topic)
+            # Claim setzen
             await self.cog._ticket_set_claim(interaction.guild, interaction.channel.id, member)
+            # Öffentliche Nachricht
             embed = discord.Embed(
                 title="✅ Ticket übernommen",
                 description=f"{member.mention} hat dieses Ticket übernommen und ist nun zuständig.",
                 color=discord.Color.green(),
                 timestamp=_now(),
             )
-            # Öffentliche Nachricht (nicht ephemeral)
             try:
                 await interaction.channel.send(embed=embed)
             except discord.HTTPException:
                 pass
-            # Bestätigung an den User (ephemeral)
-            await self._safe_respond(interaction, "✅ Du hast das Ticket übernommen.", ephemeral=True)
+            # Bestätigung an User
+            await interaction.followup.send("✅ Du hast das Ticket übernommen.", ephemeral=True)
         except Exception as e:
             log.exception("Fehler in claim_ticket_btn")
             try:
-                error_msg = f"❌ Fehler beim Übernehmen: `{type(e).__name__}: {e}`"
                 if interaction.response.is_done():
-                    await interaction.followup.send(error_msg, ephemeral=True)
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
                 else:
-                    await interaction.response.send_message(error_msg, ephemeral=True)
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
             except Exception:
                 pass
 
@@ -13286,11 +13282,13 @@ class TicketControlView(discord.ui.View):
     )
     async def unclaim_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
+            # IMMEDIATELY defer to prevent 3-second timeout
+            await interaction.response.defer(ephemeral=True)
             if not self.claim_enabled:
-                await self._safe_respond(interaction, "❌ Claim-System ist deaktiviert.", ephemeral=True)
+                await interaction.followup.send("❌ Claim-System ist deaktiviert.", ephemeral=True)
                 return
             if interaction.channel is None or interaction.guild is None:
-                await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+                await interaction.followup.send("❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
                 return
             # Member sicherstellen
             member = interaction.user
@@ -13300,12 +13298,12 @@ class TicketControlView(discord.ui.View):
                 except Exception:
                     member = None
                 if member is None:
-                    await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
+                    await interaction.followup.send("❌ Nur Server-Mitglieder.", ephemeral=True)
                     return
             # Claim-Status aus Config holen
             existing_claim = await self.cog._ticket_get_claim(interaction.guild, interaction.channel.id)
             if not existing_claim:
-                await self._safe_respond(interaction, "ℹ️ Dieses Ticket ist aktuell nicht geclaimt.", ephemeral=True)
+                await interaction.followup.send("ℹ️ Dieses Ticket ist aktuell nicht geclaimt.", ephemeral=True)
                 return
             claimed_by_id = existing_claim.get("claimer_id")
             is_claimer = member.id == claimed_by_id
@@ -13319,13 +13317,12 @@ class TicketControlView(discord.ui.View):
                     except Exception:
                         claimer = None
                 claimer_name = claimer.display_name if claimer else f"User {claimed_by_id}"
-                await self._safe_respond(
-                    interaction,
-                    f"❌ Nur **{claimer_name}** (aktueller Claimer), Teammitglieder oder Admins können freigeben.",
+                await interaction.followup.send(
+                    f"❌ Nur **{claimer_name}**, Teammitglieder oder Admins können freigeben.",
                     ephemeral=True,
                 )
                 return
-            # Claim entfernen (aus Config UND Topic)
+            # Claim entfernen
             await self.cog._ticket_clear_claim(interaction.guild, interaction.channel.id)
             embed = discord.Embed(
                 title="🔓 Ticket freigegeben",
@@ -13333,21 +13330,18 @@ class TicketControlView(discord.ui.View):
                 color=discord.Color.orange(),
                 timestamp=_now(),
             )
-            # Öffentliche Nachricht
             try:
                 await interaction.channel.send(embed=embed)
             except discord.HTTPException:
                 pass
-            # Bestätigung an User
-            await self._safe_respond(interaction, "✅ Du hast das Ticket freigegeben.", ephemeral=True)
+            await interaction.followup.send("✅ Du hast das Ticket freigegeben.", ephemeral=True)
         except Exception as e:
             log.exception("Fehler in unclaim_ticket_btn")
             try:
-                error_msg = f"❌ Fehler beim Freigeben: `{type(e).__name__}: {e}`"
                 if interaction.response.is_done():
-                    await interaction.followup.send(error_msg, ephemeral=True)
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
                 else:
-                    await interaction.response.send_message(error_msg, ephemeral=True)
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
             except Exception:
                 pass
 
