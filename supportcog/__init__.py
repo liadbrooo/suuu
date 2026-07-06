@@ -5113,6 +5113,155 @@ class SupportCog(commands.Cog):
         await self.config.guild(ctx.guild).ticket_active.set(active)
         await ctx.send(f"✅ Cleanup fertig: {removed} verwaiste Einträge entfernt.")
 
+    @ticketset.command(name="refreshpanel", aliases=["refresh"])
+    async def ticketset_refreshpanel(self, ctx: commands.Context):
+        """Aktualisiert das bestehende Ticket-Panel (z.B. nach Kategorie-Änderungen)."""
+        panel_msg_id = await self.config.guild(ctx.guild).ticket_panel_message_id()
+        panel_ch_id = await self.config.guild(ctx.guild).ticket_panel_channel()
+        if not panel_msg_id or not panel_ch_id:
+            await ctx.send("❌ Kein Panel konfiguriert. Nutze `[p]ticketset createmulti` oder `[p]ticketset createpanel`.")
+            return
+        channel = ctx.guild.get_channel(panel_ch_id)
+        if not channel:
+            await ctx.send("❌ Panel-Channel existiert nicht mehr.")
+            return
+        multi_enabled = await self.config.guild(ctx.guild).ticket_panel_multi_enabled()
+        if multi_enabled:
+            # Multi-Panel aktualisieren
+            cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+            valid_cats = [(k, c) for k, c in cats.items() if c.get("category_id") and c.get("support_role_id")]
+            if not valid_cats:
+                await ctx.send("❌ Keine gültigen Kategorien für Multi-Panel.")
+                return
+            embed = discord.Embed(
+                title="🎫 Ticket erstellen",
+                description=(
+                    "Wähle unten aus, welche Art von Ticket du erstellen möchtest.\n\n"
+                    "**Verfügbare Kategorien:**\n"
+                    + "\n".join(f"{c.get('emoji', '🎫')} **{c.get('name', k)}** — {c.get('description', '')}" for k, c in valid_cats)
+                ),
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            embed.set_footer(text="Ticket-System • Wähle eine Kategorie")
+            view = TicketMultiPanelView(self, valid_cats)
+        else:
+            # Single-Panel aktualisieren
+            title = await self.config.guild(ctx.guild).ticket_panel_title()
+            description = await self.config.guild(ctx.guild).ticket_panel_description()
+            color_name = await self.config.guild(ctx.guild).ticket_panel_color()
+            color_map = {
+                "blurple": discord.Color.blurple(),
+                "red": discord.Color.red(),
+                "green": discord.Color.green(),
+                "grey": discord.Color.greyple(),
+                "orange": discord.Color.orange(),
+            }
+            color = color_map.get(color_name, discord.Color.blurple())
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                color=color,
+                timestamp=_now(),
+            )
+            embed.set_footer(text="Ticket-System • Klicke auf den Button")
+            view = TicketPanelView(self)
+        try:
+            message = await channel.fetch_message(panel_msg_id)
+            await message.edit(embed=embed, view=view)
+            await ctx.send("✅ Panel aktualisiert.")
+        except discord.NotFound:
+            await ctx.send("❌ Panel-Nachricht existiert nicht mehr. Erstelle neu mit `[p]ticketset createmulti` oder `[p]ticketset createpanel`.")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Panel nicht aktualisieren: `{e}`")
+
+    @ticketset.command(name="closeall")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def ticketset_closeall(self, ctx: commands.Context, *, reason: str = "Massenschließung durch Admin"):
+        """Schließt ALLE offenen Tickets auf diesem Server. Admin only!"""
+        active = await self.config.guild(ctx.guild).ticket_active() or {}
+        if not active:
+            await ctx.send("ℹ️ Keine offenen Tickets.")
+            return
+        total = sum(len(v) for v in active.values())
+        # Bestätigung
+        await ctx.send(
+            f"⚠️ **Achtung!** Hiermit werden **{total} offene Tickets** geschlossen.\n"
+            f"Grund: `{reason}`\n\n"
+            f"Schließe in 5 Sekunden ab... (Abbruch durch `[p]ticketset cancel`)"
+        )
+        # Wir warten 5 Sekunden — falls der Admin abbrechen will, kann er das über einen weiteren Befehl
+        # (für Einfachheit hier ohne Bestätigungs-View)
+        await asyncio.sleep(5)
+        closed = 0
+        failed = 0
+        for user_id_str, channel_ids in list(active.items()):
+            for cid in list(channel_ids):
+                channel = ctx.guild.get_channel(cid)
+                if channel is None:
+                    continue
+                try:
+                    # Auto-Close-Nachricht
+                    embed = discord.Embed(
+                        title="🎫 Massenschließung",
+                        description=f"Dieses Ticket wurde von einem Admin geschlossen.\n**Grund:** {reason[:500]}",
+                        color=discord.Color.red(),
+                        timestamp=_now(),
+                    )
+                    try:
+                        await channel.send(embed=embed)
+                    except discord.HTTPException:
+                        pass
+                    await asyncio.sleep(1)
+                    await channel.delete(reason=f"Massenschließung durch {ctx.author}: {reason[:100]}")
+                    closed += 1
+                except (discord.Forbidden, discord.HTTPException):
+                    failed += 1
+            # Cleanup
+            try:
+                user_id_int = int(user_id_str)
+                for cid in list(channel_ids):
+                    await self._ticket_remove_active(ctx.guild, user_id_int, cid)
+            except Exception:
+                pass
+        await ctx.send(f"✅ Massenschließung fertig: {closed} Tickets geschlossen, {failed} Fehler.")
+
+    @ticketset.command(name="reset")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def ticketset_reset(self, ctx: commands.Context, confirm: str = None):
+        """Setzt die gesamte Ticket-Konfiguration zurück. `confirm` muss 'YES' sein."""
+        if confirm != "YES":
+            await ctx.send(
+                "⚠️ Dies setzt die GESAMTE Ticket-Konfiguration zurück (Kategorien, Panel, Einstellungen).\n"
+                "Bestehende offene Tickets werden NICHT geschlossen.\n\n"
+                "Zur Bestätigung: `[p]ticketset reset YES`"
+            )
+            return
+        # Reset all ticket config
+        g = self.config.guild(ctx.guild)
+        await g.ticket_categories.set({})
+        await g.ticket_panel_message_id.set(None)
+        await g.ticket_panel_channel.set(None)
+        await g.ticket_panel_multi_enabled.set(False)
+        await g.ticket_panel_button_text.set("Ticket erstellen")
+        await g.ticket_panel_title.set("🎫 Ticket erstellen")
+        await g.ticket_panel_description.set("Brauchst du Hilfe? Klicke auf den Button unten um ein Ticket zu erstellen.")
+        await g.ticket_panel_color.set("blurple")
+        await g.ticket_panel_emoji.set("🎫")
+        await g.ticket_welcome_message.set("Willkommen zu deinem Ticket! Ein Teammitglied wird sich gleich um dich kümmern.")
+        await g.ticket_modal_enabled.set(True)
+        await g.ticket_modal_question.set("Worum geht es in deinem Ticket?")
+        await g.ticket_modal_placeholder.set("Kurze Beschreibung deines Anliegens...")
+        await g.ticket_dm_on_close.set(False)
+        await g.ticket_auto_close_hours.set(0)
+        await g.ticket_transcript.set(True)
+        await g.ticket_user_can_close.set(True)
+        await g.ticket_claim_enabled.set(True)
+        await g.ticket_blacklist.set([])
+        await g.ticket_max_open.set(1)
+        await g.ticket_active.set({})
+        await ctx.send("✅ Ticket-Konfiguration vollständig zurückgesetzt. Nutze `[p]ticketset quickstart` oder `[p]ticketset examples` für Neu-Einrichtung.")
+
     # ============================================
     # MULTI-KATEGORIE-CORE-LOGIK
     # ============================================
@@ -5999,29 +6148,54 @@ class SupportCog(commands.Cog):
             return False
         return "Ticket #" in (channel.topic or "")
 
-    async def _is_ticket_staff(self, member: discord.Member, channel, guild: discord.Guild) -> bool:
+    async def _is_ticket_staff(self, member, channel, guild: discord.Guild) -> bool:
         """Prüft ob ein Member Support-Staff für diesen Ticket-Channel ist.
         Berücksichtigt sowohl die globale Support-Rolle als auch die kategorie-spezifische Rolle."""
-        if member.guild_permissions.manage_channels:
-            return True
+        # Defensive: Falls member None ist oder keine guild_permissions hat
+        if member is None:
+            return False
+        # Admin-Rechte prüfen (verschiedene Varianten für Kompatibilität)
+        try:
+            if hasattr(member, "guild_permissions"):
+                if member.guild_permissions.manage_channels or member.guild_permissions.manage_guild or member.guild_permissions.administrator:
+                    return True
+        except Exception:
+            pass
+        # Falls member nur ein User ist (nicht Member), hat er keine Rollen
+        if not isinstance(member, discord.Member):
+            return False
         # Globale Support-Rolle prüfen
-        support_role = await self.get_ticket_support_role(guild)
-        if support_role and member.get_role(support_role.id) is not None:
-            return True
+        try:
+            support_role = await self.get_ticket_support_role(guild)
+            if support_role is not None:
+                try:
+                    if member.get_role(support_role.id) is not None:
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Kategorie-spezifische Rolle prüfen
-        if hasattr(channel, "topic") and channel.topic:
-            # Kategorie-Key aus Topic extrahieren
-            m = re.search(r"Category: (\w+)", channel.topic)
-            if m:
-                cat_key = m.group(1)
-                cats = await self.config.guild(guild).ticket_categories() or {}
-                cat = cats.get(cat_key)
-                if cat:
-                    role_id = cat.get("support_role_id")
-                    if role_id:
-                        role = guild.get_role(role_id)
-                        if role and member.get_role(role_id) is not None:
-                            return True
+        try:
+            if hasattr(channel, "topic") and channel.topic:
+                # Kategorie-Key aus Topic extrahieren
+                m = re.search(r"Category:\s*(\w+)", channel.topic)
+                if m:
+                    cat_key = m.group(1)
+                    cats = await self.config.guild(guild).ticket_categories() or {}
+                    cat = cats.get(cat_key)
+                    if cat:
+                        role_id = cat.get("support_role_id")
+                        if role_id:
+                            try:
+                                role = guild.get_role(role_id)
+                                if role is not None:
+                                    if member.get_role(role_id) is not None:
+                                        return True
+                            except Exception:
+                                pass
+        except Exception:
+            pass
         return False
 
     @commands.command(name="ticketadd", aliases=["tadd", "adduser"])
@@ -6109,7 +6283,7 @@ class SupportCog(commands.Cog):
     @commands.guild_only()
     async def ticket_close_cmd(self, ctx: commands.Context, *, reason: str = "Kein Grund angegeben"):
         """Schließt das aktuelle Ticket (Text-Befehl-Version)."""
-        if not ctx.channel.name.startswith("ticket-"):
+        if not ctx.channel.name.startswith("ticket-") and not self._is_ticket_channel(ctx.channel):
             await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
             return
         support_role = await self.get_ticket_support_role(ctx.guild)
@@ -6127,6 +6301,163 @@ class SupportCog(commands.Cog):
         # Wir rufen die gleiche Logik auf, aber mit einem Fake-Interaction-Objekt
         # Da _close_ticket interaction.response etc. braucht, bauen wir eine Wrapper-Klasse
         await self._close_ticket_via_command(ctx, reason)
+
+    @commands.command(name="ticketinfo", aliases=["tinfo", "ticketstatus"])
+    @commands.guild_only()
+    async def ticket_info_cmd(self, ctx: commands.Context):
+        """Zeigt Informationen zum aktuellen Ticket an."""
+        if not ctx.channel.name.startswith("ticket-") and not self._is_ticket_channel(ctx.channel):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        channel = ctx.channel
+        topic = channel.topic or ""
+        # Info extrahieren
+        ticket_num = "?"
+        m = re.search(r"Ticket #(\d+)", topic)
+        if m:
+            ticket_num = m.group(1)
+        creator_id = await self._ticket_get_creator(channel)
+        creator_mention = f"<@{creator_id}>" if creator_id else "Unbekannt"
+        # Kategorie
+        cat_label = "—"
+        m = re.search(r"Category:\s*(\w+)", topic)
+        if m:
+            cat_key = m.group(1)
+            cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+            cat = cats.get(cat_key)
+            if cat:
+                cat_label = f"{cat.get('emoji', '🎫')} {cat.get('name', cat_key)}"
+            else:
+                cat_label = cat_key
+        # Claimer
+        claimer_mention = "Nicht geclaimt"
+        m = re.search(r"Claimed by:\s*(\d+)", topic)
+        if m:
+            claimer_mention = f"<@{m.group(1)}>"
+        # Erstellungszeit
+        created_str = _fmt_berlin_full(channel.created_at) if channel.created_at else "?"
+        # Letzte Aktivität
+        last_activity = "Unbekannt"
+        try:
+            async for msg in channel.history(limit=1):
+                last_activity = _fmt_berlin_full(msg.created_at) if msg.created_at else "?"
+                break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Nachrichten-Anzahl
+        msg_count = "?"
+        try:
+            count = 0
+            async for _ in channel.history(limit=None):
+                count += 1
+            msg_count = str(count)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        embed = discord.Embed(
+            title=f"🎫 Ticket-Info — #{ticket_num}",
+            description=f"Channel: {channel.mention}",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="🎫 Ticket-ID", value=f"#{ticket_num}", inline=True)
+        embed.add_field(name="📂 Kategorie", value=cat_label, inline=True)
+        embed.add_field(name="👤 Erstellt von", value=creator_mention, inline=True)
+        embed.add_field(name="✋ Zuständig", value=claimer_mention, inline=True)
+        embed.add_field(name="📅 Erstellt am", value=created_str, inline=True)
+        embed.add_field(name="💬 Letzte Aktivität", value=last_activity, inline=True)
+        embed.add_field(name="📊 Nachrichten", value=msg_count, inline=True)
+        embed.set_footer(text=f"Ticket-Info • {ctx.guild.name} • Zeiten in Europe/Berlin")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="ticketnotify", aliases=["tnotify", "pingstaff"])
+    @commands.guild_only()
+    async def ticket_notify_cmd(self, ctx: commands.Context):
+        """Pingt die Support-Rolle manuell im aktuellen Ticket (für User wenn Team lange nicht antwortet)."""
+        if not ctx.channel.name.startswith("ticket-") and not self._is_ticket_channel(ctx.channel):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        creator_id = await self._ticket_get_creator(ctx.channel)
+        is_creator = creator_id == ctx.author.id
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_creator or is_staff):
+            await ctx.send("❌ Nur der Ticket-Ersteller oder Teammitglieder können das Team pingen.")
+            return
+        # Anti-Spam: 30 Sekunden Cooldown pro Channel
+        # Wir speichern den letzten Ping-Zeitstempel in einem Attribut am Cog
+        if not hasattr(self, "_ticket_notify_cooldowns"):
+            self._ticket_notify_cooldowns = {}
+        channel_id = ctx.channel.id
+        last_notify = self._ticket_notify_cooldowns.get(channel_id, 0)
+        now_ts = _now_ts()
+        if now_ts - last_notify < 30:
+            remaining = 30 - (now_ts - last_notify)
+            await ctx.send(f"⏳ Bitte warte noch {remaining} Sekunden bevor du das Team erneut pingst.")
+            return
+        self._ticket_notify_cooldowns[channel_id] = now_ts
+        # Support-Rolle ermitteln
+        # Zuerst Kategorie-spezifisch, dann global
+        support_role = None
+        topic = ctx.channel.topic or ""
+        m = re.search(r"Category:\s*(\w+)", topic)
+        if m:
+            cat_key = m.group(1)
+            cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+            cat = cats.get(cat_key)
+            if cat:
+                role_id = cat.get("support_role_id")
+                if role_id:
+                    support_role = ctx.guild.get_role(role_id)
+        if support_role is None:
+            support_role = await self.get_ticket_support_role(ctx.guild)
+        if support_role is None:
+            await ctx.send("❌ Keine Support-Rolle konfiguriert.")
+            return
+        embed = discord.Embed(
+            title="🔔 Team-Benachrichtigung",
+            description=f"{ctx.author.mention} bittet um Unterstützung in diesem Ticket!",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Bitte antworte zeitnah")
+        try:
+            await ctx.send(
+                content=f"{support_role.mention} 🔔",
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(roles=[support_role]),
+            )
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Konnte Ping nicht senden: `{e}`")
+
+    @commands.command(name="ticketcategory", aliases=["tcat"])
+    @commands.guild_only()
+    async def ticket_category_info_cmd(self, ctx: commands.Context):
+        """Zeigt die Kategorie des aktuellen Tickets an."""
+        if not self._is_ticket_channel(ctx.channel):
+            await ctx.send("❌ Dieser Befehl funktioniert nur in Ticket-Channels.")
+            return
+        topic = ctx.channel.topic or ""
+        m = re.search(r"Category:\s*(\w+)", topic)
+        if not m:
+            await ctx.send("ℹ️ Dieses Ticket hat keine Kategorie (Legacy-Ticket).")
+            return
+        cat_key = m.group(1)
+        cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+        cat = cats.get(cat_key)
+        if not cat:
+            await ctx.send(f"ℹ️ Kategorie `{cat_key}` ist nicht mehr konfiguriert.")
+            return
+        embed = discord.Embed(
+            title=f"{cat.get('emoji', '🎫')} {cat.get('name', cat_key)}",
+            description=cat.get("description", "Keine Beschreibung"),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        role_id = cat.get("support_role_id")
+        role = ctx.guild.get_role(role_id) if role_id else None
+        embed.add_field(name="Support-Rolle", value=role.mention if role else "❌", inline=True)
+        embed.add_field(name="Farbe", value=cat.get("color", "?"), inline=True)
+        embed.add_field(name="Button-Text", value=cat.get("button_text", "?"), inline=True)
+        await ctx.send(embed=embed)
 
     async def _close_ticket_via_command(self, ctx: commands.Context, reason: str):
         """Schließt ein Ticket via Text-Befehl (ohne Interaction)."""
@@ -10347,12 +10678,22 @@ class TicketControlView(discord.ui.View):
         custom_id="ticket_close",
     )
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.channel is None:
-            await interaction.response.send_message("❌ Dieser Button kann nur in einem Channel verwendet werden.", ephemeral=True)
-            return
-        # Close-Reason Modal öffnen
-        modal = TicketCloseReasonModal(self.cog, interaction.channel)
-        await interaction.response.send_modal(modal)
+        try:
+            if interaction.channel is None:
+                await self._safe_respond(interaction, "❌ Dieser Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+                return
+            # Close-Reason Modal öffnen
+            modal = TicketCloseReasonModal(self.cog, interaction.channel)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            log.exception("Fehler in close_ticket Button")
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"❌ Fehler: `{e}`", ephemeral=True)
+                else:
+                    await interaction.response.send_message(f"❌ Fehler: `{e}`", ephemeral=True)
+            except Exception:
+                pass
 
     @discord.ui.button(
         label="Übernehmen",
@@ -10361,40 +10702,58 @@ class TicketControlView(discord.ui.View):
         custom_id="ticket_claim",
     )
     async def claim_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.claim_enabled:
-            await self._safe_respond(interaction, "❌ Claim-System ist deaktiviert.", ephemeral=True)
-            return
-        if interaction.channel is None or interaction.guild is None:
-            await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
-            return
-        if not isinstance(interaction.user, discord.Member):
-            await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
-            return
-        # Berechtigungsprüfung (inkl. kategorie-spezifischer Rolle)
-        is_staff = await self.cog._is_ticket_staff(interaction.user, interaction.channel, interaction.guild)
-        if not is_staff:
-            await self._safe_respond(interaction, "❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
-            return
-        # Channel-Topic aktualisieren — robust gegen mehrere/mögliche Claim-Einträge
-        channel = interaction.channel
-        topic = channel.topic or ""
-        # ALLE Claimed-Einträge entfernen (egal wie viele, falls durch Race Conditions mehrere entstanden)
-        topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
-        # Doppelte Leerzeichen/Trenner aufräumen
-        topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
-        new_topic = f"{topic_clean} • Claimed by: {interaction.user.id}"
         try:
-            await channel.edit(topic=new_topic, reason=f"Ticket claimed by {interaction.user.display_name}")
-        except (discord.Forbidden, discord.HTTPException) as e:
-            await self._safe_respond(interaction, f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
-            return
-        embed = discord.Embed(
-            title="✅ Ticket übernommen",
-            description=f"{interaction.user.mention} hat dieses Ticket übernommen und ist nun zuständig.",
-            color=discord.Color.green(),
-            timestamp=_now(),
-        )
-        await self._safe_respond(interaction, embed=embed)
+            if not self.claim_enabled:
+                await self._safe_respond(interaction, "❌ Claim-System ist deaktiviert.", ephemeral=True)
+                return
+            if interaction.channel is None or interaction.guild is None:
+                await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+                return
+            # Berechtigungsprüfung — interaction.user kann User oder Member sein
+            member = interaction.user
+            if not isinstance(member, discord.Member):
+                # Versuche Member zu holen
+                try:
+                    member = interaction.guild.get_member(interaction.user.id)
+                except Exception:
+                    member = None
+                if member is None:
+                    await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
+                    return
+            is_staff = await self.cog._is_ticket_staff(member, interaction.channel, interaction.guild)
+            if not is_staff:
+                await self._safe_respond(interaction, "❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
+                return
+            # Channel-Topic aktualisieren — robust gegen mehrere/mögliche Claim-Einträge
+            channel = interaction.channel
+            topic = channel.topic or ""
+            # ALLE Claimed-Einträge entfernen (egal wie viele, falls durch Race Conditions mehrere entstanden)
+            topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
+            # Doppelte Leerzeichen/Trenner aufräumen
+            topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
+            new_topic = f"{topic_clean} • Claimed by: {interaction.user.id}"
+            try:
+                await channel.edit(topic=new_topic, reason=f"Ticket claimed by {interaction.user.display_name}")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await self._safe_respond(interaction, f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
+                return
+            embed = discord.Embed(
+                title="✅ Ticket übernommen",
+                description=f"{interaction.user.mention} hat dieses Ticket übernommen und ist nun zuständig.",
+                color=discord.Color.green(),
+                timestamp=_now(),
+            )
+            await self._safe_respond(interaction, embed=embed)
+        except Exception as e:
+            log.exception("Fehler in claim_ticket_btn")
+            try:
+                error_msg = f"❌ Fehler beim Übernehmen: `{type(e).__name__}: {e}`"
+                if interaction.response.is_done():
+                    await interaction.followup.send(error_msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(error_msg, ephemeral=True)
+            except Exception:
+                pass
 
     @discord.ui.button(
         label="Freigeben",
@@ -10403,54 +10762,92 @@ class TicketControlView(discord.ui.View):
         custom_id="ticket_unclaim",
     )
     async def unclaim_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.claim_enabled:
-            await self._safe_respond(interaction, "❌ Claim-System ist deaktiviert.", ephemeral=True)
-            return
-        if interaction.channel is None or interaction.guild is None:
-            await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
-            return
-        if not isinstance(interaction.user, discord.Member):
-            await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
-            return
-        channel = interaction.channel
-        topic = channel.topic or ""
-        m = re.search(r"Claimed by:\s*(\d+)", topic)
-        if not m:
-            await self._safe_respond(interaction, "ℹ️ Dieses Ticket ist aktuell nicht geclaimt.", ephemeral=True)
-            return
-        claimed_by_id = int(m.group(1))
-        is_claimer = interaction.user.id == claimed_by_id
-        is_staff = await self.cog._is_ticket_staff(interaction.user, channel, interaction.guild)
-        if not (is_claimer or is_staff):
-            await self._safe_respond(interaction, "❌ Nur der aktuelle Claimer oder Teammitglieder können freigeben.", ephemeral=True)
-            return
-        # ALLE Claimed-Einträge aus Topic entfernen
-        topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
-        topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
         try:
-            await channel.edit(topic=topic_clean, reason=f"Ticket unclaimed by {interaction.user.display_name}")
-        except (discord.Forbidden, discord.HTTPException) as e:
-            await self._safe_respond(interaction, f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
-            return
-        embed = discord.Embed(
-            title="🔓 Ticket freigegeben",
-            description=f"{interaction.user.mention} hat dieses Ticket wieder freigegeben.\nEs kann nun von jedem Teammitglied übernommen werden (`✋ Übernehmen`).",
-            color=discord.Color.orange(),
-            timestamp=_now(),
-        )
-        await self._safe_respond(interaction, embed=embed)
+            if not self.claim_enabled:
+                await self._safe_respond(interaction, "❌ Claim-System ist deaktiviert.", ephemeral=True)
+                return
+            if interaction.channel is None or interaction.guild is None:
+                await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+                return
+            # Member sicherstellen
+            member = interaction.user
+            if not isinstance(member, discord.Member):
+                try:
+                    member = interaction.guild.get_member(interaction.user.id)
+                except Exception:
+                    member = None
+                if member is None:
+                    await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
+                    return
+            channel = interaction.channel
+            topic = channel.topic or ""
+            m = re.search(r"Claimed by:\s*(\d+)", topic)
+            if not m:
+                await self._safe_respond(interaction, "ℹ️ Dieses Ticket ist aktuell nicht geclaimt.", ephemeral=True)
+                return
+            claimed_by_id = int(m.group(1))
+            is_claimer = interaction.user.id == claimed_by_id
+            is_staff = await self.cog._is_ticket_staff(member, channel, interaction.guild)
+            if not (is_claimer or is_staff):
+                await self._safe_respond(interaction, "❌ Nur der aktuelle Claimer oder Teammitglieder können freigeben.", ephemeral=True)
+                return
+            # ALLE Claimed-Einträge aus Topic entfernen
+            topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
+            topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
+            try:
+                await channel.edit(topic=topic_clean, reason=f"Ticket unclaimed by {interaction.user.display_name}")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await self._safe_respond(interaction, f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
+                return
+            embed = discord.Embed(
+                title="🔓 Ticket freigegeben",
+                description=f"{interaction.user.mention} hat dieses Ticket wieder freigegeben.\nEs kann nun von jedem Teammitglied übernommen werden (`✋ Übernehmen`).",
+                color=discord.Color.orange(),
+                timestamp=_now(),
+            )
+            await self._safe_respond(interaction, embed=embed)
+        except Exception as e:
+            log.exception("Fehler in unclaim_ticket_btn")
+            try:
+                error_msg = f"❌ Fehler beim Freigeben: `{type(e).__name__}: {e}`"
+                if interaction.response.is_done():
+                    await interaction.followup.send(error_msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(error_msg, ephemeral=True)
+            except Exception:
+                pass
 
     async def _safe_respond(self, interaction: discord.Interaction, content: str = None, *, embed: discord.Embed = None, ephemeral: bool = True):
         """Sichere Response-Methode die sowohl mit frischen als auch schon beantworteten Interactions umgeht."""
         try:
+            # Bau kwargs nur mit nicht-None Werten auf (vermeidet TypeError bei manchen discord.py Versionen)
+            kwargs = {"ephemeral": ephemeral}
+            if content is not None:
+                kwargs["content"] = content
+            if embed is not None:
+                kwargs["embed"] = embed
             if interaction.response.is_done():
-                await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+                await interaction.followup.send(**kwargs)
             else:
-                await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+                await interaction.response.send_message(**kwargs)
         except discord.HTTPException:
             pass
         except Exception:
             log.exception("Fehler bei _safe_respond")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        """Fängt alle Fehler in der View ab und verhindert dass der Button stillschweigend stirbt."""
+        log.exception("Fehler in TicketControlView", exc_info=error)
+        try:
+            error_msg = f"❌ Ein Fehler ist aufgetreten: `{type(error).__name__}: {error}`"
+            if interaction.response.is_done():
+                await interaction.followup.send(error_msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(error_msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        except Exception:
+            pass
 
 
 class TicketMultiPanelView(discord.ui.View):
