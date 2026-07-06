@@ -128,6 +128,44 @@ def _from_ts(ts: float) -> datetime:
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
+# German timezone (Europe/Berlin — handles CET/CEST automatically)
+_BERLIN_TZ = timezone(timedelta(hours=1))  # Fallback if zoneinfo not available
+try:
+    from zoneinfo import ZoneInfo
+    _BERLIN_TZ = ZoneInfo("Europe/Berlin")
+except (ImportError, Exception):
+    pass
+
+
+def _now_berlin() -> datetime:
+    """Aktuelle Zeit in Europe/Berlin."""
+    return datetime.now(_BERLIN_TZ)
+
+
+def _fmt_berlin(dt: datetime, fmt: str = "%d.%m.%Y %H:%M:%S") -> str:
+    """Formatiert ein datetime in Europe/Berlin Zeitzone."""
+    if dt is None:
+        return "?"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_BERLIN_TZ).strftime(fmt)
+
+
+def _fmt_berlin_short(dt: datetime) -> str:
+    """Kurzes Format: HH:MM:SS."""
+    return _fmt_berlin(dt, "%H:%M:%S")
+
+
+def _fmt_berlin_date(dt: datetime) -> str:
+    """Nur Datum: DD.MM.YYYY."""
+    return _fmt_berlin(dt, "%d.%m.%Y")
+
+
+def _fmt_berlin_full(dt: datetime) -> str:
+    """Vollständiges Format: DD.MM.YYYY HH:MM:SS."""
+    return _fmt_berlin(dt, "%d.%m.%Y %H:%M:%S")
+
+
 def _fmt_h_m(seconds: int) -> str:
     """Format a duration as 'Xh Ym'."""
     seconds = int(seconds)
@@ -4892,6 +4930,189 @@ class SupportCog(commands.Cog):
         await self.config.guild(ctx.guild).ticket_panel_multi_enabled.set(True)
         await ctx.send(f"✅ Multi-Kategorie Panel erstellt: {message.jump_url}")
 
+    @ticketset.command(name="examples", aliases=["autoexamples", "demo"])
+    async def ticketset_examples(self, ctx: commands.Context):
+        """Erstellt automatisch Beispiel-Kategorien (support, report, bug, bewerbung).
+        Erstellt für jede Kategorie eine eigene Discord-Kategorie + Support-Rolle.
+        Nützlich für schnelles Testen oder als Startpunkt."""
+        guild = ctx.guild
+        g = self.config.guild(guild)
+        cats = await g.ticket_categories() or {}
+        created = []
+        # Beispiel-Kategorien definieren
+        examples = [
+            ("support", "Allgemeiner Support", "🎫", "blurple", "Allgemeine Fragen und Probleme"),
+            ("report", "Spieler melden", "🚨", "red", "Melde einen Spieler für Regelverstöße"),
+            ("bug", "Bug melden", "🐛", "orange", "Melde einen Bug auf dem Server"),
+            ("bewerbung", "Bewerbung", "📋", "green", "Bewerbe dich für das Team"),
+        ]
+        for key, name, emoji, color, desc in examples:
+            if key in cats:
+                continue  # bereits vorhanden
+            # Support-Rolle erstellen
+            role_name = f"🎫 {name} Team"
+            try:
+                role = await guild.create_role(name=role_name, reason=f"Auto-created by ticketset examples ({key})")
+            except discord.Forbidden:
+                await ctx.send("❌ Brauche `Manage Roles` um Rollen zu erstellen.")
+                return
+            # Discord-Kategorie erstellen
+            try:
+                category = await guild.create_category(
+                    name=f"🎫 {name}",
+                    reason=f"Auto-created by ticketset examples ({key})",
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                        guild.me: discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True,
+                            read_message_history=True, manage_channels=True,
+                        ),
+                        role: discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True,
+                            read_message_history=True, attach_files=True,
+                        ),
+                    },
+                )
+            except discord.Forbidden:
+                await ctx.send("❌ Brauche `Manage Channels` um Kategorien zu erstellen.")
+                return
+            # Kategorie-Config speichern
+            cats[key] = {
+                "name": name,
+                "emoji": emoji,
+                "color": color,
+                "button_text": name,
+                "category_id": category.id,
+                "support_role_id": role.id,
+                "description": desc,
+                "welcome_message": f"Ein {name}-Teammitglied wird sich gleich um dein Anliegen kümmern.",
+                "modal_question": "Was ist dein Anliegen?",
+                "modal_placeholder": "Beschreibe dein Anliegen so detailliert wie möglich...",
+            }
+            created.append((key, name, role, category))
+        await g.ticket_categories.set(cats)
+        if not created:
+            await ctx.send("ℹ️ Alle Beispiel-Kategorien existieren bereits. Nutze `[p]ticketset category list` zum Anzeigen.")
+            return
+        # Zusammenfassung
+        lines = []
+        for key, name, role, category in created:
+            lines.append(f"• `{key}` — {name}: {role.mention} / {category.name}")
+        embed = discord.Embed(
+            title="✅ Beispiel-Kategorien erstellt",
+            description=f"{len(created)} Kategorien wurden angelegt:\n\n" + "\n".join(lines),
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        embed.add_field(
+            name="Nächster Schritt",
+            value="Führe `[p]ticketset createmulti` aus um das Panel mit Buttons zu erstellen.",
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+
+    @ticketset.command(name="list", aliases=["activetickets"])
+    async def ticketset_list(self, ctx: commands.Context):
+        """Zeigt alle aktuell offenen Tickets an."""
+        active = await self.config.guild(ctx.guild).ticket_active() or {}
+        if not active:
+            await ctx.send("ℹ️ Aktuell sind keine Tickets offen.")
+            return
+        embed = discord.Embed(
+            title="🎫 Offene Tickets",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        total = 0
+        for user_id_str, channel_ids in active.items():
+            if not channel_ids:
+                continue
+            try:
+                user_id = int(user_id_str)
+                user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+                user_label = user.display_name if user else f"User {user_id}"
+            except Exception:
+                user_label = f"User {user_id_str}"
+            channel_lines = []
+            for cid in channel_ids[:10]:
+                ch = ctx.guild.get_channel(cid)
+                if ch:
+                    # Kategorie aus Topic extrahieren
+                    cat_label = ""
+                    if ch.topic:
+                        m = re.search(r"Category: (\w+)", ch.topic)
+                        if m:
+                            cats = await self.config.guild(ctx.guild).ticket_categories() or {}
+                            cat = cats.get(m.group(1))
+                            if cat:
+                                cat_label = f" [{cat.get('name', m.group(1))}]"
+                    channel_lines.append(f"• {ch.mention}{cat_label}")
+                else:
+                    channel_lines.append(f"• ~~Channel {cid} (gelöscht)~~")
+            embed.add_field(
+                name=f"{user_label} (ID: {user_id_str}) — {len(channel_ids)} Ticket(s)",
+                value="\n".join(channel_lines),
+                inline=False,
+            )
+            total += len(channel_ids)
+        embed.set_footer(text=f"Total: {total} offene Tickets • {ctx.guild.name}")
+        # Falls Embed zu viele Fields hat, kürzen
+        if len(embed.fields) > 25:
+            embed.clear_fields()
+            embed.add_field(name="Hinweis", value=f"Zu viele User mit offenen Tickets. Total: {total} Tickets über {len(active)} User.", inline=False)
+        await ctx.send(embed=embed)
+
+    @ticketset.command(name="stats", aliases=["statistics"])
+    async def ticketset_stats(self, ctx: commands.Context):
+        """Zeigt Statistiken zum Ticket-System."""
+        g = self.config.guild(ctx.guild)
+        counter = await g.ticket_counter() or 0
+        active = await g.ticket_active() or {}
+        total_open = sum(len(v) for v in active.values())
+        users_with_tickets = len([k for k, v in active.items() if v])
+        cats = await g.ticket_categories() or {}
+        blacklist = await g.ticket_blacklist() or []
+        embed = discord.Embed(
+            title="📊 Ticket-System Statistiken",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="🎫 Gesamt erstellte Tickets", value=str(counter), inline=True)
+        embed.add_field(name="🟢 Aktuell offen", value=str(total_open), inline=True)
+        embed.add_field(name="👥 User mit offenen Tickets", value=str(users_with_tickets), inline=True)
+        embed.add_field(name="📂 Konfigurierte Kategorien", value=str(len(cats)), inline=True)
+        embed.add_field(name="🚫 Blacklist-Einträge", value=str(len(blacklist)), inline=True)
+        # Top-Kategorie (falls Kategorien existieren)
+        if cats:
+            cat_lines = []
+            for key, cat in cats.items():
+                cat_obj = ctx.guild.get_channel(cat.get("category_id")) if cat.get("category_id") else None
+                role_obj = ctx.guild.get_role(cat.get("support_role_id")) if cat.get("support_role_id") else None
+                status = "✅" if (cat_obj and role_obj) else "❌"
+                cat_lines.append(f"{status} {cat.get('emoji', '🎫')} `{key}` — {cat.get('name', '?')}")
+            embed.add_field(name="📂 Kategorien-Übersicht", value="\n".join(cat_lines[:15]), inline=False)
+        embed.set_footer(text=f"Ticket-Stats • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    @ticketset.command(name="cleanup")
+    async def ticketset_cleanup(self, ctx: commands.Context):
+        """Entfernt verwaiste Ticket-Einträge aus dem Tracking (Channel existiert nicht mehr)."""
+        active = await self.config.guild(ctx.guild).ticket_active() or {}
+        if not active:
+            await ctx.send("ℹ️ Keine aktiven Tickets im Tracking.")
+            return
+        removed = 0
+        for user_id_str, channel_ids in list(active.items()):
+            for cid in list(channel_ids):
+                ch = ctx.guild.get_channel(cid)
+                if ch is None:
+                    channel_ids.remove(cid)
+                    removed += 1
+            if not channel_ids:
+                del active[user_id_str]
+        await self.config.guild(ctx.guild).ticket_active.set(active)
+        await ctx.send(f"✅ Cleanup fertig: {removed} verwaiste Einträge entfernt.")
+
     # ============================================
     # MULTI-KATEGORIE-CORE-LOGIK
     # ============================================
@@ -5125,28 +5346,45 @@ class SupportCog(commands.Cog):
         creator: Optional[discord.abc.User] = None,
         category_name: str = "",
     ) -> str:
-        """Baut ein schick formatiertes HTML-Transcript."""
+        """Baut ein schick formatiertes HTML-Transcript (Europe/Berlin Zeitzone, mit UserIDs)."""
         import html as _html
         ticket_num = "?"
         if channel.topic:
             m = re.search(r"Ticket #(\d+)", channel.topic)
             if m:
                 ticket_num = m.group(1)
-        # Header
-        closed_at_str = _now().strftime("%d.%m.%Y %H:%M:%S UTC")
+        # Header (Berlin Zeit)
+        closed_at_str = _fmt_berlin_full(_now())
         created_at_str = ""
         if channel.created_at:
-            created_at_str = channel.created_at.strftime("%d.%m.%Y %H:%M:%S UTC")
-        creator_name = creator.display_name if creator else "Unbekannt"
+            created_at_str = _fmt_berlin_full(channel.created_at)
+        creator_name = _html.escape(creator.display_name) if creator else "Unbekannt"
         creator_id = creator.id if creator else "?"
-        closer_name = closed_by.display_name if closed_by else "Unbekannt"
+        closer_name = _html.escape(closed_by.display_name) if closed_by else "Unbekannt"
         closer_id = closed_by.id if closed_by else "?"
+        # Claimer aus Topic extrahieren
+        claimed_by_name = "—"
+        claimed_by_id = "—"
+        if channel.topic:
+            m = re.search(r"Claimed by:\s*(\d+)", channel.topic)
+            if m:
+                claimed_by_id = m.group(1)
+                # Versuchen den User zu holen
+                try:
+                    claimed_user = self.bot.get_user(int(claimed_by_id))
+                    if claimed_user:
+                        claimed_by_name = _html.escape(claimed_user.display_name)
+                    else:
+                        claimed_by_name = f"User {claimed_by_id}"
+                except Exception:
+                    claimed_by_name = f"User {claimed_by_id}"
         msg_count = len(messages)
         # Messages HTML bauen
         msg_html_parts = []
         for msg in messages:
-            ts = msg.created_at.strftime("%H:%M:%S") if msg.created_at else "?"
-            date_str = msg.created_at.strftime("%d.%m.%Y") if msg.created_at else ""
+            # Berlin Zeit
+            ts = _fmt_berlin_short(msg.created_at) if msg.created_at else "?"
+            date_str = _fmt_berlin_date(msg.created_at) if msg.created_at else ""
             author_name = _html.escape(msg.author.display_name) if msg.author else "Unbekannt"
             author_id = msg.author.id if msg.author else "?"
             author_avatar = msg.author.display_avatar.url if msg.author and hasattr(msg.author, "display_avatar") else ""
@@ -5194,6 +5432,7 @@ class SupportCog(commands.Cog):
                 <div class="message-content">
                     <div class="message-header">
                         <span class="author" style="color: {author_color};">{author_name}</span>
+                        <span class="author-id">({author_id})</span>
                         <span class="timestamp">{date_str} {ts}</span>
                     </div>
                     <div class="message-text">{content_html}</div>
@@ -5224,8 +5463,9 @@ class SupportCog(commands.Cog):
         .message-avatar {{ flex-shrink: 0; }}
         .message-avatar img {{ width: 40px; height: 40px; border-radius: 50%; }}
         .message-content {{ flex: 1; min-width: 0; }}
-        .message-header {{ display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }}
+        .message-header {{ display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; flex-wrap: wrap; }}
         .author {{ font-weight: 600; font-size: 14px; }}
+        .author-id {{ font-size: 11px; color: #72767d; font-family: 'Consolas', monospace; }}
         .timestamp {{ font-size: 11px; color: #949ba4; }}
         .message-text {{ font-size: 14px; line-height: 1.4; word-wrap: break-word; }}
         .message-text code {{ background: #1e1f22; padding: 2px 4px; border-radius: 3px; font-family: 'Consolas', monospace; font-size: 13px; }}
@@ -5247,10 +5487,11 @@ class SupportCog(commands.Cog):
             <div class="meta">
                 <div class="meta-item"><strong>Channel</strong>{_html.escape(channel.name)}</div>
                 <div class="meta-item"><strong>Kategorie</strong>{_html.escape(category_name or "—")}</div>
-                <div class="meta-item"><strong>Erstellt am</strong>{created_at_str or "—"}</div>
-                <div class="meta-item"><strong>Geschlossen am</strong>{closed_at_str}</div>
-                <div class="meta-item"><strong>Ersteller</strong>{_html.escape(creator_name)} ({creator_id})</div>
-                <div class="meta-item"><strong>Geschlossen von</strong>{_html.escape(closer_name)} ({closer_id})</div>
+                <div class="meta-item"><strong>Erstellt am</strong>{created_at_str or "—"} (MEZ/MESZ)</div>
+                <div class="meta-item"><strong>Geschlossen am</strong>{closed_at_str} (MEZ/MESZ)</div>
+                <div class="meta-item"><strong>Ersteller</strong>{creator_name} (ID: {creator_id})</div>
+                <div class="meta-item"><strong>Geschlossen von</strong>{closer_name} (ID: {closer_id})</div>
+                <div class="meta-item"><strong>Zuständig (Claimed)</strong>{claimed_by_name} (ID: {claimed_by_id})</div>
                 <div class="meta-item"><strong>Nachrichten</strong>{msg_count}</div>
                 <div class="meta-item"><strong>Grund</strong>{_html.escape(reason[:200] or "Kein Grund angegeben")}</div>
             </div>
@@ -5259,7 +5500,7 @@ class SupportCog(commands.Cog):
             {messages_html}
         </div>
         <div class="footer">
-            Generiert von SupportCog • {_now().strftime("%d.%m.%Y %H:%M:%S UTC")} • {msg_count} Nachrichten
+            Generiert von SupportCog • {_fmt_berlin_full(_now())} (MEZ/MESZ) • {msg_count} Nachrichten • Alle Zeiten in Europe/Berlin
         </div>
     </div>
 </body>
@@ -5299,7 +5540,7 @@ class SupportCog(commands.Cog):
             closed_by=closed_by, reason=reason,
             creator=creator_user, category_name=category_name,
         )
-        # TXT Transcript (Fallback)
+        # TXT Transcript (Fallback) — mit Berliner Zeit + UserIDs
         txt_lines = []
         ticket_num = "?"
         if channel.topic:
@@ -5309,19 +5550,25 @@ class SupportCog(commands.Cog):
         txt_lines.append(f"Transcript für Ticket #{ticket_num}")
         txt_lines.append(f"Channel: #{channel.name}")
         txt_lines.append(f"Kategorie: {category_name or '—'}")
+        txt_lines.append(f"Erstellt am: {_fmt_berlin_full(channel.created_at) if channel.created_at else '?'} (MEZ/MESZ)")
+        txt_lines.append(f"Geschlossen am: {_fmt_berlin_full(_now())} (MEZ/MESZ)")
+        creator_str = f"{creator_user} ({creator_user.id})" if creator_user else "Unbekannt"
+        txt_lines.append(f"Ersteller: {creator_str}")
         txt_lines.append(f"Geschlossen von: {closed_by} ({closed_by.id if closed_by else '?'})")
         txt_lines.append(f"Grund: {reason}")
+        txt_lines.append(f"Zeitzone: Europe/Berlin (MEZ/MESZ)")
         txt_lines.append("=" * 60)
         txt_lines.append("")
         for msg in messages:
-            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if msg.created_at else "?"
+            ts = _fmt_berlin_full(msg.created_at) if msg.created_at else "?"
             author = msg.author.display_name if msg.author else "Unbekannt"
+            author_id = msg.author.id if msg.author else "?"
             content = msg.content or ""
             if msg.attachments:
                 content += " " + " ".join(f"[Attachment: {a.filename}]" for a in msg.attachments)
             if msg.embeds:
                 content += f" [{len(msg.embeds)} Embeds]"
-            txt_lines.append(f"[{ts}] {author}: {content}")
+            txt_lines.append(f"[{ts}] {author} (ID: {author_id}): {content}")
         txt_content = "\n".join(txt_lines)
         return html_content, txt_content, creator_user, ticket_num
 
@@ -10115,28 +10362,31 @@ class TicketControlView(discord.ui.View):
     )
     async def claim_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.claim_enabled:
-            await interaction.response.send_message("❌ Claim-System ist deaktiviert.", ephemeral=True)
+            await self._safe_respond(interaction, "❌ Claim-System ist deaktiviert.", ephemeral=True)
             return
         if interaction.channel is None or interaction.guild is None:
-            await interaction.response.send_message("❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+            await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
             return
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
             return
         # Berechtigungsprüfung (inkl. kategorie-spezifischer Rolle)
         is_staff = await self.cog._is_ticket_staff(interaction.user, interaction.channel, interaction.guild)
         if not is_staff:
-            await interaction.response.send_message("❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
+            await self._safe_respond(interaction, "❌ Nur Teammitglieder können Tickets übernehmen.", ephemeral=True)
             return
-        # Channel-Topic aktualisieren
+        # Channel-Topic aktualisieren — robust gegen mehrere/mögliche Claim-Einträge
         channel = interaction.channel
         topic = channel.topic or ""
-        topic_clean = re.sub(r" • Claimed by: \d+", "", topic)
+        # ALLE Claimed-Einträge entfernen (egal wie viele, falls durch Race Conditions mehrere entstanden)
+        topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
+        # Doppelte Leerzeichen/Trenner aufräumen
+        topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
         new_topic = f"{topic_clean} • Claimed by: {interaction.user.id}"
         try:
             await channel.edit(topic=new_topic, reason=f"Ticket claimed by {interaction.user.display_name}")
         except (discord.Forbidden, discord.HTTPException) as e:
-            await interaction.response.send_message(f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
+            await self._safe_respond(interaction, f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
             return
         embed = discord.Embed(
             title="✅ Ticket übernommen",
@@ -10144,7 +10394,7 @@ class TicketControlView(discord.ui.View):
             color=discord.Color.green(),
             timestamp=_now(),
         )
-        await interaction.response.send_message(embed=embed)
+        await self._safe_respond(interaction, embed=embed)
 
     @discord.ui.button(
         label="Freigeben",
@@ -10154,40 +10404,53 @@ class TicketControlView(discord.ui.View):
     )
     async def unclaim_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.claim_enabled:
-            await interaction.response.send_message("❌ Claim-System ist deaktiviert.", ephemeral=True)
+            await self._safe_respond(interaction, "❌ Claim-System ist deaktiviert.", ephemeral=True)
             return
         if interaction.channel is None or interaction.guild is None:
-            await interaction.response.send_message("❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
+            await self._safe_respond(interaction, "❌ Button kann nur in einem Channel verwendet werden.", ephemeral=True)
             return
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            await self._safe_respond(interaction, "❌ Nur Server-Mitglieder.", ephemeral=True)
             return
         channel = interaction.channel
         topic = channel.topic or ""
-        m = re.search(r"Claimed by: (\d+)", topic)
+        m = re.search(r"Claimed by:\s*(\d+)", topic)
         if not m:
-            await interaction.response.send_message("ℹ️ Dieses Ticket ist aktuell nicht geclaimt.", ephemeral=True)
+            await self._safe_respond(interaction, "ℹ️ Dieses Ticket ist aktuell nicht geclaimt.", ephemeral=True)
             return
         claimed_by_id = int(m.group(1))
         is_claimer = interaction.user.id == claimed_by_id
         is_staff = await self.cog._is_ticket_staff(interaction.user, channel, interaction.guild)
         if not (is_claimer or is_staff):
-            await interaction.response.send_message("❌ Nur der aktuelle Claimer oder Teammitglieder können freigeben.", ephemeral=True)
+            await self._safe_respond(interaction, "❌ Nur der aktuelle Claimer oder Teammitglieder können freigeben.", ephemeral=True)
             return
-        # Claimed-Eintrag aus Topic entfernen
-        topic_clean = re.sub(r" • Claimed by: \d+", "", topic)
+        # ALLE Claimed-Einträge aus Topic entfernen
+        topic_clean = re.sub(r"\s*•\s*Claimed by:\s*\d+", "", topic)
+        topic_clean = re.sub(r"\s+", " ", topic_clean).strip()
         try:
             await channel.edit(topic=topic_clean, reason=f"Ticket unclaimed by {interaction.user.display_name}")
         except (discord.Forbidden, discord.HTTPException) as e:
-            await interaction.response.send_message(f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
+            await self._safe_respond(interaction, f"❌ Konnte Topic nicht aktualisieren: `{e}`", ephemeral=True)
             return
         embed = discord.Embed(
             title="🔓 Ticket freigegeben",
-            description=f"{interaction.user.mention} hat dieses Ticket wieder freigegeben.\nEs kann nun von jedem Teammitglied übernommen werden.",
+            description=f"{interaction.user.mention} hat dieses Ticket wieder freigegeben.\nEs kann nun von jedem Teammitglied übernommen werden (`✋ Übernehmen`).",
             color=discord.Color.orange(),
             timestamp=_now(),
         )
-        await interaction.response.send_message(embed=embed)
+        await self._safe_respond(interaction, embed=embed)
+
+    async def _safe_respond(self, interaction: discord.Interaction, content: str = None, *, embed: discord.Embed = None, ephemeral: bool = True):
+        """Sichere Response-Methode die sowohl mit frischen als auch schon beantworteten Interactions umgeht."""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+        except discord.HTTPException:
+            pass
+        except Exception:
+            log.exception("Fehler bei _safe_respond")
 
 
 class TicketMultiPanelView(discord.ui.View):
