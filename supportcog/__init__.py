@@ -15057,7 +15057,7 @@ class EmbedBuilderModal(discord.ui.Modal):
         # Feld 3: Farbe
         color_default = safe_default(self.existing_data.get("color"))
         self.color_input = discord.ui.TextInput(
-            label="Farbe (blurple, red, green, orange, purple, grey, random)",
+            label="Farbe (blurple/red/green/orange/purple/grey)",
             placeholder="blurple",
             required=False,
             max_length=20,
