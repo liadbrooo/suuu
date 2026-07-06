@@ -15340,28 +15340,47 @@ class EmbedBuilderNextView(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(label="Überspringen / Fertig", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Überspringen", style=discord.ButtonStyle.secondary)
     async def skip_step(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             if not isinstance(interaction.user, discord.Member):
                 await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
                 return
             if self.step == 2:
-                # Von Schritt 2 überspringen → direkt zu Schritt 3
                 embed = discord.Embed(
                     title=f"3/3 Fields: {self.key}",
-                    description="Bilder übersprungen! Klicke auf den Button um Fields hinzuzufügen.\nOder klicke 'Fertig' um das Embed zu speichern.",
+                    description="Bilder übersprungen! Klicke 'Weiter' für Fields.\nOder klicke 'Senden' um direkt zu speichern.",
                     color=discord.Color.blue(),
                     timestamp=_now(),
                 )
                 view = EmbedBuilderNextView(self.cog, self.key, self.data, self.send_channel, self.force_send, step=3)
                 await interaction.response.edit_message(embed=embed, view=view)
             else:
-                # Schritt 3 überspringen → direkt speichern
                 await interaction.response.defer(ephemeral=True)
                 await self.cog._embed_builder_save_and_send(interaction, self.key, self.data, self.send_channel, self.force_send)
         except Exception as e:
             log.exception("Fehler beim Überspringen")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Senden", style=discord.ButtonStyle.success)
+    async def send_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            if not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            await self.cog._embed_builder_save_and_send(interaction, self.key, self.data, self.send_channel, self.force_send)
+        except Exception as e:
+            log.exception("Fehler beim direkten Senden")
             try:
                 if not interaction.response.is_done():
                     await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
