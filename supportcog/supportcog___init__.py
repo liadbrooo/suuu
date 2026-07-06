@@ -124,7 +124,7 @@ def _now_ts() -> int:
 
 def _from_ts(ts: float) -> datetime:
     """Parse a POSIX timestamp into a timezone-aware UTC datetime."""
-    return _from_ts(ts, tz=timezone.utc)
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
 def _fmt_h_m(seconds: int) -> str:
@@ -4293,92 +4293,6 @@ class SupportCog(commands.Cog):
             await interaction.followup.send(f"❌ Konnte Channel nicht löschen: `{e}`", ephemeral=True)
 
     # ============================================
-    # DUTY HANDOVER
-    # ============================================
-
-    @duty_group.command(name="handover", aliases=["transfer"])
-    async def duty_handover(self, ctx: commands.Context, target: discord.Member):
-        """Übergibt deinen aktiven Duty an einen anderen Teamkollegen.
-
-        Du wirst vom Duty abgemeldet, der Ziel-User wird angemeldet.
-        Der Ziel-User muss die Support-Basisrolle haben.
-        """
-        guild = ctx.guild
-        member = ctx.author
-
-        if target.id == member.id:
-            await ctx.send("❌ Du kannst Duty nicht an dich selbst übergeben.")
-            return
-        if target.bot:
-            await ctx.send("❌ Du kannst Duty nicht an einen Bot übergeben.")
-            return
-
-        role_id = await self.config.guild(guild).role()
-        if not role_id:
-            await ctx.send("❌ Keine Support-Rolle konfiguriert.")
-            return
-        if target.get_role(role_id) is None:
-            await ctx.send(f"❌ {target.mention} hat nicht die Support-Basisrolle.")
-            return
-
-        is_on_duty = await self.config.member(member).on_duty()
-        if not is_on_duty:
-            await ctx.send("❌ Du bist aktuell nicht im Duty.")
-            return
-        target_on_duty = await self.config.member(target).on_duty()
-        if target_on_duty:
-            await ctx.send(f"❌ {target.mention} ist bereits im Duty.")
-            return
-
-        # Sender abmelden (mit _finalize_duty_stop für saubere Statistik)
-        async with self._lock_for(guild.id, member.id):
-            await self._finalize_duty_stop(member, whitelist=False, reason=f"Duty übergeben an {target.display_name}")
-
-        # Ziel anmelden
-        async with self._lock_for(guild.id, target.id):
-            await self.config.member(target).on_duty.set(True)
-            start_ts = _now_ts()
-            await self.config.member(target).duty_start.set(start_ts)
-            await self.config.member(target).duty_status.set("available")
-            await self.config.member(target).duty_status_message.set(None)
-            current_sessions = await self.config.member(target).duty_session_count() or 0
-            await self.config.member(target).duty_session_count.set(current_sessions + 1)
-            await self.config.member(target).duty_break_count.set(0)
-            await self.config.member(target).duty_total_break_time.set(0)
-            await self.config.member(target).current_break_start.set(None)
-            ok = await self.update_duty_role(target, True)
-            if not ok:
-                # Rollback
-                await self.config.member(target).on_duty.set(False)
-                await self.config.member(target).duty_start.set(None)
-                await self.config.member(target).duty_status.set("off_duty")
-                await self.config.member(target).duty_session_count.set(current_sessions)
-                await ctx.send("❌ Konnte Duty-Rolle für den Ziel-User nicht zuweisen. Übergabe abgebrochen.")
-                return
-
-        # Refresh panels
-        await self.update_panel_display(guild)
-        await self.update_status_display(guild)
-
-        # Log
-        log_channel = await self.get_log_channel(guild)
-        if log_channel:
-            try:
-                embed = discord.Embed(
-                    title="🔄 Duty übergeben",
-                    description=f"{member.mention} hat Duty an {target.mention} übergeben.",
-                    color=discord.Color.gold(),
-                    timestamp=_now(),
-                )
-                embed.add_field(name="👤 Von", value=member.display_name, inline=True)
-                embed.add_field(name="👤 An", value=target.display_name, inline=True)
-                await log_channel.send(embed=embed)
-            except discord.HTTPException:
-                pass
-
-        await ctx.send(f"✅ Duty von {member.mention} an {target.mention} übergeben.")
-
-    # ============================================
     # SUPPORT BLOCKLIST
     # ============================================
 
@@ -5387,11 +5301,97 @@ class SupportCog(commands.Cog):
         """
         member = ctx.author
         await self.config.member(member).duty_status_message.set(None)
-        
+
         guild = ctx.guild
         await self.update_status_display(guild)
-        
+
         await ctx.send("✅ Deine Status-Nachricht wurde gelöscht.")
+
+    # ============================================
+    # DUTY HANDOVER
+    # ============================================
+
+    @duty_group.command(name="handover", aliases=["transfer"])
+    async def duty_handover(self, ctx: commands.Context, target: discord.Member):
+        """Übergibt deinen aktiven Duty an einen anderen Teamkollegen.
+
+        Du wirst vom Duty abgemeldet, der Ziel-User wird angemeldet.
+        Der Ziel-User muss die Support-Basisrolle haben.
+        """
+        guild = ctx.guild
+        member = ctx.author
+
+        if target.id == member.id:
+            await ctx.send("❌ Du kannst Duty nicht an dich selbst übergeben.")
+            return
+        if target.bot:
+            await ctx.send("❌ Du kannst Duty nicht an einen Bot übergeben.")
+            return
+
+        role_id = await self.config.guild(guild).role()
+        if not role_id:
+            await ctx.send("❌ Keine Support-Rolle konfiguriert.")
+            return
+        if target.get_role(role_id) is None:
+            await ctx.send(f"❌ {target.mention} hat nicht die Support-Basisrolle.")
+            return
+
+        is_on_duty = await self.config.member(member).on_duty()
+        if not is_on_duty:
+            await ctx.send("❌ Du bist aktuell nicht im Duty.")
+            return
+        target_on_duty = await self.config.member(target).on_duty()
+        if target_on_duty:
+            await ctx.send(f"❌ {target.mention} ist bereits im Duty.")
+            return
+
+        # Sender abmelden (mit _finalize_duty_stop für saubere Statistik)
+        async with self._lock_for(guild.id, member.id):
+            await self._finalize_duty_stop(member, whitelist=False, reason=f"Duty übergeben an {target.display_name}")
+
+        # Ziel anmelden
+        async with self._lock_for(guild.id, target.id):
+            await self.config.member(target).on_duty.set(True)
+            start_ts = _now_ts()
+            await self.config.member(target).duty_start.set(start_ts)
+            await self.config.member(target).duty_status.set("available")
+            await self.config.member(target).duty_status_message.set(None)
+            current_sessions = await self.config.member(target).duty_session_count() or 0
+            await self.config.member(target).duty_session_count.set(current_sessions + 1)
+            await self.config.member(target).duty_break_count.set(0)
+            await self.config.member(target).duty_total_break_time.set(0)
+            await self.config.member(target).current_break_start.set(None)
+            ok = await self.update_duty_role(target, True)
+            if not ok:
+                # Rollback
+                await self.config.member(target).on_duty.set(False)
+                await self.config.member(target).duty_start.set(None)
+                await self.config.member(target).duty_status.set("off_duty")
+                await self.config.member(target).duty_session_count.set(current_sessions)
+                await ctx.send("❌ Konnte Duty-Rolle für den Ziel-User nicht zuweisen. Übergabe abgebrochen.")
+                return
+
+        # Refresh panels
+        await self.update_panel_display(guild)
+        await self.update_status_display(guild)
+
+        # Log
+        log_channel = await self.get_log_channel(guild)
+        if log_channel:
+            try:
+                embed = discord.Embed(
+                    title="🔄 Duty übergeben",
+                    description=f"{member.mention} hat Duty an {target.mention} übergeben.",
+                    color=discord.Color.gold(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="👤 Von", value=member.display_name, inline=True)
+                embed.add_field(name="👤 An", value=target.display_name, inline=True)
+                await log_channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+        await ctx.send(f"✅ Duty von {member.mention} an {target.mention} übergeben.")
 
     @commands.command(name="dutylist", aliases=["activestaff"])
     async def dutylist(self, ctx: commands.Context):
