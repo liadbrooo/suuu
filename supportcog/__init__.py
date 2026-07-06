@@ -6401,24 +6401,17 @@ class SupportCog(commands.Cog):
         await ctx.send(embed=embed_obj)
 
     def _build_custom_embed(self, data: dict) -> discord.Embed:
-        """Baut ein Discord Embed aus den gespeicherten Daten."""
-        # Farbe: Name oder Hex-Code
-        color_name = data.get("color", "blurple").strip().lower()
+        """Baut ein Discord Embed aus den gespeicherten Daten (alle Eigenschaften)."""
+        color_name = (data.get("color") or "blurple").strip().lower()
         color_map = {
-            "blurple": discord.Color.blurple(),
-            "red": discord.Color.red(),
-            "green": discord.Color.green(),
-            "yellow": discord.Color.gold(),
-            "orange": discord.Color.orange(),
-            "purple": discord.Color.purple(),
-            "grey": discord.Color.greyple(),
-            "dark_blue": discord.Color.dark_blue(),
-            "dark_green": discord.Color.dark_green(),
-            "dark_red": discord.Color.dark_red(),
+            "blurple": discord.Color.blurple(), "red": discord.Color.red(),
+            "green": discord.Color.green(), "yellow": discord.Color.gold(),
+            "orange": discord.Color.orange(), "purple": discord.Color.purple(),
+            "grey": discord.Color.greyple(), "dark_blue": discord.Color.dark_blue(),
+            "dark_green": discord.Color.dark_green(), "dark_red": discord.Color.dark_red(),
             "random": discord.Color.random(),
         }
         if color_name.startswith("#") or (len(color_name) == 6 and all(c in "0123456789abcdef" for c in color_name)):
-            # Hex-Code
             try:
                 color = discord.Color(int(color_name.lstrip("#"), 16))
             except (ValueError, TypeError):
@@ -6433,17 +6426,29 @@ class SupportCog(commands.Cog):
             color=color,
             timestamp=_now(),
         )
+        # Author (Name + Icon + URL)
+        author_name = data.get("author_name")
+        if author_name:
+            embed.set_author(
+                name=author_name[:256],
+                icon_url=data.get("author_icon") or None,
+                url=data.get("author_url") or None,
+            )
+        # Fields
         for i in range(1, 4):
             fname = data.get(f"field{i}_name")
             fvalue = data.get(f"field{i}_value")
             if fname and fvalue:
                 embed.add_field(name=fname[:256], value=fvalue[:1024], inline=False)
+        # Footer (Text + Icon)
         footer = data.get("footer")
         if footer:
-            embed.set_footer(text=footer[:2048])
+            embed.set_footer(text=footer[:2048], icon_url=data.get("footer_icon") or None)
+        # Image (groß unten)
         image_url = data.get("image")
         if image_url:
             embed.set_image(url=image_url)
+        # Thumbnail (klein oben rechts)
         thumbnail_url = data.get("thumbnail")
         if thumbnail_url:
             embed.set_thumbnail(url=thumbnail_url)
@@ -15091,10 +15096,10 @@ class EmbedBuilderStartView(discord.ui.View):
 
 
 class EmbedBuilderMainModal(discord.ui.Modal):
-    """Haupt-Modal (Teil 1): Titel, Beschreibung, Farbe, Footer, Field 1."""
+    """Modal 1/3: Titel, Beschreibung, Farbe, Footer-Text, Author-Name."""
 
     def __init__(self, cog, key: str, existing_data: dict = None, send_channel=None, force_send=False):
-        title_str = f"📝 Embed: {key}" if existing_data else f"🆕 Embed: {key}"
+        title_str = f"1/3 Embed: {key}"
         if len(title_str) > 45:
             title_str = title_str[:45]
         super().__init__(title=title_str, timeout=600)
@@ -15108,57 +15113,40 @@ class EmbedBuilderMainModal(discord.ui.Modal):
             return val if val else None
 
         self.title_input = discord.ui.TextInput(
-            label="Titel",
-            placeholder="Titel des Embeds...",
-            required=False,
-            max_length=256,
-            default=sd(self.existing_data.get("title")),
-            custom_id="embed_title",
+            label="Titel", placeholder="Titel des Embeds...",
+            required=False, max_length=256,
+            default=sd(self.existing_data.get("title")), custom_id="eb_title",
         )
         self.add_item(self.title_input)
         self.description_input = discord.ui.TextInput(
             label="Beschreibung (Haupttext)",
             placeholder="Haupttext des Embeds...",
-            required=False,
-            max_length=1500,
+            required=False, max_length=1500,
             style=discord.TextStyle.paragraph,
-            default=sd(self.existing_data.get("description")),
-            custom_id="embed_desc",
+            default=sd(self.existing_data.get("description")), custom_id="eb_desc",
         )
         self.add_item(self.description_input)
         self.color_input = discord.ui.TextInput(
             label="Farbe (Name oder #Hex)",
-            placeholder="blurple, red, green, #ff0000, ...",
-            required=False,
-            max_length=20,
-            default=sd(self.existing_data.get("color")),
-            custom_id="embed_color",
+            placeholder="blurple, red, #ff0000, ...",
+            required=False, max_length=20,
+            default=sd(self.existing_data.get("color")), custom_id="eb_color",
         )
         self.add_item(self.color_input)
         self.footer_input = discord.ui.TextInput(
             label="Footer-Text (optional)",
             placeholder="Text unten im Embed...",
-            required=False,
-            max_length=500,
-            default=sd(self.existing_data.get("footer")),
-            custom_id="embed_footer",
+            required=False, max_length=500,
+            default=sd(self.existing_data.get("footer")), custom_id="eb_footer",
         )
         self.add_item(self.footer_input)
-        field1_default = None
-        f1n = self.existing_data.get("field1_name", "")
-        f1v = self.existing_data.get("field1_value", "")
-        if f1n or f1v:
-            field1_default = f"{f1n}|{f1v}"
-        self.field1_input = discord.ui.TextInput(
-            label="Field 1 (Name|Wert mit | trennen)",
-            placeholder="z.B. Regel 1|Kein Spam",
-            required=False,
-            max_length=1200,
-            style=discord.TextStyle.paragraph,
-            default=field1_default,
-            custom_id="embed_field1",
+        self.author_input = discord.ui.TextInput(
+            label="Author-Name (optional, oben im Embed)",
+            placeholder="z.B. Server-Team",
+            required=False, max_length=256,
+            default=sd(self.existing_data.get("author_name")), custom_id="eb_author",
         )
-        self.add_item(self.field1_input)
+        self.add_item(self.author_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -15167,32 +15155,19 @@ class EmbedBuilderMainModal(discord.ui.Modal):
             "description": self.description_input.value.strip() if self.description_input.value else "",
             "color": self.color_input.value.strip().lower() if self.color_input.value else "blurple",
             "footer": self.footer_input.value.strip() if self.footer_input.value else "",
+            "author_name": self.author_input.value.strip() if self.author_input.value else "",
         }
-        if self.field1_input.value and self.field1_input.value.strip():
-            parts = self.field1_input.value.strip().split("|", 1)
-            if len(parts) == 2:
-                data["field1_name"] = parts[0].strip()[:256]
-                data["field1_value"] = parts[1].strip()[:1024]
-            else:
-                data["field1_name"] = "Info"
-                data["field1_value"] = parts[0].strip()[:1024]
-        # Vorhandene Fields 2 & 3 beibehalten
-        for i in [2, 3]:
-            if self.existing_data.get(f"field{i}_name"):
-                data[f"field{i}_name"] = self.existing_data[f"field{i}_name"]
-            if self.existing_data.get(f"field{i}_value"):
-                data[f"field{i}_value"] = self.existing_data[f"field{i}_value"]
-        # Image/Thumbnail beibehalten
-        if self.existing_data.get("image"):
-            data["image"] = self.existing_data["image"]
-        if self.existing_data.get("thumbnail"):
-            data["thumbnail"] = self.existing_data["thumbnail"]
-        # Teil 2 Modal öffnen (Image + Thumbnail)
-        modal2 = EmbedBuilderExtraModal(self.cog, self.key, data, self.send_channel, self.force_send)
+        # Alle anderen Felder beibehalten
+        for k in ["image", "thumbnail", "footer_icon", "author_icon", "author_url",
+                   "field1_name", "field1_value", "field2_name", "field2_value",
+                   "field3_name", "field3_value"]:
+            if self.existing_data.get(k):
+                data[k] = self.existing_data[k]
+        # Modal 2 öffnen
+        modal2 = EmbedBuilderImagesModal(self.cog, self.key, data, self.send_channel, self.force_send)
         try:
             await interaction.followup.send_modal(modal2)
-        except (discord.HTTPException, Exception):
-            # Falls followup.send_modal nicht funktioniert, direkt speichern
+        except Exception:
             await self.cog._embed_builder_save_and_send(interaction, self.key, data, self.send_channel, self.force_send)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
@@ -15206,11 +15181,11 @@ class EmbedBuilderMainModal(discord.ui.Modal):
         log.exception("Fehler im EmbedBuilderMainModal", exc_info=error)
 
 
-class EmbedBuilderExtraModal(discord.ui.Modal):
-    """Zusatz-Modal (Teil 2): Image URL, Thumbnail URL."""
+class EmbedBuilderImagesModal(discord.ui.Modal):
+    """Modal 2/3: Bild URL, Thumbnail URL, Footer-Icon, Author-Icon, Field 1."""
 
     def __init__(self, cog, key: str, data: dict, send_channel=None, force_send=False):
-        title_str = f"🖼️ Extras: {key}"
+        title_str = f"2/3 Bilder: {key}"
         if len(title_str) > 45:
             title_str = title_str[:45]
         super().__init__(title=title_str, timeout=600)
@@ -15221,52 +15196,131 @@ class EmbedBuilderExtraModal(discord.ui.Modal):
         self.force_send = force_send
 
         self.image_input = discord.ui.TextInput(
-            label="Bild URL (optional)",
+            label="Bild URL (gross, unten im Embed)",
             placeholder="https://example.com/image.png",
-            required=False,
-            max_length=500,
+            required=False, max_length=500,
             default=data.get("image") if data.get("image") else None,
-            custom_id="embed_image",
+            custom_id="eb_image",
         )
         self.add_item(self.image_input)
         self.thumbnail_input = discord.ui.TextInput(
-            label="Thumbnail URL (kleines Bild oben rechts)",
+            label="Thumbnail URL (klein, oben rechts)",
             placeholder="https://example.com/thumb.png",
-            required=False,
-            max_length=500,
+            required=False, max_length=500,
             default=data.get("thumbnail") if data.get("thumbnail") else None,
-            custom_id="embed_thumb",
+            custom_id="eb_thumb",
         )
         self.add_item(self.thumbnail_input)
+        self.footer_icon_input = discord.ui.TextInput(
+            label="Footer-Icon URL (klein neben Footer)",
+            placeholder="https://example.com/icon.png",
+            required=False, max_length=500,
+            default=data.get("footer_icon") if data.get("footer_icon") else None,
+            custom_id="eb_ficon",
+        )
+        self.add_item(self.footer_icon_input)
+        self.author_icon_input = discord.ui.TextInput(
+            label="Author-Icon URL (Avatar neben Author)",
+            placeholder="https://example.com/avatar.png",
+            required=False, max_length=500,
+            default=data.get("author_icon") if data.get("author_icon") else None,
+            custom_id="eb_aicon",
+        )
+        self.add_item(self.author_icon_input)
+        field1_default = None
+        f1n = data.get("field1_name", "")
+        f1v = data.get("field1_value", "")
+        if f1n or f1v:
+            field1_default = f"{f1n}|{f1v}"
+        self.field1_input = discord.ui.TextInput(
+            label="Field 1 (Name|Wert mit | trennen)",
+            placeholder="z.B. Regel 1|Kein Spam",
+            required=False, max_length=1200,
+            style=discord.TextStyle.paragraph,
+            default=field1_default, custom_id="eb_f1",
+        )
+        self.add_item(self.field1_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if self.image_input.value and self.image_input.value.strip():
+            self.data["image"] = self.image_input.value.strip()
+        if self.thumbnail_input.value and self.thumbnail_input.value.strip():
+            self.data["thumbnail"] = self.thumbnail_input.value.strip()
+        if self.footer_icon_input.value and self.footer_icon_input.value.strip():
+            self.data["footer_icon"] = self.footer_icon_input.value.strip()
+        if self.author_icon_input.value and self.author_icon_input.value.strip():
+            self.data["author_icon"] = self.author_icon_input.value.strip()
+        # Field 1 parsen
+        if self.field1_input.value and self.field1_input.value.strip():
+            parts = self.field1_input.value.strip().split("|", 1)
+            if len(parts) == 2:
+                self.data["field1_name"] = parts[0].strip()[:256]
+                self.data["field1_value"] = parts[1].strip()[:1024]
+            else:
+                self.data["field1_name"] = "Info"
+                self.data["field1_value"] = parts[0].strip()[:1024]
+        # Modal 3 öffnen
+        modal3 = EmbedBuilderFieldsModal(self.cog, self.key, self.data, self.send_channel, self.force_send)
+        try:
+            await interaction.followup.send_modal(modal3)
+        except Exception:
+            await self.cog._embed_builder_save_and_send(interaction, self.key, self.data, self.send_channel, self.force_send)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+        log.exception("Fehler im EmbedBuilderImagesModal", exc_info=error)
+
+
+class EmbedBuilderFieldsModal(discord.ui.Modal):
+    """Modal 3/3: Field 2, Field 3."""
+
+    def __init__(self, cog, key: str, data: dict, send_channel=None, force_send=False):
+        title_str = f"3/3 Fields: {key}"
+        if len(title_str) > 45:
+            title_str = title_str[:45]
+        super().__init__(title=title_str, timeout=600)
+        self.cog = cog
+        self.key = key
+        self.data = data
+        self.send_channel = send_channel
+        self.force_send = force_send
+
+        field2_default = None
+        f2n = data.get("field2_name", "")
+        f2v = data.get("field2_value", "")
+        if f2n or f2v:
+            field2_default = f"{f2n}|{f2v}"
         self.field2_input = discord.ui.TextInput(
             label="Field 2 (Name|Wert mit | trennen)",
             placeholder="z.B. Regel 2|Sei freundlich",
-            required=False,
-            max_length=1200,
+            required=False, max_length=1200,
             style=discord.TextStyle.paragraph,
-            default=f"{data.get('field2_name', '')}|{data.get('field2_value', '')}" if data.get("field2_name") else None,
-            custom_id="embed_field2",
+            default=field2_default, custom_id="eb_f2",
         )
         self.add_item(self.field2_input)
+        field3_default = None
+        f3n = data.get("field3_name", "")
+        f3v = data.get("field3_value", "")
+        if f3n or f3v:
+            field3_default = f"{f3n}|{f3v}"
         self.field3_input = discord.ui.TextInput(
             label="Field 3 (Name|Wert mit | trennen)",
             placeholder="z.B. Regel 3|Kein Werbung",
-            required=False,
-            max_length=1200,
+            required=False, max_length=1200,
             style=discord.TextStyle.paragraph,
-            default=f"{data.get('field3_name', '')}|{data.get('field3_value', '')}" if data.get("field3_name") else None,
-            custom_id="embed_field3",
+            default=field3_default, custom_id="eb_f3",
         )
         self.add_item(self.field3_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        # Image/Thumbnail
-        if self.image_input.value and self.image_input.value.strip():
-            self.data["image"] = self.image_input.value.strip()
-        if self.thumbnail_input.value and self.thumbnail_input.value.strip():
-            self.data["thumbnail"] = self.thumbnail_input.value.strip()
-        # Field 2 & 3
         for field_input, field_num in [(self.field2_input, 2), (self.field3_input, 3)]:
             if field_input.value and field_input.value.strip():
                 parts = field_input.value.strip().split("|", 1)
@@ -15287,7 +15341,7 @@ class EmbedBuilderExtraModal(discord.ui.Modal):
                 await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
         except discord.HTTPException:
             pass
-        log.exception("Fehler im EmbedBuilderExtraModal", exc_info=error)
+        log.exception("Fehler im EmbedBuilderFieldsModal", exc_info=error)
 
 
 async def setup(bot: Red):
