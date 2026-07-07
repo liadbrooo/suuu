@@ -282,7 +282,37 @@ class SupportCog(commands.Cog):
             "ticket_survey_channel": None,  # Channel für Survey-Ergebnisse
             "ticket_survey_results": {},  # {ticket_num: {user_id, rating, ts}}
             # CUSTOM EMBED SYSTEM
-            "custom_embeds": {},  # {embed_key: {title, description, color, footer, image, thumbnail, field1_name, field1_value, field2_name, field2_value, message_id, channel_id}}
+            "custom_embeds": {},  # {embed_key: {...}}
+            # EXTENDED MODLOG
+            "modlog_enabled": False,
+            "modlog_channel": None,           # Haupt-Log-Channel (Fallback)
+            "modlog_member_channel": None,    # Member-Events (Join/Leave/Ban/etc)
+            "modlog_message_channel": None,   # Message-Events (Delete/Edit)
+            "modlog_voice_channel": None,     # Voice-Events
+            "modlog_role_channel": None,      # Rollen-Events
+            "modlog_channel_events_channel": None,  # Channel-Events (Create/Delete)
+            "modlog_events": {                # Toggle pro Event-Typ
+                "member_join": True,
+                "member_leave": True,
+                "member_ban": True,
+                "member_unban": True,
+                "member_kick": True,
+                "member_roles": True,
+                "member_nickname": True,
+                "member_timeout": True,
+                "message_delete": True,
+                "message_edit": True,
+                "channel_create": True,
+                "channel_delete": True,
+                "role_create": True,
+                "role_delete": True,
+                "role_update": True,
+                "voice_join": True,
+                "voice_leave": True,
+                "voice_move": True,
+                "guild_update": True,
+            },
+            "modlog_ignored_channels": [],    # Channel-IDs die nicht geloggt werden (z.B. Bot-Commands)
             "ticket_first_response_reminder_minutes": 0,  # 0 = deaktiviert, sonst: Reminder nach X Min wenn Team nicht reagiert
             "ticket_history": {},  # Runtime: {user_id: [{ticket_num, channel_name, category, opened_ts, closed_ts, closed_by, reason}]}
             "ticket_first_response_tracker": {},  # Runtime: {channel_id: {created_ts, first_response_ts, first_responder_id}}
@@ -1326,7 +1356,7 @@ class SupportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        """Hört auf Voice-Channel Änderungen und sendet Benachrichtigungen für Support UND Whitelist"""
+        """Hört auf Voice-Channel Änderungen: Support + Whitelist + Modlog"""
 
         # Ignoriere Bots
         if member.bot:
@@ -1335,6 +1365,19 @@ class SupportCog(commands.Cog):
         guild = member.guild
         if not guild:
             return
+
+        # Modlog: Voice Events
+        if before.channel is None and after.channel is not None:
+            log_embed = discord.Embed(title="🎤 Voice beigetreten", description=f"**{member.mention}**\n📍 {after.channel.mention}", color=discord.Color.green(), timestamp=_now())
+            await self._modlog_send(guild, "voice_join", log_embed)
+        elif before.channel is not None and after.channel is None:
+            log_embed = discord.Embed(title="🔇 Voice verlassen", description=f"**{member.mention}**\n📍 {before.channel.mention}", color=discord.Color.red(), timestamp=_now())
+            await self._modlog_send(guild, "voice_leave", log_embed)
+        elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+            log_embed = discord.Embed(title="🔄 Voice gewechselt", description=f"**{member.mention}**", color=discord.Color.blue(), timestamp=_now())
+            log_embed.add_field(name="Von", value=before.channel.mention, inline=True)
+            log_embed.add_field(name="Nach", value=after.channel.mention, inline=True)
+            await self._modlog_send(guild, "voice_move", log_embed)
 
         # Prüfen ob Cog für dieses Guild aktiviert ist
         enabled = await self.config.guild(guild).enabled()
@@ -6199,6 +6242,349 @@ class SupportCog(commands.Cog):
             except Exception:
                 log.exception("Schwerer Fehler im Ticket-Reminder-Loop")
             await asyncio.sleep(300)  # Alle 5 Minuten prüfen
+
+    # ============================================
+    # EXTENDED MODLOG
+    # ============================================
+
+    async def _modlog_get_channel(self, guild: discord.Guild, event_type: str) -> Optional[discord.TextChannel]:
+        """Ermittelt den richtigen Log-Channel für einen Event-Typ."""
+        if not await self.config.guild(guild).modlog_enabled():
+            return None
+        events = await self.config.guild(guild).modlog_events() or {}
+        if not events.get(event_type, True):
+            return None
+        # Spezifischen Channel pro Kategorie suchen
+        category_map = {
+            "member_join": "modlog_member_channel",
+            "member_leave": "modlog_member_channel",
+            "member_ban": "modlog_member_channel",
+            "member_unban": "modlog_member_channel",
+            "member_kick": "modlog_member_channel",
+            "member_roles": "modlog_member_channel",
+            "member_nickname": "modlog_member_channel",
+            "member_timeout": "modlog_member_channel",
+            "message_delete": "modlog_message_channel",
+            "message_edit": "modlog_message_channel",
+            "channel_create": "modlog_channel_events_channel",
+            "channel_delete": "modlog_channel_events_channel",
+            "role_create": "modlog_role_channel",
+            "role_delete": "modlog_role_channel",
+            "role_update": "modlog_role_channel",
+            "voice_join": "modlog_voice_channel",
+            "voice_leave": "modlog_voice_channel",
+            "voice_move": "modlog_voice_channel",
+            "guild_update": "modlog_channel",
+        }
+        config_key = category_map.get(event_type, "modlog_channel")
+        ch_id = await self.config.guild(guild).get_attr(config_key)()
+        if ch_id:
+            ch = guild.get_channel(ch_id)
+            if ch:
+                return ch
+        # Fallback auf Haupt-Channel
+        main_id = await self.config.guild(guild).modlog_channel()
+        if main_id:
+            return guild.get_channel(main_id)
+        return None
+
+    async def _modlog_send(self, guild: discord.Guild, event_type: str, embed: discord.Embed):
+        """Sendet einen Log-Eintrag in den richtigen Channel."""
+        ch = await self._modlog_get_channel(guild, event_type)
+        if ch is None:
+            return
+        try:
+            await ch.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def _modlog_is_ignored(self, guild: discord.Guild, channel_id: int) -> bool:
+        """Prüft ob ein Channel ignoriert werden soll."""
+        ignored = await self.config.guild(guild).modlog_ignored_channels() or []
+        return channel_id in ignored
+
+    @commands.group(name="modlogset", aliases=["mlset", "modlogconfig"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def modlog_set(self, ctx: commands.Context):
+        """Konfiguriert das Extended Modlog System."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @modlog_set.command(name="toggle")
+    async def modlog_set_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert das Modlog System."""
+        current = await self.config.guild(ctx.guild).modlog_enabled()
+        await self.config.guild(ctx.guild).modlog_enabled.set(not current)
+        status = "✅ aktiviert" if not current else "❌ deaktiviert"
+        await ctx.send(f"📋 Extended Modlog ist jetzt **{status}**.")
+
+    @modlog_set.command(name="channel")
+    async def modlog_set_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Haupt-Log-Channel (Fallback für alle Events)."""
+        if channel is None:
+            await self.config.guild(ctx.guild).modlog_channel.set(None)
+            await ctx.send("✅ Haupt-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).modlog_channel.set(channel.id)
+        await ctx.send(f"✅ Haupt-Log-Channel gesetzt auf {channel.mention}.")
+
+    @modlog_set.command(name="memberchannel")
+    async def modlog_set_memberchannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Member-Events (Join/Leave/Ban/etc)."""
+        if channel is None:
+            await self.config.guild(ctx.guild).modlog_member_channel.set(None)
+            await ctx.send("✅ Member-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).modlog_member_channel.set(channel.id)
+        await ctx.send(f"✅ Member-Log-Channel gesetzt auf {channel.mention}.")
+
+    @modlog_set.command(name="messagechannel")
+    async def modlog_set_messagechannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Message-Events (Delete/Edit)."""
+        if channel is None:
+            await self.config.guild(ctx.guild).modlog_message_channel.set(None)
+            await ctx.send("✅ Message-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).modlog_message_channel.set(channel.id)
+        await ctx.send(f"✅ Message-Log-Channel gesetzt auf {channel.mention}.")
+
+    @modlog_set.command(name="voicechannel")
+    async def modlog_set_voicechannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Voice-Events."""
+        if channel is None:
+            await self.config.guild(ctx.guild).modlog_voice_channel.set(None)
+            await ctx.send("✅ Voice-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).modlog_voice_channel.set(channel.id)
+        await ctx.send(f"✅ Voice-Log-Channel gesetzt auf {channel.mention}.")
+
+    @modlog_set.command(name="rolechannel")
+    async def modlog_set_rolechannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Rollen-Events."""
+        if channel is None:
+            await self.config.guild(ctx.guild).modlog_role_channel.set(None)
+            await ctx.send("✅ Rollen-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).modlog_role_channel.set(channel.id)
+        await ctx.send(f"✅ Rollen-Log-Channel gesetzt auf {channel.mention}.")
+
+    @modlog_set.command(name="channelchannel")
+    async def modlog_set_channelchannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Channel-Events (Create/Delete)."""
+        if channel is None:
+            await self.config.guild(ctx.guild).modlog_channel_events_channel.set(None)
+            await ctx.send("✅ Channel-Events-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).modlog_channel_events_channel.set(channel.id)
+        await ctx.send(f"✅ Channel-Events-Log-Channel gesetzt auf {channel.mention}.")
+
+    @modlog_set.command(name="event")
+    async def modlog_set_event(self, ctx: commands.Context, event_name: str = None):
+        """Schaltet einen bestimmten Event-Typ an/aus.
+        Verfügbare Events: member_join, member_leave, member_ban, member_unban, member_kick,
+        member_roles, member_nickname, member_timeout, message_delete, message_edit,
+        channel_create, channel_delete, role_create, role_delete, role_update,
+        voice_join, voice_leave, voice_move, guild_update
+        Ohne Angabe werden alle Events angezeigt."""
+        events = await self.config.guild(ctx.guild).modlog_events() or {}
+        if event_name is None:
+            embed = discord.Embed(
+                title="📋 Modlog Events",
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            event_names_de = {
+                "member_join": "Mitglied beigetreten", "member_leave": "Mitglied verlassen",
+                "member_ban": "Mitglied gebannt", "member_unban": "Mitglied entbannt",
+                "member_kick": "Mitglied gekickt", "member_roles": "Rollen-Änderung",
+                "member_nickname": "Nickname-Änderung", "member_timeout": "Timeout-Änderung",
+                "message_delete": "Nachricht gelöscht", "message_edit": "Nachricht bearbeitet",
+                "channel_create": "Channel erstellt", "channel_delete": "Channel gelöscht",
+                "role_create": "Rolle erstellt", "role_delete": "Rolle gelöscht",
+                "role_update": "Rolle bearbeitet", "voice_join": "Voice beigetreten",
+                "voice_leave": "Voice verlassen", "voice_move": "Voice gewechselt",
+                "guild_update": "Server aktualisiert",
+            }
+            lines = []
+            for evt, enabled in sorted(events.items()):
+                de_name = event_names_de.get(evt, evt)
+                status = "✅" if enabled else "❌"
+                lines.append(f"{status} `{evt}` — {de_name}")
+            embed.description = "\n".join(lines)
+            embed.set_footer(text="Umschalten mit: [p]modlogset event <name>")
+            await ctx.send(embed=embed)
+            return
+        event_name = event_name.lower().strip()
+        if event_name not in events:
+            await ctx.send(f"❌ Unbekanntes Event: `{event_name}`. Verfügbare Events siehe `[p]modlogset event`.")
+            return
+        events[event_name] = not events[event_name]
+        await self.config.guild(ctx.guild).modlog_events.set(events)
+        status = "✅ aktiviert" if events[event_name] else "❌ deaktiviert"
+        await ctx.send(f"📋 Event `{event_name}` ist jetzt **{status}**.")
+
+    @modlog_set.command(name="ignore")
+    async def modlog_set_ignore(self, ctx: commands.Context, action: str, channel: discord.TextChannel):
+        """Ignoriert einen Channel im Message-Log (z.B. Bot-Commands).
+        `add` oder `remove` als Aktion."""
+        ignored = await self.config.guild(ctx.guild).modlog_ignored_channels() or []
+        if action.lower() == "add":
+            if channel.id not in ignored:
+                ignored.append(channel.id)
+            await self.config.guild(ctx.guild).modlog_ignored_channels.set(ignored)
+            await ctx.send(f"✅ {channel.mention} wird im Modlog ignoriert.")
+        elif action.lower() == "remove":
+            if channel.id in ignored:
+                ignored.remove(channel.id)
+            await self.config.guild(ctx.guild).modlog_ignored_channels.set(ignored)
+            await ctx.send(f"✅ {channel.mention} wird wieder geloggt.")
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
+
+    @modlog_set.command(name="show")
+    async def modlog_set_show(self, ctx: commands.Context):
+        """Zeigt die aktuelle Modlog-Konfiguration."""
+        g = self.config.guild(ctx.guild)
+        embed = discord.Embed(title="📋 Extended Modlog Konfiguration", color=discord.Color.blurple(), timestamp=_now())
+        embed.add_field(name="Aktiviert", value="✅" if await g.modlog_enabled() else "❌", inline=True)
+        main_ch = await g.modlog_channel()
+        embed.add_field(name="Haupt-Channel", value=ctx.guild.get_channel(main_ch).mention if main_ch else "❌", inline=True)
+        member_ch = await g.modlog_member_channel()
+        embed.add_field(name="Member-Channel", value=ctx.guild.get_channel(member_ch).mention if member_ch else "❌", inline=True)
+        msg_ch = await g.modlog_message_channel()
+        embed.add_field(name="Message-Channel", value=ctx.guild.get_channel(msg_ch).mention if msg_ch else "❌", inline=True)
+        voice_ch = await g.modlog_voice_channel()
+        embed.add_field(name="Voice-Channel", value=ctx.guild.get_channel(voice_ch).mention if voice_ch else "❌", inline=True)
+        role_ch = await g.modlog_role_channel()
+        embed.add_field(name="Rollen-Channel", value=ctx.guild.get_channel(role_ch).mention if role_ch else "❌", inline=True)
+        ch_ch = await g.modlog_channel_events_channel()
+        embed.add_field(name="Channel-Events", value=ctx.guild.get_channel(ch_ch).mention if ch_ch else "❌", inline=True)
+        ignored = await g.modlog_ignored_channels() or []
+        embed.add_field(name="Ignorierte Channels", value=str(len(ignored)), inline=True)
+        events = await g.modlog_events() or {}
+        active_count = sum(1 for v in events.values() if v)
+        embed.add_field(name="Aktive Events", value=f"{active_count}/{len(events)}", inline=True)
+        embed.set_footer(text=f"Modlog • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    # --- MODLOG: Neue Listener (keine Konflikte) ---
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """Log: Mitglied beigetreten."""
+        embed = discord.Embed(
+            title="📥 Mitglied beigetreten",
+            description=f"{member.mention} ({member})\n`{member.id}`",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="Account erstellt", value=_fmt_berlin_full(member.created_at), inline=True)
+        embed.set_footer(text=f"Mitglieder: {member.guild.member_count}")
+        await self._modlog_send(member.guild, "member_join", embed)
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message: discord.Message):
+        """Log: Nachricht gelöscht."""
+        if not message.guild or message.author.bot:
+            return
+        if await self._modlog_is_ignored(message.guild, message.channel.id):
+            return
+        embed = discord.Embed(
+            title="🗑️ Nachricht gelöscht",
+            description=f"**Channel:** {message.channel.mention}\n**Autor:** {message.author.mention} (`{message.author.id}`)",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Inhalt", value=(message.content or "(kein Text)")[:1024], inline=False)
+        if message.attachments:
+            embed.add_field(name="Anhänge", value=str(len(message.attachments)), inline=True)
+        embed.set_footer(text=f"Message-ID: {message.id}")
+        await self._modlog_send(message.guild, "message_delete", embed)
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """Log: Nachricht bearbeitet."""
+        if not before.guild or before.author.bot or before.content == after.content:
+            return
+        if await self._modlog_is_ignored(before.guild, before.channel.id):
+            return
+        embed = discord.Embed(
+            title="✏️ Nachricht bearbeitet",
+            description=f"**Channel:** {before.channel.mention}\n**Autor:** {before.author.mention}",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Vorher", value=(before.content or "(leer)")[:1024], inline=False)
+        embed.add_field(name="Nachher", value=(after.content or "(leer)")[:1024], inline=False)
+        embed.set_footer(text=f"[Klick]({after.jump_url})")
+        await self._modlog_send(before.guild, "message_edit", embed)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        """Log: Channel erstellt."""
+        moderator = None
+        try:
+            async for entry in channel.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_create):
+                if entry.target and entry.target.id == channel.id:
+                    moderator = entry.user
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        ch_type_de = {"text": "Text-Channel", "voice": "Sprach-Channel", "category": "Kategorie"}.get(str(channel.type), str(channel.type))
+        embed = discord.Embed(title="➕ Channel erstellt", description=f"**{ch_type_de}:** `{channel.name}`", color=discord.Color.green(), timestamp=_now())
+        if moderator:
+            embed.add_field(name="Von", value=moderator.mention, inline=True)
+        await self._modlog_send(channel.guild, "channel_create", embed)
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role: discord.Role):
+        """Log: Rolle erstellt."""
+        moderator = None
+        try:
+            async for entry in role.guild.audit_logs(limit=5, action=discord.AuditLogAction.role_create):
+                if entry.target and entry.target.id == role.id:
+                    moderator = entry.user
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        embed = discord.Embed(title="➕ Rolle erstellt", description=f"**Rolle:** {role.mention}", color=discord.Color.green(), timestamp=_now())
+        if moderator:
+            embed.add_field(name="Von", value=moderator.mention, inline=True)
+        await self._modlog_send(role.guild, "role_create", embed)
+
+    @commands.Cog.listener()
+    async def on_guild_role_update(self, before: discord.Role, after: discord.Role):
+        """Log: Rolle bearbeitet."""
+        changes = []
+        if before.name != after.name:
+            changes.append(f"**Name:** `{before.name}` → `{after.name}`")
+        if before.color != after.color:
+            changes.append(f"**Farbe:** `{before.color}` → `{after.color}`")
+        if before.permissions != after.permissions:
+            changes.append("**Berechtigungen** geändert")
+        if before.mentionable != after.mentionable:
+            changes.append(f"**Erwähnbar:** {before.mentionable} → {after.mentionable}")
+        if not changes:
+            return
+        embed = discord.Embed(title="✏️ Rolle bearbeitet", description=f"**Rolle:** {after.mention}\n" + "\n".join(changes), color=discord.Color.orange(), timestamp=_now())
+        await self._modlog_send(after.guild, "role_update", embed)
+
+    @commands.Cog.listener()
+    async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
+        """Log: Server-Einstellungen geändert."""
+        changes = []
+        if before.name != after.name:
+            changes.append(f"**Name:** `{before.name}` → `{after.name}`")
+        if before.verification_level != after.verification_level:
+            changes.append(f"**Verifizierung:** `{before.verification_level}` → `{after.verification_level}`")
+        if before.premium_tier != after.premium_tier:
+            changes.append(f"**Boost-Level:** {before.premium_tier} → {after.premium_tier}")
+        if not changes:
+            return
+        embed = discord.Embed(title="⚙️ Server aktualisiert", description="\n".join(changes), color=discord.Color.gold(), timestamp=_now())
+        await self._modlog_send(after, "guild_update", embed)
 
     # ============================================
     # CUSTOM EMBED BUILDER & EDITOR
@@ -11092,39 +11478,53 @@ class SupportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.User):
-        """Wird gefeuert wenn ein User gebannt wird — synchronisiert an andere Guilds."""
-        # Anti-Nuke Tracking (immer, wenn enabled)
+        """Wird gefeuert wenn ein User gebannt wird — synchronisiert + loggt."""
+        # Anti-Nuke Tracking
         await self._antinuke_track(guild, "ban")
+        # Modlog
+        reason = "Kein Grund angegeben"
+        moderator = None
+        try:
+            async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
+                if entry.target and entry.target.id == user.id:
+                    reason = entry.reason or reason
+                    moderator = entry.user
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        log_embed = discord.Embed(title="🔨 Mitglied gebannt", description=f"**{user}** (`{user.id}`)", color=discord.Color.dark_red(), timestamp=_now())
+        log_embed.add_field(name="Grund", value=reason[:500], inline=False)
+        if moderator:
+            log_embed.add_field(name="Von", value=f"{moderator.mention}", inline=True)
+        log_embed.set_thumbnail(url=user.display_avatar.url)
+        await self._modlog_send(guild, "member_ban", log_embed)
         # Sync
         if not await self._sync_should_propagate_from(guild):
             return
-        # Vermeide Rekursion: wenn die Aktion vor kurzem durch Sync getriggert wurde, skip
-        # Der propagate-Aufruf markiert den Key auf der ZIEL-Guild. Auf der QUELL-Guild gibt
-        # es keinen Key (weil die Original-Aktion vom User kam, nicht vom Sync). Hier prüfen
-        # wir trotzdem: falls diese Guild selbst vor kurzem Ziel eines Sync-Banns war, skip.
-        # Das ist wichtig für bidirektionale Sync-Setups.
         key = self._sync_action_key("ban", user.id, guild.id)
         if await self._sync_was_recent(guild, key):
             return
-        # Reason aus Audit Log holen falls aktiviert
-        reason = "Kein Grund verfügbar"
-        if await self.config.guild(guild).sync_audit_log():
-            try:
-                async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
-                    if entry.target and entry.target.id == user.id:
-                        reason = entry.reason or "Kein Grund angegeben"
-                        break
-            except (discord.Forbidden, discord.HTTPException):
-                pass
         await self._sync_propagate_ban(guild, user, reason)
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild: discord.Guild, user: discord.User):
-        """Wird gefeuert wenn ein User entbannt wird — synchronisiert an andere Guilds."""
-        # Anti-Nuke: unban nicht limitiert, nur Sync
+        """Wird gefeuert wenn ein User entbannt wird — synchronisiert + loggt."""
+        # Modlog
+        moderator = None
+        try:
+            async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.unban):
+                if entry.target and entry.target.id == user.id:
+                    moderator = entry.user
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        log_embed = discord.Embed(title="🔓 Mitglied entbannt", description=f"**{user}** (`{user.id}`)", color=discord.Color.green(), timestamp=_now())
+        if moderator:
+            log_embed.add_field(name="Von", value=moderator.mention, inline=True)
+        await self._modlog_send(guild, "member_unban", log_embed)
+        # Sync
         if not await self._sync_should_propagate_from(guild):
             return
-        # Rekursion verhindern (bidirektionaler Modus)
         key = self._sync_action_key("unban", user.id, guild.id)
         if await self._sync_was_recent(guild, key):
             return
@@ -11132,18 +11532,39 @@ class SupportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
-        """Erkennt Timeout-Änderungen und Rollen-Änderungen (für Auto-Role-Sync)."""
-        # Timeout-Erkennung
+        """Erkennt Timeout-Änderungen, Rollen-Änderungen, Nickname-Änderung (Sync + Modlog)."""
+        # Modlog: Nickname-Änderung
+        if before.nick != after.nick:
+            log_embed = discord.Embed(title="✏️ Nickname geändert", description=f"**{after.mention}** (`{after.id}`)", color=discord.Color.blurple(), timestamp=_now())
+            log_embed.add_field(name="Vorher", value=before.nick or "Keiner", inline=True)
+            log_embed.add_field(name="Nachher", value=after.nick or "Keiner", inline=True)
+            await self._modlog_send(after.guild, "member_nickname", log_embed)
+        # Modlog: Rollen-Änderung
+        before_roles_set = set(r.id for r in before.roles)
+        after_roles_set = set(r.id for r in after.roles)
+        added_roles = after_roles_set - before_roles_set
+        removed_roles = before_roles_set - after_roles_set
+        if added_roles or removed_roles:
+            log_embed = discord.Embed(title="🎭 Rollen geändert", description=f"**{after.mention}** (`{after.id}`)", color=discord.Color.blue(), timestamp=_now())
+            if added_roles:
+                log_embed.add_field(name="Hinzugefügt", value="\n".join(f"+ {after.guild.get_role(r).mention}" for r in added_roles if after.guild.get_role(r)) or "Keine", inline=False)
+            if removed_roles:
+                log_embed.add_field(name="Entfernt", value="\n".join(f"- {before.guild.get_role(r).mention}" for r in removed_roles if before.guild.get_role(r)) or "Keine", inline=False)
+            await self._modlog_send(after.guild, "member_roles", log_embed)
+        # Modlog: Timeout-Änderung
         before_timeout = getattr(before, "timed_out_until", None)
         after_timeout = getattr(after, "timed_out_until", None)
         if before_timeout != after_timeout:
-            # Timeout wurde geändert
+            log_embed = discord.Embed(title="⏱️ Timeout geändert", description=f"**{after.mention}** (`{after.id}`)", color=discord.Color.orange(), timestamp=_now())
+            log_embed.add_field(name="Vorher", value=_fmt_berlin_full(before_timeout) if before_timeout else "Kein Timeout", inline=True)
+            log_embed.add_field(name="Nachher", value=_fmt_berlin_full(after_timeout) if after_timeout else "Kein Timeout", inline=True)
+            await self._modlog_send(after.guild, "member_timeout", log_embed)
+        # Sync: Timeout
+        if before_timeout != after_timeout:
             if after_timeout is not None and (after_timeout.replace(tzinfo=timezone.utc) if after_timeout.tzinfo is None else after_timeout) > _now():
-                # Neuer/verlängerter Timeout
                 if await self._sync_should_propagate_from(before.guild):
                     if await self.config.guild(before.guild).sync_timeouts():
                         reason = "Timeout (via Member Update)"
-                        # Audit Log für Reason
                         if await self.config.guild(before.guild).sync_audit_log():
                             try:
                                 async for entry in before.guild.audit_logs(limit=5, action=discord.AuditLogAction.member_update):
@@ -11154,12 +11575,10 @@ class SupportCog(commands.Cog):
                                 pass
                         await self._sync_propagate_timeout(before.guild, after, after_timeout, reason)
             elif after_timeout is None or (after_timeout.replace(tzinfo=timezone.utc) if after_timeout.tzinfo is None else after_timeout) <= _now():
-                # Timeout aufgehoben
                 if await self._sync_should_propagate_from(before.guild):
                     if await self.config.guild(before.guild).sync_timeouts():
                         await self._sync_propagate_timeout(before.guild, after, None, "Timeout aufgehoben")
-
-        # Auto-Role-Sync
+        # Sync: Auto-Role-Sync
         if not await self.config.guild(before.guild).sync_role_sync_enabled():
             return
         if not await self._sync_should_propagate_from(before.guild):
@@ -11203,8 +11622,26 @@ class SupportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
-        """Erkennt Kicks (via Audit Log) und synchronisiert + schließt offene Tickets des Users."""
+        """Erkennt Kicks, synchronisiert, schließt Tickets + loggt."""
         await self._antinuke_track(member.guild, "kick")
+        # Modlog: Mitglied verlassen
+        log_embed = discord.Embed(title="📤 Mitglied verlassen", description=f"{member.mention} ({member})\n`{member.id}`", color=discord.Color.orange(), timestamp=_now())
+        if member.joined_at:
+            log_embed.add_field(name="Beigetreten", value=_fmt_berlin_full(member.joined_at), inline=True)
+        log_embed.set_footer(text=f"Mitglieder: {member.guild.member_count}")
+        await self._modlog_send(member.guild, "member_leave", log_embed)
+        # Modlog: Kick-Erkennung
+        try:
+            async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
+                if entry.target and entry.target.id == member.id:
+                    if entry.created_at and (_now() - entry.created_at.replace(tzinfo=timezone.utc)).total_seconds() < 10:
+                        kick_embed = discord.Embed(title="👢 Mitglied gekickt", description=f"**{member}** (`{member.id}`)", color=discord.Color.red(), timestamp=_now())
+                        kick_embed.add_field(name="Von", value=entry.user.mention if entry.user else "Unbekannt", inline=True)
+                        kick_embed.add_field(name="Grund", value=entry.reason or "Kein Grund", inline=False)
+                        await self._modlog_send(member.guild, "member_kick", kick_embed)
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         # Ticket-Auto-Close wenn User die Guild verlässt
         try:
             active = await self.config.guild(member.guild).ticket_active() or {}
@@ -11305,13 +11742,39 @@ class SupportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
-        """Anti-Nuke: Channel-Löschungen tracken."""
+        """Anti-Nuke + Modlog: Channel-Löschungen."""
         await self._antinuke_track(channel.guild, "channel_delete")
+        moderator = None
+        try:
+            async for entry in channel.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_delete):
+                if entry.target and entry.target.id == channel.id:
+                    moderator = entry.user
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        ch_type_de = {"text": "Text-Channel", "voice": "Sprach-Channel", "category": "Kategorie"}.get(str(channel.type), str(channel.type))
+        log_embed = discord.Embed(title="➖ Channel gelöscht", description=f"**{ch_type_de}:** `{channel.name}`", color=discord.Color.red(), timestamp=_now())
+        if moderator:
+            log_embed.add_field(name="Von", value=moderator.mention, inline=True)
+        await self._modlog_send(channel.guild, "channel_delete", log_embed)
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role):
-        """Anti-Nuke: Rollen-Löschungen tracken."""
+        """Anti-Nuke + Modlog: Rollen-Löschungen."""
         await self._antinuke_track(role.guild, "role_delete")
+        moderator = None
+        try:
+            async for entry in role.guild.audit_logs(limit=5, action=discord.AuditLogAction.role_delete):
+                if entry.target and entry.target.id == role.id:
+                    moderator = entry.user
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        log_embed = discord.Embed(title="➖ Rolle gelöscht", description=f"**Rolle:** `{role.name}`", color=discord.Color.red(), timestamp=_now())
+        log_embed.add_field(name="Mitglieder", value=str(len(role.members)), inline=True)
+        if moderator:
+            log_embed.add_field(name="Von", value=moderator.mention, inline=True)
+        await self._modlog_send(role.guild, "role_delete", log_embed)
 
     # --- AUTO-ROLE-SYNC HELPER ---
 
