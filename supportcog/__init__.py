@@ -286,7 +286,8 @@ class SupportCog(commands.Cog):
             # EXTENDED MODLOG
             "modlog_enabled": False,
             "modlog_channel": None,           # Haupt-Log-Channel (Fallback)
-            "modlog_member_channel": None,    # Member-Events (Join/Leave/Ban/etc)
+            "modlog_member_channel": None,    # Member-Events (Join/Leave)
+            "modlog_punishment_channel": None,  # Bestrafungen (Ban/Kick/Timeout/Unban)
             "modlog_message_channel": None,   # Message-Events (Delete/Edit)
             "modlog_voice_channel": None,     # Voice-Events
             "modlog_role_channel": None,      # Rollen-Events
@@ -311,8 +312,22 @@ class SupportCog(commands.Cog):
                 "voice_leave": True,
                 "voice_move": True,
                 "guild_update": True,
+                "thread_create": True,
+                "thread_delete": True,
+                "thread_update": True,
             },
             "modlog_ignored_channels": [],    # Channel-IDs die nicht geloggt werden (z.B. Bot-Commands)
+            # PUNISHMENT HISTORY (für userinfo Command)
+            "punishment_history": {},  # {user_id: [{type, reason, moderator_id, moderator_name, ts, guild_id}]}
+            # ANTI-LINK SYSTEM
+            "antilink_enabled": False,
+            "antilink_mode": "all",  # "all" = alle Links, "discord" = nur Discord-Invites, "off" = deaktiviert
+            "antilink_whitelist_channels": [],  # Channel-IDs in denen Links erlaubt sind
+            "antilink_whitelist_roles": [],  # Rollen-IDs die immer Links senden dürfen
+            "antilink_whitelist_users": [],  # User-IDs die immer Links senden dürfen
+            "antilink_action": "delete",  # "delete" = nur löschen, "delete_warn" = löschen + warn, "delete_timeout" = löschen + timeout
+            "antilink_timeout_minutes": 10,  # Timeout-Dauer bei delete_timeout
+            "antilink_warning_message": "⚠️ Links sind in diesem Channel nicht erlaubt!",
             "ticket_first_response_reminder_minutes": 0,  # 0 = deaktiviert, sonst: Reminder nach X Min wenn Team nicht reagiert
             "ticket_history": {},  # Runtime: {user_id: [{ticket_num, channel_name, category, opened_ts, closed_ts, closed_by, reason}]}
             "ticket_first_response_tracker": {},  # Runtime: {channel_id: {created_ts, first_response_ts, first_responder_id}}
@@ -6258,12 +6273,12 @@ class SupportCog(commands.Cog):
         category_map = {
             "member_join": "modlog_member_channel",
             "member_leave": "modlog_member_channel",
-            "member_ban": "modlog_member_channel",
-            "member_unban": "modlog_member_channel",
-            "member_kick": "modlog_member_channel",
+            "member_ban": "modlog_punishment_channel",
+            "member_unban": "modlog_punishment_channel",
+            "member_kick": "modlog_punishment_channel",
+            "member_timeout": "modlog_punishment_channel",
             "member_roles": "modlog_member_channel",
             "member_nickname": "modlog_member_channel",
-            "member_timeout": "modlog_member_channel",
             "message_delete": "modlog_message_channel",
             "message_edit": "modlog_message_channel",
             "channel_create": "modlog_channel_events_channel",
@@ -6275,6 +6290,9 @@ class SupportCog(commands.Cog):
             "voice_leave": "modlog_voice_channel",
             "voice_move": "modlog_voice_channel",
             "guild_update": "modlog_channel",
+            "thread_create": "modlog_channel_events_channel",
+            "thread_delete": "modlog_channel_events_channel",
+            "thread_update": "modlog_channel_events_channel",
         }
         config_key = category_map.get(event_type, "modlog_channel")
         ch_id = await self.config.guild(guild).get_attr(config_key)()
@@ -6338,6 +6356,16 @@ class SupportCog(commands.Cog):
             return
         await self.config.guild(ctx.guild).modlog_member_channel.set(channel.id)
         await ctx.send(f"✅ Member-Log-Channel gesetzt auf {channel.mention}.")
+
+    @modlog_set.command(name="punishmentchannel", aliases=["punchannel", "punishchannel"])
+    async def modlog_set_punishmentchannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Bestrafungen (Ban/Kick/Timeout/Unban)."""
+        if channel is None:
+            await self.config.guild(ctx.guild).modlog_punishment_channel.set(None)
+            await ctx.send("✅ Bestrafungs-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).modlog_punishment_channel.set(channel.id)
+        await ctx.send(f"✅ Bestrafungs-Log-Channel gesetzt auf {channel.mention}.")
 
     @modlog_set.command(name="messagechannel")
     async def modlog_set_messagechannel(self, ctx: commands.Context, channel: discord.TextChannel = None):
@@ -6446,27 +6474,48 @@ class SupportCog(commands.Cog):
     async def modlog_set_show(self, ctx: commands.Context):
         """Zeigt die aktuelle Modlog-Konfiguration."""
         g = self.config.guild(ctx.guild)
-        embed = discord.Embed(title="📋 Extended Modlog Konfiguration", color=discord.Color.blurple(), timestamp=_now())
-        embed.add_field(name="Aktiviert", value="✅" if await g.modlog_enabled() else "❌", inline=True)
-        main_ch = await g.modlog_channel()
-        embed.add_field(name="Haupt-Channel", value=ctx.guild.get_channel(main_ch).mention if main_ch else "❌", inline=True)
-        member_ch = await g.modlog_member_channel()
-        embed.add_field(name="Member-Channel", value=ctx.guild.get_channel(member_ch).mention if member_ch else "❌", inline=True)
-        msg_ch = await g.modlog_message_channel()
-        embed.add_field(name="Message-Channel", value=ctx.guild.get_channel(msg_ch).mention if msg_ch else "❌", inline=True)
-        voice_ch = await g.modlog_voice_channel()
-        embed.add_field(name="Voice-Channel", value=ctx.guild.get_channel(voice_ch).mention if voice_ch else "❌", inline=True)
-        role_ch = await g.modlog_role_channel()
-        embed.add_field(name="Rollen-Channel", value=ctx.guild.get_channel(role_ch).mention if role_ch else "❌", inline=True)
-        ch_ch = await g.modlog_channel_events_channel()
-        embed.add_field(name="Channel-Events", value=ctx.guild.get_channel(ch_ch).mention if ch_ch else "❌", inline=True)
+        embed = discord.Embed(
+            title="📋 Extended Modlog Konfiguration",
+            color=discord.Color.blurple() if await g.modlog_enabled() else discord.Color.greyple(),
+            timestamp=_now(),
+        )
+        embed.description = f"**Status:** {'✅ Aktiviert' if await g.modlog_enabled() else '❌ Deaktiviert'}"
+        embed.add_field(name="━━━ Channels ━━━", value="\u200b", inline=False)
+        def ch_mention(cid):
+            ch = ctx.guild.get_channel(cid) if cid else None
+            return ch.mention if ch else "❌ Nicht gesetzt"
+        embed.add_field(name="🌐 Haupt-Channel", value=ch_mention(await g.modlog_channel()), inline=True)
+        embed.add_field(name="📥 Member (Join/Leave)", value=ch_mention(await g.modlog_member_channel()), inline=True)
+        embed.add_field(name="🔨 Bestrafungen", value=ch_mention(await g.modlog_punishment_channel()), inline=True)
+        embed.add_field(name="💬 Nachrichten", value=ch_mention(await g.modlog_message_channel()), inline=True)
+        embed.add_field(name="🎤 Voice", value=ch_mention(await g.modlog_voice_channel()), inline=True)
+        embed.add_field(name="🎭 Rollen", value=ch_mention(await g.modlog_role_channel()), inline=True)
+        embed.add_field(name="📂 Channel-Events", value=ch_mention(await g.modlog_channel_events_channel()), inline=True)
         ignored = await g.modlog_ignored_channels() or []
-        embed.add_field(name="Ignorierte Channels", value=str(len(ignored)), inline=True)
+        embed.add_field(name="🔇 Ignoriert", value=f"{len(ignored)} Channel", inline=True)
         events = await g.modlog_events() or {}
         active_count = sum(1 for v in events.values() if v)
-        embed.add_field(name="Aktive Events", value=f"{active_count}/{len(events)}", inline=True)
-        embed.set_footer(text=f"Modlog • {ctx.guild.name}")
+        embed.add_field(name="📊 Aktive Events", value=f"{active_count}/{len(events)}", inline=True)
+        embed.set_footer(text=f"Extended Modlog • {ctx.guild.name} • {_fmt_berlin_full(_now())} (MEZ/MESZ)")
         await ctx.send(embed=embed)
+
+    @modlog_set.command(name="setup", aliases=["wizard", "quickstart"])
+    async def modlog_set_setup(self, ctx: commands.Context):
+        """Interaktiver Setup-Wizard für das Extended Modlog System."""
+        embed = discord.Embed(
+            title="📋 Extended Modlog Setup Wizard",
+            description=(
+                "Willkommen! Dieser Wizard hilft dir beim Einrichten des Modlog Systems.\n\n"
+                "**Schritt 1:** Wähle einen Log-Channel für alle Events\n"
+                "**Schritt 2:** Wähle optionale separate Channels\n"
+                "**Schritt 3:** Fertig!\n\n"
+                "Klicke auf den Button um zu starten."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        view = ModlogWizardView(self, ctx.guild)
+        await ctx.send(embed=embed, view=view)
 
     # --- MODLOG: Neue Listener (keine Konflikte) ---
 
@@ -6585,6 +6634,392 @@ class SupportCog(commands.Cog):
             return
         embed = discord.Embed(title="⚙️ Server aktualisiert", description="\n".join(changes), color=discord.Color.gold(), timestamp=_now())
         await self._modlog_send(after, "guild_update", embed)
+
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread: discord.Thread):
+        """Log: Thread erstellt."""
+        embed = discord.Embed(
+            title="🧵 Thread erstellt",
+            description=f"**Thread:** {thread.mention}\n**Typ:** {thread.type}\n**Parent:** {thread.parent.mention if thread.parent else 'Keiner'}",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        if thread.owner:
+            embed.add_field(name="Erstellt von", value=thread.owner.mention, inline=True)
+        embed.set_footer(text=f"Thread-ID: {thread.id}")
+        await self._modlog_send(thread.guild, "thread_create", embed)
+
+    @commands.Cog.listener()
+    async def on_thread_delete(self, thread: discord.Thread):
+        """Log: Thread gelöscht."""
+        embed = discord.Embed(
+            title="🧵 Thread gelöscht",
+            description=f"**Thread:** `{thread.name}`\n**Parent:** {thread.parent.mention if thread.parent else 'Keiner'}",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text=f"Thread-ID: {thread.id}")
+        await self._modlog_send(thread.guild, "thread_delete", embed)
+
+    @commands.Cog.listener()
+    async def on_thread_update(self, before: discord.Thread, after: discord.Thread):
+        """Log: Thread aktualisiert."""
+        changes = []
+        if before.name != after.name:
+            changes.append(f"**Name:** `{before.name}` → `{after.name}`")
+        if before.archived != after.archived:
+            changes.append(f"**Archiviert:** {before.archived} → {after.archived}")
+        if before.locked != after.locked:
+            changes.append(f"**Gesperrt:** {before.locked} → {after.locked}")
+        if not changes:
+            return
+        embed = discord.Embed(
+            title="🧵 Thread aktualisiert",
+            description=f"**Thread:** {after.mention}\n" + "\n".join(changes),
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        await self._modlog_send(after.guild, "thread_update", embed)
+
+    # --- PUNISHMENT TRACKING ---
+
+    async def _punishment_record(self, guild: discord.Guild, user_id: int, punishment_type: str, reason: str, moderator):
+        """Zeichnet eine Bestrafung in der History auf."""
+        history = await self.config.guild(guild).punishment_history() or {}
+        key = str(user_id)
+        if key not in history:
+            history[key] = []
+        history[key].append({
+            "type": punishment_type,
+            "reason": reason[:500] if reason else "Kein Grund",
+            "moderator_id": moderator.id if moderator else None,
+            "moderator_name": moderator.display_name if moderator else "Unbekannt",
+            "ts": _now_ts(),
+        })
+        # Max 50 Einträge pro User
+        if len(history[key]) > 50:
+            history[key] = history[key][-50:]
+        await self.config.guild(guild).punishment_history.set(history)
+
+    # --- ANTI-LINK SYSTEM ---
+
+    @commands.group(name="antilink", aliases=["al"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def antilink(self, ctx: commands.Context):
+        """Konfiguriert das Anti-Link System."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @antilink.command(name="toggle")
+    async def antilink_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert das Anti-Link System."""
+        current = await self.config.guild(ctx.guild).antilink_enabled()
+        await self.config.guild(ctx.guild).antilink_enabled.set(not current)
+        await ctx.send(f"🔗 Anti-Link ist jetzt **{'✅ aktiviert' if not current else '❌ deaktiviert'}**.")
+
+    @antilink.command(name="mode")
+    async def antilink_mode(self, ctx: commands.Context, mode: str):
+        """Setzt den Anti-Link Modus.
+        `all` = alle Links blockieren
+        `discord` = nur Discord-Invite-Links blockieren"""
+        mode = mode.lower().strip()
+        if mode not in ("all", "discord", "off"):
+            await ctx.send("❌ Ungültiger Modus. Verwende `all`, `discord` oder `off`.")
+            return
+        await self.config.guild(ctx.guild).antilink_mode.set(mode)
+        mode_text = {"all": "Alle Links", "discord": "Nur Discord-Invites", "off": "Deaktiviert"}.get(mode, mode)
+        await ctx.send(f"✅ Anti-Link Modus gesetzt auf: **{mode_text}**")
+
+    @antilink.command(name="action")
+    async def antilink_action(self, ctx: commands.Context, action: str, timeout_minutes: int = 10):
+        """Setzt die Aktion bei Link-Erkennung.
+        `delete` = nur löschen
+        `warn` = löschen + Verwarnung
+        `timeout` = löschen + Timeout (mit Dauer in Min)"""
+        action = action.lower().strip()
+        if action not in ("delete", "warn", "timeout"):
+            await ctx.send("❌ Ungültige Aktion. Verwende `delete`, `warn` oder `timeout`.")
+            return
+        await self.config.guild(ctx.guild).antilink_action.set(action)
+        if action == "timeout":
+            await self.config.guild(ctx.guild).antilink_timeout_minutes.set(timeout_minutes)
+            await ctx.send(f"✅ Aktion: **Löschen + Timeout ({timeout_minutes} Min)**")
+        elif action == "warn":
+            await ctx.send("✅ Aktion: **Löschen + Verwarnung**")
+        else:
+            await ctx.send("✅ Aktion: **Nur löschen**")
+
+    @antilink.command(name="channel", aliases=["whitelistchannel"])
+    async def antilink_channel(self, ctx: commands.Context, action: str, channel: discord.TextChannel):
+        """Fügt einen Channel zur Whitelist hinzu/entfernt ihn (Links erlaubt).
+        `add` oder `remove`."""
+        wl = await self.config.guild(ctx.guild).antilink_whitelist_channels() or []
+        if action.lower() == "add":
+            if channel.id not in wl:
+                wl.append(channel.id)
+            await self.config.guild(ctx.guild).antilink_whitelist_channels.set(wl)
+            await ctx.send(f"✅ {channel.mention} zur Link-Whitelist hinzugefügt.")
+        elif action.lower() == "remove":
+            if channel.id in wl:
+                wl.remove(channel.id)
+            await self.config.guild(ctx.guild).antilink_whitelist_channels.set(wl)
+            await ctx.send(f"✅ {channel.mention} von der Link-Whitelist entfernt.")
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
+
+    @antilink.command(name="role", aliases=["whitelistrole"])
+    async def antilink_role(self, ctx: commands.Context, action: str, role: discord.Role):
+        """Fügt eine Rolle zur Whitelist hinzu/entfernt sie (darf immer Links senden)."""
+        wl = await self.config.guild(ctx.guild).antilink_whitelist_roles() or []
+        if action.lower() == "add":
+            if role.id not in wl:
+                wl.append(role.id)
+            await self.config.guild(ctx.guild).antilink_whitelist_roles.set(wl)
+            await ctx.send(f"✅ Rolle {role.mention} darf immer Links senden.")
+        elif action.lower() == "remove":
+            if role.id in wl:
+                wl.remove(role.id)
+            await self.config.guild(ctx.guild).antilink_whitelist_roles.set(wl)
+            await ctx.send(f"✅ Rolle {role.mention} darf nicht mehr immer Links senden.")
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
+
+    @antilink.command(name="user", aliases=["whitelistuser"])
+    async def antilink_user(self, ctx: commands.Context, action: str, user: discord.User):
+        """Fügt einen User zur Whitelist hinzu/entfernt ihn (darf immer Links senden)."""
+        wl = await self.config.guild(ctx.guild).antilink_whitelist_users() or []
+        if action.lower() == "add":
+            if user.id not in wl:
+                wl.append(user.id)
+            await self.config.guild(ctx.guild).antilink_whitelist_users.set(wl)
+            await ctx.send(f"✅ {user.mention} darf immer Links senden.")
+        elif action.lower() == "remove":
+            if user.id in wl:
+                wl.remove(user.id)
+            await self.config.guild(ctx.guild).antilink_whitelist_users.set(wl)
+            await ctx.send(f"✅ {user.mention} darf nicht mehr immer Links senden.")
+        else:
+            await ctx.send("❌ Ungültige Aktion. Verwende `add` oder `remove`.")
+
+    @antilink.command(name="message")
+    async def antilink_message(self, ctx: commands.Context, *, message: str = None):
+        """Setzt die Warnungs-Nachricht die beim Löschen gezeigt wird."""
+        if message is None:
+            await self.config.guild(ctx.guild).antilink_warning_message.set("⚠️ Links sind in diesem Channel nicht erlaubt!")
+            await ctx.send("✅ Warnungs-Nachricht zurückgesetzt.")
+            return
+        if len(message) > 500:
+            await ctx.send("❌ Nachricht zu lang (max 500 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).antilink_warning_message.set(message)
+        await ctx.send(f"✅ Warnungs-Nachricht gesetzt auf: {message}")
+
+    @antilink.command(name="show")
+    async def antilink_show(self, ctx: commands.Context):
+        """Zeigt die aktuelle Anti-Link Konfiguration."""
+        g = self.config.guild(ctx.guild)
+        embed = discord.Embed(title="🔗 Anti-Link Konfiguration", color=discord.Color.blurple() if await g.antilink_enabled() else discord.Color.greyple(), timestamp=_now())
+        embed.description = f"**Status:** {'✅ Aktiviert' if await g.antilink_enabled() else '❌ Deaktiviert'}"
+        mode = await g.antilink_mode()
+        mode_text = {"all": "Alle Links", "discord": "Nur Discord-Invites", "off": "Deaktiviert"}.get(mode, mode)
+        embed.add_field(name="Modus", value=mode_text, inline=True)
+        action = await g.antilink_action()
+        action_text = {"delete": "Nur löschen", "warn": "Löschen + Verwarnung", "timeout": "Löschen + Timeout"}.get(action, action)
+        embed.add_field(name="Aktion", value=action_text, inline=True)
+        if action == "timeout":
+            embed.add_field(name="Timeout-Dauer", value=f"{await g.antilink_timeout_minutes()} Min", inline=True)
+        # Whitelists
+        wl_ch = await g.antilink_whitelist_channels() or []
+        wl_ch_mentions = [ctx.guild.get_channel(c).mention for c in wl_ch if ctx.guild.get_channel(c)]
+        embed.add_field(name="📡 Whitelist Channels", value=", ".join(wl_ch_mentions) or "Keine", inline=False)
+        wl_roles = await g.antilink_whitelist_roles() or []
+        wl_role_mentions = [ctx.guild.get_role(r).mention for r in wl_roles if ctx.guild.get_role(r)]
+        embed.add_field(name="🎭 Whitelist Rollen", value=", ".join(wl_role_mentions) or "Keine", inline=False)
+        wl_users = await g.antilink_whitelist_users() or []
+        wl_user_mentions = [f"<@{u}>" for u in wl_users]
+        embed.add_field(name="👤 Whitelist User", value=", ".join(wl_user_mentions) or "Keine", inline=False)
+        msg = await g.antilink_warning_message()
+        embed.add_field(name="⚠️ Warnungs-Nachricht", value=msg, inline=False)
+        embed.set_footer(text=f"Anti-Link • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    def _detect_link(self, content: str, mode: str) -> bool:
+        """Prüft ob ein Text Links enthält basierend auf dem Modus."""
+        if not content:
+            return False
+        if mode == "all":
+            # Alle URLs erkennen
+            url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+            return bool(re.search(url_pattern, content, re.IGNORECASE))
+        elif mode == "discord":
+            # Discord-Invite-Links erkennen
+            invite_patterns = [
+                r'discord\.gg/\S+',
+                r'discord\.com/invite/\S+',
+                r'discordapp\.com/invite/\S+',
+                r'discord\.me/\S+',
+                r'disboard\.org/server/join/\S+',
+            ]
+            for pattern in invite_patterns:
+                if re.search(pattern, content, re.IGNORECASE):
+                    return True
+            return False
+        return False
+
+    async def _antilink_check_message(self, message: discord.Message):
+        """Prüft eine Nachricht auf Links und handelt entsprechend."""
+        if not message.guild or message.author.bot:
+            return
+        if not await self.config.guild(message.guild).antilink_enabled():
+            return
+        mode = await self.config.guild(message.guild).antilink_mode()
+        if mode == "off":
+            return
+        content = message.content or ""
+        # Whitelist prüfen: Channel
+        wl_channels = await self.config.guild(message.guild).antilink_whitelist_channels() or []
+        if message.channel.id in wl_channels:
+            return
+        # Whitelist prüfen: User
+        wl_users = await self.config.guild(message.guild).antilink_whitelist_users() or []
+        if message.author.id in wl_users:
+            return
+        # Whitelist prüfen: Rollen
+        wl_roles = await self.config.guild(message.guild).antilink_whitelist_roles() or []
+        if isinstance(message.author, discord.Member):
+            for role in message.author.roles:
+                if role.id in wl_roles:
+                    return
+        # Admins dürfen immer
+        if isinstance(message.author, discord.Member):
+            if message.author.guild_permissions.manage_guild or message.author.guild_permissions.administrator:
+                return
+        # Link erkennen
+        if not self._detect_link(content, mode):
+            return
+        # Nachricht löschen
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Warnungs-Nachricht
+        warn_msg = await self.config.guild(message.guild).antilink_warning_message() or "⚠️ Links sind nicht erlaubt!"
+        mode_text = "Discord-Invite" if mode == "discord" else "Link"
+        try:
+            await message.channel.send(f"{message.author.mention} {warn_msg} ({mode_text} entfernt)", delete_after=10)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Aktion ausführen
+        action = await self.config.guild(message.guild).antilink_action()
+        member = message.author if isinstance(message.author, discord.Member) else None
+        if member:
+            if action == "warn":
+                await self._punishment_record(message.guild, member.id, "warn", f"Anti-Link: {mode_text} gesendet", None)
+            elif action == "timeout":
+                timeout_min = await self.config.guild(message.guild).antilink_timeout_minutes() or 10
+                try:
+                    until = _now() + timedelta(minutes=timeout_min)
+                    await member.timeout(until, reason=f"Anti-Link: {mode_text} gesendet")
+                    await self._punishment_record(message.guild, member.id, "timeout", f"Anti-Link: {mode_text} gesendet (Timeout {timeout_min}min)", None)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        # Modlog
+        log_embed = discord.Embed(
+            title=f"🔗 Anti-Link: {mode_text} blockiert",
+            description=f"**User:** {message.author.mention} (`{message.author.id}`)\n**Channel:** {message.channel.mention}\n**Aktion:** {action}",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        log_embed.add_field(name="Gelöschte Nachricht", value=content[:500], inline=False)
+        log_embed.set_thumbnail(url=message.author.display_avatar.url)
+        await self._modlog_send(message.guild, "message_delete", log_embed)
+
+    # --- USERINFO COMMAND ---
+
+    @commands.command(name="memberinfo", aliases=["minfo", "lookup", "minvestigate"])
+    @commands.guild_only()
+    async def userinfo_cmd(self, ctx: commands.Context, user: discord.User = None):
+        """Zeigt alle Informationen über einen User.
+        inklusive Bestrafungs-Historie, Server-Übersicht, Avatar-Download."""
+        if user is None:
+            user = ctx.author
+        member = ctx.guild.get_member(user.id)
+        # Grund-Embed
+        embed = discord.Embed(
+            title=f"👤 {user.display_name}",
+            description=f"{'🟢 Online' if member and str(member.status) == 'online' else '⚫ Offline' if member else 'Nicht auf diesem Server'}",
+            color=member.color if member and member.color.value != 0 else discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        # Basis-Info
+        embed.add_field(name="🆔 User-ID", value=f"`{user.id}`", inline=True)
+        embed.add_field(name="📛 Username", value=user.name, inline=True)
+        embed.add_field(name="🏷️ Display Name", value=user.display_name, inline=True)
+        embed.add_field(name="📅 Account erstellt", value=_fmt_berlin_full(user.created_at) + "\n(MEZ/MESZ)", inline=True)
+        if member:
+            embed.add_field(name="📥 Beigetreten", value=_fmt_berlin_full(member.joined_at) + "\n(MEZ/MESZ)", inline=True)
+            embed.add_field(name="🤖 Bot", value="✅ Ja" if member.bot else "❌ Nein", inline=True)
+            embed.add_field(name="🎭 Rollen", value=str(len(member.roles) - 1), inline=True)
+            # Top-Rollen (max 5)
+            if len(member.roles) > 1:
+                top_roles = [r.mention for r in reversed(member.roles[1:])][:5]
+                embed.add_field(name="📋 Top-Rollen", value=" ".join(top_roles), inline=False)
+            # Boost
+            if member.premium_since:
+                embed.add_field(name="💎 Booster seit", value=_fmt_berlin_full(member.premium_since), inline=True)
+            # Permissions
+            perms = member.guild_permissions
+            perm_list = []
+            if perms.administrator:
+                perm_list.append("Administrator")
+            if perms.ban_members:
+                perm_list.append("Bann-Mitglieder")
+            if perms.kick_members:
+                perm_list.append("Kick-Mitglieder")
+            if perms.manage_guild:
+                perm_list.append("Server-Verwaltung")
+            if perms.manage_channels:
+                perm_list.append("Channel-Verwaltung")
+            if perms.manage_roles:
+                perm_list.append("Rollen-Verwaltung")
+            if perm_list:
+                embed.add_field(name="🔑 Wichtige Rechte", value=", ".join(perm_list), inline=False)
+        else:
+            embed.add_field(name="⚠️ Status", value="User ist nicht auf diesem Server", inline=False)
+        # Bestrafungs-Historie (nur auf diesem Server)
+        history = await self.config.guild(ctx.guild).punishment_history() or {}
+        user_history = history.get(str(user.id), [])
+        if user_history:
+            # Stats
+            ban_count = sum(1 for h in user_history if h.get("type") == "ban")
+            kick_count = sum(1 for h in user_history if h.get("type") == "kick")
+            timeout_count = sum(1 for h in user_history if h.get("type") == "timeout")
+            warn_count = sum(1 for h in user_history if h.get("type") == "warn")
+            embed.add_field(name="━━━ Bestrafungen ━━━", value=f"🔨 Banns: **{ban_count}** | 👢 Kicks: **{kick_count}** | ⏱️ Timeouts: **{timeout_count}** | ⚠️ Warns: **{warn_count}**", inline=False)
+            # Letzte 5 Bestrafungen
+            recent = user_history[-5:]
+            recent.reverse()
+            for h in recent:
+                ptype = h.get("type", "?")
+                emoji = {"ban": "🔨", "kick": "👢", "timeout": "⏱️", "warn": "⚠️", "unban": "🔓"}.get(ptype, "❓")
+                ts_str = _fmt_berlin_full(_from_ts(h.get("ts", 0)))
+                mod_name = h.get("moderator_name", "?")
+                reason = h.get("reason", "?")[:100]
+                embed.add_field(name=f"{emoji} {ptype.title()}", value=f"📅 {ts_str}\n👤 Von: {mod_name}\n📝 {reason}", inline=True)
+        else:
+            embed.add_field(name="━━━ Bestrafungen ━━━", value="✅ Keine Bestrafungen registriert", inline=False)
+        # Gemeinsame Server (wo der Bot auch ist)
+        shared_guilds = [g.name for g in self.bot.guilds if g.get_member(user.id)]
+        if shared_guilds:
+            embed.add_field(name="━━━ Gemeinsame Server ━━━", value=f"Bot und User sind auf **{len(shared_guilds)}** Server(n) gemeinsam:\n" + ", ".join(shared_guilds[:10]), inline=False)
+        # Avatar-Download
+        avatar_url = user.display_avatar.url
+        embed.add_field(name="🖼️ Avatar", value=f"[Download]({avatar_url})", inline=True)
+        embed.set_image(url=avatar_url)
+        embed.set_footer(text=f"Userinfo • {ctx.guild.name} • {_fmt_berlin_full(_now())} (MEZ/MESZ)")
+        await ctx.send(embed=embed)
 
     # ============================================
     # CUSTOM EMBED BUILDER & EDITOR
@@ -11498,6 +11933,8 @@ class SupportCog(commands.Cog):
             log_embed.add_field(name="Von", value=f"{moderator.mention}", inline=True)
         log_embed.set_thumbnail(url=user.display_avatar.url)
         await self._modlog_send(guild, "member_ban", log_embed)
+        # Punishment History
+        await self._punishment_record(guild, user.id, "ban", reason, moderator)
         # Sync
         if not await self._sync_should_propagate_from(guild):
             return
@@ -11559,6 +11996,9 @@ class SupportCog(commands.Cog):
             log_embed.add_field(name="Vorher", value=_fmt_berlin_full(before_timeout) if before_timeout else "Kein Timeout", inline=True)
             log_embed.add_field(name="Nachher", value=_fmt_berlin_full(after_timeout) if after_timeout else "Kein Timeout", inline=True)
             await self._modlog_send(after.guild, "member_timeout", log_embed)
+            # Punishment History (nur wenn neuer Timeout, nicht aufgehoben)
+            if after_timeout:
+                await self._punishment_record(after.guild, after.id, "timeout", "Timeout verhängt", None)
         # Sync: Timeout
         if before_timeout != after_timeout:
             if after_timeout is not None and (after_timeout.replace(tzinfo=timezone.utc) if after_timeout.tzinfo is None else after_timeout) > _now():
@@ -11597,7 +12037,7 @@ class SupportCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Trackt erste Team-Antwort in Tickets für First-Response-Tracking."""
+        """Anti-Link Check + First-Response Tracking in Tickets."""
         # Basis-Filter
         if not message.guild:
             return
@@ -11605,6 +12045,11 @@ class SupportCog(commands.Cog):
             return
         if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
             return
+        # Anti-Link Check (vor allem anderen)
+        try:
+            await self._antilink_check_message(message)
+        except Exception:
+            log.exception("Fehler im Anti-Link Check")
         # Prüfen ob es ein Ticket-Channel ist
         if not (message.channel.name.startswith("ticket-") or self._is_ticket_channel(message.channel)):
             return
@@ -11639,6 +12084,8 @@ class SupportCog(commands.Cog):
                         kick_embed.add_field(name="Von", value=entry.user.mention if entry.user else "Unbekannt", inline=True)
                         kick_embed.add_field(name="Grund", value=entry.reason or "Kein Grund", inline=False)
                         await self._modlog_send(member.guild, "member_kick", kick_embed)
+                        # Punishment History
+                        await self._punishment_record(member.guild, member.id, "kick", entry.reason or "Kein Grund", entry.user)
                     break
         except (discord.Forbidden, discord.HTTPException):
             pass
@@ -15851,6 +16298,129 @@ class EmbedBuilderNextView(discord.ui.View):
                     await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
             except Exception:
                 pass
+
+
+class ModlogWizardView(discord.ui.View):
+    """Setup Wizard für Extended Modlog — führt Schritt für Schritt durch."""
+
+    def __init__(self, cog, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+
+    @discord.ui.button(label="🚀 Quick Start (Alles in einem Channel)", style=discord.ButtonStyle.success)
+    async def quick_start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            # Aktivieren + aktuellen Channel als Haupt-Channel setzen
+            await self.cog.config.guild(self.guild).modlog_enabled.set(True)
+            if isinstance(interaction.channel, discord.TextChannel):
+                await self.cog.config.guild(self.guild).modlog_channel.set(interaction.channel.id)
+            embed = discord.Embed(
+                title="✅ Modlog Quick Start fertig!",
+                description=(
+                    f"**Modlog ist jetzt aktiviert!**\n\n"
+                    f"**Haupt-Channel:** {interaction.channel.mention if isinstance(interaction.channel, discord.TextChannel) else 'Aktueller Channel'}\n\n"
+                    f"Alle Events werden in diesen Channel gesendet.\n"
+                    f"Du kannst später separate Channels setzen mit:\n"
+                    f"• `[p]extmodlog memberchannel #channel`\n"
+                    f"• `[p]extmodlog punishmentchannel #channel`\n"
+                    f"• `[p]extmodlog messagechannel #channel`\n"
+                    f"• `[p]extmodlog voicechannel #channel`\n"
+                    f"• `[p]extmodlog rolechannel #channel`\n"
+                    f"• `[p]extmodlog channelchannel #channel`"
+                ),
+                color=discord.Color.green(),
+                timestamp=_now(),
+            )
+            embed.set_footer(text="Extended Modlog Setup")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            log.exception("Fehler im Modlog Quick Start")
+            try:
+                await interaction.followup.send(f"❌ Fehler: `{e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="⚙️ Erweitert (Separate Channels)", style=discord.ButtonStyle.primary)
+    async def advanced_setup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            # Aktivieren
+            await self.cog.config.guild(self.guild).modlog_enabled.set(True)
+            embed = discord.Embed(
+                title="⚙️ Erweitertes Setup",
+                description=(
+                    "Modlog wurde aktiviert! Jetzt kannst du separate Channels setzen.\n\n"
+                    "**Führe diese Befehle aus (jeder optional):**\n\n"
+                    "```\n"
+                    "[p]extmodlog channel #audit-log\n"
+                    "[p]extmodlog memberchannel #member-logs\n"
+                    "[p]extmodlog punishmentchannel #punishment-logs\n"
+                    "[p]extmodlog messagechannel #message-logs\n"
+                    "[p]extmodlog voicechannel #voice-logs\n"
+                    "[p]extmodlog rolechannel #role-logs\n"
+                    "[p]extmodlog channelchannel #channel-logs\n"
+                    "```\n\n"
+                    "**Events an/aus:**\n"
+                    "```\n"
+                    "[p]extmodlog event member_join\n"
+                    "[p]extmodlog event message_delete\n"
+                    "```\n\n"
+                    "**Channel ignorieren:**\n"
+                    "```\n"
+                    "[p]extmodlog ignore add #bot-commands\n"
+                    "```\n\n"
+                    "Ohne spezifischen Channel fällt alles auf den Haupt-Channel zurück."
+                ),
+                color=discord.Color.blue(),
+                timestamp=_now(),
+            )
+            embed.set_footer(text="Extended Modlog Setup")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            log.exception("Fehler im Modlog Advanced Setup")
+            try:
+                await interaction.followup.send(f"❌ Fehler: `{e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="📋 Aktuelle Konfiguration", style=discord.ButtonStyle.secondary)
+    async def show_config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("❌ Du brauchst `Manage Server` Rechte.", ephemeral=True)
+                return
+            g = self.cog.config.guild(self.guild)
+            embed = discord.Embed(
+                title="📋 Extended Modlog Konfiguration",
+                color=discord.Color.blurple() if await g.modlog_enabled() else discord.Color.greyple(),
+                timestamp=_now(),
+            )
+            embed.description = f"**Status:** {'✅ Aktiviert' if await g.modlog_enabled() else '❌ Deaktiviert'}"
+            def cm(cid):
+                ch = self.guild.get_channel(cid) if cid else None
+                return ch.mention if ch else "❌"
+            embed.add_field(name="🌐 Haupt", value=cm(await g.modlog_channel()), inline=True)
+            embed.add_field(name="📥 Member", value=cm(await g.modlog_member_channel()), inline=True)
+            embed.add_field(name="🔨 Strafen", value=cm(await g.modlog_punishment_channel()), inline=True)
+            embed.add_field(name="💬 Nachrichten", value=cm(await g.modlog_message_channel()), inline=True)
+            embed.add_field(name="🎤 Voice", value=cm(await g.modlog_voice_channel()), inline=True)
+            embed.add_field(name="🎭 Rollen", value=cm(await g.modlog_role_channel()), inline=True)
+            embed.add_field(name="📂 Channel", value=cm(await g.modlog_channel_events_channel()), inline=True)
+            events = await g.modlog_events() or {}
+            active = sum(1 for v in events.values() if v)
+            embed.add_field(name="📊 Events", value=f"{active}/{len(events)}", inline=True)
+            embed.set_footer(text="Extended Modlog")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception:
+            log.exception("Fehler im Modlog Show Config Button")
 
 
 async def setup(bot: Red):
