@@ -1,16 +1,16 @@
 """AAA3A Dashboard-Integration für den SupportCog.
-Diese Datei macht alle wichtigen Funktionen des supportcog über das
-Web-Dashboard von AAA3A (https://github.com/AAA3A-AAA3A/AAA3A-cogs) verfügbar.
 
 WICHTIG:
 - 'guild' und 'member' müssen explizit als Funktionsparameter stehen (nicht via kwargs.get)
-- Keine hardcoded <a href> Links ins Dashboard verwenden (bricht die SPA)
-- Keine manuellen CSRF-Tokens (das Dashboard kümmert sich selbst drum)
-- web_content.standalone=False damit Dashboard-Layout erhalten bleibt
+- Bei GET: web_content mit source zurückgeben
+- Bei POST: redirect_url zurückgeben (PRG-Pattern) + notifications als Flash-Message
+- Nie hardcoded <a href> Links ins Dashboard verwenden
+- Keine manuellen CSRF-Tokens (Dashboard kümmert sich selbst)
+- Top-Level 'data' key NICHT verwenden (würde Rendering bypassen!)
 """
 import typing
-import json
 import time as _time
+import discord
 from redbot.core import commands
 from redbot.core.bot import Red
 
@@ -45,25 +45,11 @@ class DashboardIntegration:
             )
 
     # ============================================
-    # HELPER
+    # HELPER (wichtig: korrekte Response-Schema!)
     # ============================================
 
-    def _success(self, message: str, **extra) -> dict:
-        return {
-            "status": 0,
-            "notifications": [{"message": message, "category": "success"}],
-            **extra,
-        }
-
-    def _error(self, message: str, **extra) -> dict:
-        return {
-            "status": 1,
-            "error_message": message,
-            "notifications": [{"message": message, "category": "danger"}],
-            **extra,
-        }
-
     def _page(self, title: str, content: str, **extra) -> dict:
+        """Für GET-Seiten: rendert HTML im Dashboard-Layout."""
         html = f"""
         <div class="container-fluid">
             <h1 class="mb-4">{title}</h1>
@@ -72,8 +58,48 @@ class DashboardIntegration:
         """
         return {
             "status": 0,
-            "web_content": {"source": html, "standalone": False, "fullscreen": False},
+            "web_content": {
+                "source": html,
+                "standalone": False,
+                "fullscreen": False,
+            },
             **extra,
+        }
+
+    def _success_post(self, message: str, request_url: str) -> dict:
+        """Für POST-Erfolg: redirect zur GET-URL + Flash-Message."""
+        return {
+            "status": 0,
+            "notifications": [{"message": message, "category": "success"}],
+            "redirect_url": request_url,
+        }
+
+    def _error_post(self, message: str, request_url: str) -> dict:
+        """Für POST-Fehler: redirect zur GET-URL + Flash-Message (danger)."""
+        return {
+            "status": 1,
+            "notifications": [{"message": message, "category": "danger"}],
+            "redirect_url": request_url,
+        }
+
+    def _error_page(self, message: str) -> dict:
+        """Für GET-Fehler: rendert Fehlermeldung im Dashboard-Layout."""
+        html = f"""
+        <div class="container-fluid">
+            <div class="alert alert-danger">
+                <h4 class="alert-heading">Fehler</h4>
+                <p class="mb-0">{message}</p>
+            </div>
+        </div>
+        """
+        return {
+            "status": 1,
+            "web_content": {
+                "source": html,
+                "standalone": False,
+                "fullscreen": False,
+            },
+            "notifications": [{"message": message, "category": "danger"}],
         }
 
     def _fmt_ts(self, ts) -> str:
@@ -174,14 +200,33 @@ class DashboardIntegration:
                 </div>
             </div>
             <div class="alert alert-info mt-4">
-                <h5>📖 Available Pages</h5>
-                <p class="mb-0">Verwende die Seitenleiste um zu den einzelnen Seiten zu navigieren.<br>
-                Verfügbare Seiten: Mod-Aktionen, Tickets, Bewerbungen, Aufgaben, Snippets, Watchlist, Team-Stats, Warns, Anti-Link, BanSync, Modlog, Support-Konfig, Member-Suche, Server-Info, Embed-Builder, Modlog-Viewer, Slowmode/Lock.</p>
+                <h5>📖 Verfügbare Seiten</h5>
+                <p>Verwende die Seitenleiste um zu navigieren. Verfügbare Seiten:</p>
+                <ul class="mb-0">
+                    <li>🔨 Mod-Aktionen — Ban/Kick/Timeout/Warn mit Anonym-Option</li>
+                    <li>🎫 Tickets & Kategorien — Übersicht</li>
+                    <li>📋 Bewerbungen — Annehmen/Ablehnen</li>
+                    <li>📝 Aufgaben — Status ändern</li>
+                    <li>💬 Snippets — Text-Vorlagen</li>
+                    <li>👁️ Watchlist — User beobachten</li>
+                    <li>📊 Team-Stats — Leaderboard</li>
+                    <li>⚠️ Warn-System — Konfiguration</li>
+                    <li>🔗 Anti-Link — Konfiguration</li>
+                    <li>🔄 BanSync — Cross-Server Sync</li>
+                    <li>📜 Modlog — Übersicht</li>
+                    <li>⚙️ Support-Konfig — Einstellungen</li>
+                    <li>🔍 Member-Suche — User-Info mit Historie</li>
+                    <li>📊 Server-Info — Statistiken</li>
+                    <li>📝 Embed Builder — Embeds erstellen</li>
+                    <li>📜 Modlog-Viewer — Bestrafungs-Historie</li>
+                    <li>⏱️ Slowmode & Lock — Channel-Kontrolle</li>
+                    <li>📦 Massen-Aktionen — Bulk Ban/Kick/Warn</li>
+                </ul>
             </div>
             """
             return self._page("SupportCog Übersicht", content)
         except Exception as e:
-            return self._error(f"Fehler beim Laden der Übersicht: {e}")
+            return self._error_page(f"Fehler beim Laden der Übersicht: {e}")
 
     # ============================================
     # 2. MOD-AKTIONEN
@@ -191,6 +236,7 @@ class DashboardIntegration:
     async def rpc_mod_actions(self, guild, member, **kwargs) -> dict:
         """Seite für Mod-Aktionen: Ban, Kick, Timeout, Warn."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -202,7 +248,7 @@ class DashboardIntegration:
             try:
                 user_id = int(user_id)
             except (ValueError, TypeError):
-                return self._error("Ungültige User-ID.")
+                return self._error_post("Ungültige User-ID.", request_url)
             try:
                 target = guild.get_member(user_id)
                 if target is None:
@@ -210,7 +256,7 @@ class DashboardIntegration:
             except Exception:
                 target = None
             if target is None:
-                return self._error("User nicht auf diesem Server gefunden.")
+                return self._error_post("User nicht auf diesem Server gefunden.", request_url)
             try:
                 if action == "ban":
                     if anonymous:
@@ -219,7 +265,7 @@ class DashboardIntegration:
                         await self._send_mod_dm(target, guild, "ban", moderator=member, reason=reason)
                     await target.ban(reason=f"Ban via Dashboard von {member}: {reason}", delete_message_days=1)
                     await self._punishment_record(guild, target.id, "ban", reason, member)
-                    return self._success(f"🔨 {target.display_name} wurde gebannt.")
+                    return self._success_post(f"🔨 {target.display_name} wurde gebannt.", request_url)
                 elif action == "kick":
                     if anonymous:
                         await self._send_mod_dm(target, guild, "kick", moderator=member, reason=reason, anonymous=True)
@@ -227,13 +273,13 @@ class DashboardIntegration:
                         await self._send_mod_dm(target, guild, "kick", moderator=member, reason=reason)
                     await target.kick(reason=f"Kick via Dashboard von {member}: {reason}")
                     await self._punishment_record(guild, target.id, "kick", reason, member)
-                    return self._success(f"👢 {target.display_name} wurde gekickt.")
+                    return self._success_post(f"👢 {target.display_name} wurde gekickt.", request_url)
                 elif action == "timeout":
                     seconds = self._parse_duration(duration)
                     if seconds is None:
-                        return self._error("Ungültige Dauer. Verwende z.B. 30s, 5m, 2h, 1d.")
+                        return self._error_post("Ungültige Dauer. Verwende z.B. 30s, 5m, 2h, 1d.", request_url)
                     if seconds > 28 * 86400:
-                        return self._error("Timeout darf maximal 28 Tage dauern.")
+                        return self._error_post("Timeout darf maximal 28 Tage dauern.", request_url)
                     from datetime import timedelta, datetime as _dt, timezone as _tz
                     until = _dt.now(tz=_tz.utc) + timedelta(seconds=seconds)
                     if anonymous:
@@ -242,7 +288,7 @@ class DashboardIntegration:
                         await self._send_mod_dm(target, guild, "timeout", moderator=member, reason=reason, duration=duration)
                     await target.timeout(until, reason=f"Timeout via Dashboard von {member}: {reason}")
                     await self._punishment_record(guild, target.id, "timeout", f"{reason} ({duration})", member)
-                    return self._success(f"⏰ {target.display_name} wurde für {duration} getimeoutet.")
+                    return self._success_post(f"⏰ {target.display_name} wurde für {duration} getimeoutet.", request_url)
                 elif action == "warn":
                     cfg = await self.config.guild(guild).warn_config()
                     counter = await self.config.guild(guild).warn_counter() or 0
@@ -270,11 +316,11 @@ class DashboardIntegration:
                         await self._send_mod_dm(target, guild, "warn", moderator=member, reason=reason, anonymous=True)
                     else:
                         await self._send_mod_dm(target, guild, "warn", moderator=member, reason=reason)
-                    return self._success(f"⚠️ {target.display_name} wurde verwarnt ({len(user_strikes)} aktiv).")
+                    return self._success_post(f"⚠️ {target.display_name} wurde verwarnt ({len(user_strikes)} aktiv).", request_url)
                 else:
-                    return self._error("Unbekannte Aktion.")
+                    return self._error_post("Unbekannte Aktion.", request_url)
             except Exception as e:
-                return self._error(f"Aktion fehlgeschlagen: {e}")
+                return self._error_post(f"Aktion fehlgeschlagen: {e}", request_url)
         content = """
         <form method="POST" class="needs-validation" novalidate>
             <div class="mb-3">
@@ -290,7 +336,7 @@ class DashboardIntegration:
                 <label for="user_id" class="form-label">User-ID</label>
                 <input type="number" class="form-control" id="user_id" name="user_id" placeholder="123456789012345678" required>
             </div>
-            <div class="mb-3" id="duration_div" style="display:none;">
+            <div class="mb-3" id="duration_div">
                 <label for="duration" class="form-label">Dauer (nur bei Timeout)</label>
                 <input type="text" class="form-control" id="duration" name="duration" placeholder="z.B. 1h, 30m, 2d, 1h30m" value="1h">
                 <small class="text-muted">Formate: 30s, 5m, 2h, 1d oder Kombinationen</small>
@@ -355,7 +401,7 @@ class DashboardIntegration:
             """
             return self._page("Tickets & Kategorien", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 4. BEWERBUNGEN
@@ -365,6 +411,7 @@ class DashboardIntegration:
     async def rpc_applications(self, guild, member, **kwargs) -> dict:
         """Bewerbungen anzeigen und entscheiden."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -374,10 +421,10 @@ class DashboardIntegration:
             try:
                 apps = await self.config.guild(guild).team_applications() or {}
                 if app_id not in apps:
-                    return self._error("Bewerbung nicht gefunden.")
+                    return self._error_post("Bewerbung nicht gefunden.", request_url)
                 app = apps[app_id]
                 if app.get("status") != "pending":
-                    return self._error("Bewerbung wurde bereits entschieden.")
+                    return self._error_post("Bewerbung wurde bereits entschieden.", request_url)
                 new_status = "accepted" if decision == "accept" else "rejected"
                 app["status"] = new_status
                 app["decided_by"] = member.id
@@ -396,9 +443,9 @@ class DashboardIntegration:
                                     await target.add_roles(role, reason=f"Bewerbung #{app_id} via Dashboard von {member}")
                         except Exception:
                             pass
-                return self._success(f"Bewerbung #{app_id} wurde {new_status}.")
+                return self._success_post(f"Bewerbung #{app_id} wurde {new_status}.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             apps = await self.config.guild(guild).team_applications() or {}
             pending = {k: v for k, v in apps.items() if v.get("status") == "pending"}
@@ -436,7 +483,7 @@ class DashboardIntegration:
                 content += '</tbody></table>'
             return self._page("📋 Bewerbungen", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 5. AUFGABEN
@@ -446,6 +493,7 @@ class DashboardIntegration:
     async def rpc_tasks(self, guild, member, **kwargs) -> dict:
         """Aufgaben anzeigen und Status ändern."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -454,15 +502,15 @@ class DashboardIntegration:
             try:
                 tasks = await self.config.guild(guild).team_tasks() or {}
                 if task_id not in tasks:
-                    return self._error("Aufgabe nicht gefunden.")
+                    return self._error_post("Aufgabe nicht gefunden.", request_url)
                 tasks[task_id]["status"] = new_status
                 if new_status == "done":
                     tasks[task_id]["completed_by"] = member.id
                     tasks[task_id]["completed_ts"] = int(_time.time())
                 await self.config.guild(guild).team_tasks.set(tasks)
-                return self._success(f"Aufgabe #{task_id} auf '{new_status}' gesetzt.")
+                return self._success_post(f"Aufgabe #{task_id} auf '{new_status}' gesetzt.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             tasks = await self.config.guild(guild).team_tasks() or {}
             content = "<h3>📝 Team-Aufgaben</h3>"
@@ -496,7 +544,7 @@ class DashboardIntegration:
                 content += '<div class="alert alert-info">Keine Aufgaben vorhanden.</div>'
             return self._page("📝 Aufgaben", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 6. SNIPPETS
@@ -506,6 +554,7 @@ class DashboardIntegration:
     async def rpc_snippets(self, guild, member, **kwargs) -> dict:
         """Snippets anzeigen, hinzufügen, löschen."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -516,7 +565,7 @@ class DashboardIntegration:
                 snippets = await self.config.guild(guild).snippets() or {}
                 if action == "add":
                     if not name or not content_text:
-                        return self._error("Name und Inhalt erforderlich.")
+                        return self._error_post("Name und Inhalt erforderlich.", request_url)
                     snippets[name] = {
                         "content": content_text,
                         "created_by": member.id,
@@ -526,15 +575,15 @@ class DashboardIntegration:
                         "uses_count": 0,
                     }
                     await self.config.guild(guild).snippets.set(snippets)
-                    return self._success(f"Snippet '{name}' erstellt.")
+                    return self._success_post(f"Snippet '{name}' erstellt.", request_url)
                 elif action == "delete":
                     if name in snippets:
                         del snippets[name]
                         await self.config.guild(guild).snippets.set(snippets)
-                        return self._success(f"Snippet '{name}' gelöscht.")
-                    return self._error("Snippet nicht gefunden.")
+                        return self._success_post(f"Snippet '{name}' gelöscht.", request_url)
+                    return self._error_post("Snippet nicht gefunden.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             snippets = await self.config.guild(guild).snippets() or {}
             content = """
@@ -571,7 +620,7 @@ class DashboardIntegration:
                 content += '<div class="alert alert-info">Keine Snippets vorhanden.</div>'
             return self._page("💬 Snippets", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 7. WATCHLIST
@@ -581,6 +630,7 @@ class DashboardIntegration:
     async def rpc_watchlist(self, guild, member, **kwargs) -> dict:
         """Watchlist anzeigen und User hinzufügen/entfernen."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -593,10 +643,10 @@ class DashboardIntegration:
                     try:
                         user_id = int(user_id)
                     except (ValueError, TypeError):
-                        return self._error("Ungültige User-ID.")
+                        return self._error_post("Ungültige User-ID.", request_url)
                     target = guild.get_member(user_id)
                     if not target:
-                        return self._error("User nicht auf diesem Server.")
+                        return self._error_post("User nicht auf diesem Server.", request_url)
                     wl[str(user_id)] = {
                         "added_by": member.id,
                         "added_by_name": member.display_name,
@@ -608,16 +658,16 @@ class DashboardIntegration:
                         "username": target.display_name,
                     }
                     await self.config.guild(guild).watchlist.set(wl)
-                    return self._success(f"{target.display_name} zur Watchlist hinzugefügt.")
+                    return self._success_post(f"{target.display_name} zur Watchlist hinzugefügt.", request_url)
                 elif action == "remove":
                     user_id = form_data.get("user_id", "")
                     if user_id in wl:
                         del wl[user_id]
                         await self.config.guild(guild).watchlist.set(wl)
-                        return self._success("User von Watchlist entfernt.")
-                    return self._error("User nicht auf Watchlist.")
+                        return self._success_post("User von Watchlist entfernt.", request_url)
+                    return self._error_post("User nicht auf Watchlist.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             wl = await self.config.guild(guild).watchlist() or {}
             content = """
@@ -657,7 +707,7 @@ class DashboardIntegration:
                 content += '<div class="alert alert-info">Watchlist ist leer.</div>'
             return self._page("👁️ Watchlist", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 8. TEAM-STATS
@@ -699,7 +749,7 @@ class DashboardIntegration:
             content += '</tbody></table>'
             return self._page("📊 Team-Stats / Leaderboard", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 9. WARN-SYSTEM
@@ -709,6 +759,7 @@ class DashboardIntegration:
     async def rpc_warns(self, guild, member, **kwargs) -> dict:
         """Warn-System Konfiguration und Liste."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -725,9 +776,9 @@ class DashboardIntegration:
                     cfg["warn_expiry_days"] = int(expiry)
                 cfg["notify_user_dm"] = form_data.get("notify_dm") == "on"
                 await self.config.guild(guild).warn_config.set(cfg)
-                return self._success("Warn-Konfiguration aktualisiert.")
+                return self._success_post("Warn-Konfiguration aktualisiert.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             cfg = await self.config.guild(guild).warn_config()
             strikes = await self.config.guild(guild).warn_strikes() or {}
@@ -770,7 +821,7 @@ class DashboardIntegration:
                 content += '<div class="alert alert-info">Keine Verwarnungen vergeben.</div>'
             return self._page("⚠️ Warn-System", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 10. ANTI-LINK
@@ -780,6 +831,7 @@ class DashboardIntegration:
     async def rpc_antilink(self, guild, member, **kwargs) -> dict:
         """Anti-Link System konfigurieren."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -794,9 +846,9 @@ class DashboardIntegration:
                 warn_msg = form_data.get("warn_message", "")
                 if warn_msg:
                     await self.config.guild(guild).antilink_warning_message.set(warn_msg[:500])
-                return self._success("Anti-Link Konfiguration aktualisiert.")
+                return self._success_post("Anti-Link Konfiguration aktualisiert.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             enabled = await self.config.guild(guild).antilink_enabled()
             mode = await self.config.guild(guild).antilink_mode()
@@ -833,7 +885,7 @@ class DashboardIntegration:
             """
             return self._page("🔗 Anti-Link Konfiguration", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 11. BANSYNC
@@ -843,6 +895,7 @@ class DashboardIntegration:
     async def rpc_bansync(self, guild, member, **kwargs) -> dict:
         """BanSync System konfigurieren."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -853,9 +906,9 @@ class DashboardIntegration:
                 await self.config.guild(guild).sync_kicks.set(form_data.get("sync_kicks") == "on")
                 await self.config.guild(guild).sync_warns.set(form_data.get("sync_warns") == "on")
                 await self.config.guild(guild).sync_roles.set(form_data.get("sync_roles") == "on")
-                return self._success("BanSync Konfiguration aktualisiert.")
+                return self._success_post("BanSync Konfiguration aktualisiert.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             sync_bans = await self.config.guild(guild).sync_bans()
             sync_unbans = await self.config.guild(guild).sync_unbans()
@@ -894,7 +947,7 @@ class DashboardIntegration:
             """
             return self._page("🔄 BanSync Konfiguration", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 12. MODLOG
@@ -929,7 +982,7 @@ class DashboardIntegration:
             content += '<div class="alert alert-info">Konfiguriere Modlog-Kanäle mit <code>[p]extmodlog channel &lt;event&gt; #channel</code> in Discord.</div>'
             return self._page("📜 Modlog Konfiguration", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
     # 13. SUPPORT-KONFIG
@@ -939,15 +992,16 @@ class DashboardIntegration:
     async def rpc_support_config(self, guild, member, **kwargs) -> dict:
         """Support-System Konfiguration."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
             try:
                 enabled = form_data.get("enabled") == "on"
                 await self.config.guild(guild).enabled.set(enabled)
-                return self._success("Support-Konfiguration aktualisiert.")
+                return self._success_post("Support-Konfiguration aktualisiert.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             enabled = await self.config.guild(guild).enabled()
             content = f"""
@@ -976,16 +1030,17 @@ class DashboardIntegration:
             """
             return self._page("⚙️ Support-Konfiguration", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
-    # 14. MEMBER-SUCHE (NEU)
+    # 14. MEMBER-SUCHE
     # ============================================
 
     @dashboard_page(name="membersearch", description="Member-Suche mit Bestrafungs-Historie", methods=("GET", "POST"))
     async def rpc_member_search(self, guild, member, **kwargs) -> dict:
         """Member-Info mit Bestrafungs-Historie anzeigen."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         search_query = form_data.get("query", "") if method == "POST" else ""
@@ -1000,9 +1055,7 @@ class DashboardIntegration:
             </form>
             """
             return self._page("🔍 Member-Suche", content)
-        # Suche ausführen
         target = None
-        # Versuchen als ID
         try:
             uid = int(search_query.replace("<@", "").replace(">", "").replace("!", ""))
             target = guild.get_member(uid)
@@ -1010,15 +1063,13 @@ class DashboardIntegration:
                 target = await guild.fetch_member(uid)
         except (ValueError, TypeError):
             pass
-        # Falls nicht gefunden, nach Namen suchen
         if target is None:
             for m in guild.members:
                 if search_query.lower() in m.display_name.lower() or search_query.lower() in m.name.lower():
                     target = m
                     break
         if target is None:
-            return self._error(f"Kein Member gefunden für '{search_query}'.")
-        # Info sammeln
+            return self._error_post(f"Kein Member gefunden für '{search_query}'.", request_url)
         try:
             strikes = await self.config.guild(guild).warn_strikes() or {}
             user_strikes = strikes.get(str(target.id)) or []
@@ -1027,7 +1078,6 @@ class DashboardIntegration:
             user_punishments = punishment_history.get(str(target.id)) or []
             watchlist = await self.config.guild(guild).watchlist() or {}
             on_watchlist = str(target.id) in watchlist
-            # Account- & Server-Alter
             from datetime import datetime, timezone
             account_age = (datetime.now(timezone.utc) - target.created_at).days
             join_age = (datetime.now(timezone.utc) - target.joined_at).days if target.joined_at else 0
@@ -1095,17 +1145,16 @@ class DashboardIntegration:
             """
             return self._page(f"🔍 Member: {target.display_name}", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
-    # 15. SERVER-INFO (NEU)
+    # 15. SERVER-INFO
     # ============================================
 
     @dashboard_page(name="serverinfo", description="Server-Informationen", methods=("GET",))
     async def rpc_server_info(self, guild, **kwargs) -> dict:
         """Server-Statistiken anzeigen."""
         try:
-            # Generelle Server-Info
             member_count = guild.member_count
             channel_count = len(guild.channels)
             text_channels = len(guild.text_channels)
@@ -1116,7 +1165,6 @@ class DashboardIntegration:
             boost_count = guild.premium_subscription_count
             from datetime import datetime, timezone
             created_days = (datetime.now(timezone.utc) - guild.created_at).days
-            # SupportCog Stats
             tickets = await self.config.guild(guild).tickets() or {}
             apps = await self.config.guild(guild).team_applications() or {}
             strikes = await self.config.guild(guild).warn_strikes() or {}
@@ -1144,7 +1192,6 @@ class DashboardIntegration:
                             <p><strong>🎫 Tickets gesamt:</strong> {len(tickets)}</p>
                             <p><strong>📋 Bewerbungen:</strong> {len(apps)}</p>
                             <p><strong>⚠️ User mit Verwarnungen:</strong> {len(strikes)}</p>
-                            <p><strong>🤖 Bot-Status:</strong> {'Online' if guild.me.status else 'Offline'}</p>
                             <p><strong>📌 Bot-Nickname:</strong> {guild.me.display_name}</p>
                             <p><strong>👀 Bot-Rollen:</strong> {len(guild.me.roles) - 1}</p>
                         </div>
@@ -1154,16 +1201,17 @@ class DashboardIntegration:
             """
             return self._page(f"📊 Server-Info: {guild.name}", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
-    # 16. EMBED-BUILDER (NEU)
+    # 16. EMBED-BUILDER
     # ============================================
 
     @dashboard_page(name="embedbuilder", description="Embed Builder", methods=("GET", "POST"))
     async def rpc_embed_builder(self, guild, member, **kwargs) -> dict:
         """Embeds erstellen und senden."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -1178,11 +1226,10 @@ class DashboardIntegration:
                 try:
                     channel_id = int(channel_id)
                 except (ValueError, TypeError):
-                    return self._error("Ungültige Channel-ID.")
+                    return self._error_post("Ungültige Channel-ID.", request_url)
                 channel = guild.get_channel(channel_id)
                 if not channel:
-                    return self._error("Channel nicht gefunden.")
-                # Color parsen
+                    return self._error_post("Channel nicht gefunden.", request_url)
                 try:
                     if color.startswith("0x"):
                         color_int = int(color, 16)
@@ -1192,8 +1239,6 @@ class DashboardIntegration:
                         color_int = int(color)
                 except (ValueError, TypeError):
                     color_int = 0x5865F2
-                # Embed bauen
-                import discord
                 embed = discord.Embed(
                     title=title[:256] if title else None,
                     description=description[:4096] if description else None,
@@ -1206,10 +1251,9 @@ class DashboardIntegration:
                 if thumbnail_url:
                     embed.set_thumbnail(url=thumbnail_url)
                 await channel.send(embed=embed)
-                return self._success(f"Embed an {channel.mention} gesendet.")
+                return self._success_post(f"Embed an #{channel.name} gesendet.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
-        # GET: Formular
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             channels_html = ""
             for ch in guild.text_channels[:50]:
@@ -1252,10 +1296,10 @@ class DashboardIntegration:
             """
             return self._page("📝 Embed Builder", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
-    # 17. MODLOG-VIEWER (NEU)
+    # 17. MODLOG-VIEWER
     # ============================================
 
     @dashboard_page(name="modlogviewer", description="Bestrafungs-Historie durchsuchen", methods=("GET",))
@@ -1263,18 +1307,16 @@ class DashboardIntegration:
         """Bestrafungs-Historie aller User durchsuchen."""
         try:
             punishment_history = await self.config.guild(guild).punishment_history() or {}
-            # Alle Punishments in eine flache Liste bringen
             all_punishments = []
             for uid, plist in punishment_history.items():
                 for p in plist:
                     p["user_id"] = uid
                     all_punishments.append(p)
-            # Nach Datum sortieren (neueste zuerst)
             all_punishments.sort(key=lambda x: x.get("ts", 0), reverse=True)
             content = f"<h3>📜 Bestrafungs-Historie ({len(all_punishments)} Einträge)</h3>"
             if all_punishments:
                 content += '<table class="table table-striped"><thead><tr><th>Datum</th><th>User-ID</th><th>Typ</th><th>Grund</th><th>Moderator</th></tr></thead><tbody>'
-                for p in all_punishments[:50]:  # letzte 50
+                for p in all_punishments[:50]:
                     ptype = p.get("type", "?")
                     badge_class = "danger" if ptype in ("ban", "kick") else "warning" if ptype == "warn" else "info"
                     content += f"""
@@ -1293,16 +1335,17 @@ class DashboardIntegration:
                 content += '<div class="alert alert-info">Noch keine Bestrafungen protokolliert.</div>'
             return self._page("📜 Modlog-Viewer", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
-    # 18. SLOWMODE / LOCK (NEU)
+    # 18. SLOWMODE / LOCK
     # ============================================
 
     @dashboard_page(name="slowmode", description="Slowmode & Channel-Lock", methods=("GET", "POST"))
     async def rpc_slowmode(self, guild, member, **kwargs) -> dict:
         """Slowmode und Channel-Lock verwalten."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -1312,31 +1355,29 @@ class DashboardIntegration:
                 try:
                     channel_id = int(channel_id)
                 except (ValueError, TypeError):
-                    return self._error("Ungültige Channel-ID.")
+                    return self._error_post("Ungültige Channel-ID.", request_url)
                 channel = guild.get_channel(channel_id)
                 if not channel:
-                    return self._error("Channel nicht gefunden.")
+                    return self._error_post("Channel nicht gefunden.", request_url)
                 if action == "slowmode":
                     seconds = int(form_data.get("seconds", "0"))
-                    seconds = max(0, min(seconds, 21600))  # max 6h
+                    seconds = max(0, min(seconds, 21600))
                     await channel.edit(slowmode_delay=seconds, reason=f"Slowmode via Dashboard von {member}")
-                    return self._success(f"Slowmode für #{channel.name} auf {seconds}s gesetzt.")
+                    return self._success_post(f"Slowmode für #{channel.name} auf {seconds}s gesetzt.", request_url)
                 elif action == "lock":
-                    # Lock: @everyone Send Messages entfernen
                     overwrite = channel.overwrites_for(guild.default_role)
                     overwrite.send_messages = False
                     await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=f"Lock via Dashboard von {member}")
-                    return self._success(f"Channel #{channel.name} wurde gesperrt. 🔒")
+                    return self._success_post(f"Channel #{channel.name} wurde gesperrt. 🔒", request_url)
                 elif action == "unlock":
                     overwrite = channel.overwrites_for(guild.default_role)
                     overwrite.send_messages = None
                     await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=f"Unlock via Dashboard von {member}")
-                    return self._success(f"Channel #{channel.name} wurde entsperrt. 🔓")
+                    return self._success_post(f"Channel #{channel.name} wurde entsperrt. 🔓", request_url)
                 else:
-                    return self._error("Unbekannte Aktion.")
+                    return self._error_post("Unbekannte Aktion.", request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
-        # GET: Formular
+                return self._error_post(f"Fehler: {e}", request_url)
         try:
             channels_html = ""
             for ch in guild.text_channels[:50]:
@@ -1385,16 +1426,17 @@ class DashboardIntegration:
             """
             return self._page("⏱️ Slowmode & Channel-Lock", content)
         except Exception as e:
-            return self._error(f"Fehler: {e}")
+            return self._error_page(f"Fehler: {e}")
 
     # ============================================
-    # 19. BULK-ACTIONS (NEU)
+    # 19. BULK-ACTIONS
     # ============================================
 
     @dashboard_page(name="bulkactions", description="Massen-Aktionen", methods=("GET", "POST"))
     async def rpc_bulk_actions(self, guild, member, **kwargs) -> dict:
         """Mehrere User gleichzeitig bannen/kicken/warnen."""
         method = kwargs.get("method", "GET")
+        request_url = kwargs.get("request_url", "")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
         if method == "POST":
@@ -1402,15 +1444,14 @@ class DashboardIntegration:
                 action = form_data.get("bulk_action", "")
                 user_ids_raw = form_data.get("user_ids", "")
                 reason = form_data.get("reason", "Massen-Aktion via Dashboard")
-                # User-IDs parsen (kommasepariert oder eine pro Zeile)
                 import re as _re
                 id_strings = _re.findall(r'\d{17,20}', user_ids_raw)
                 if not id_strings:
-                    return self._error("Keine gültigen User-IDs gefunden.")
+                    return self._error_post("Keine gültigen User-IDs gefunden.", request_url)
                 success = 0
                 failed = 0
                 failed_ids = []
-                for uid_str in id_strings[:50]:  # max 50 auf einmal
+                for uid_str in id_strings[:50]:
                     try:
                         uid = int(uid_str)
                         if action == "ban":
@@ -1433,7 +1474,6 @@ class DashboardIntegration:
                         elif action == "warn":
                             target = guild.get_member(uid)
                             if target:
-                                cfg = await self.config.guild(guild).warn_config()
                                 counter = await self.config.guild(guild).warn_counter() or 0
                                 counter += 1
                                 strikes = await self.config.guild(guild).warn_strikes() or {}
@@ -1460,10 +1500,9 @@ class DashboardIntegration:
                 msg = f"✅ {success} User {action}ed."
                 if failed:
                     msg += f" ❌ {failed} fehlgeschlagen: {', '.join(failed_ids[:5])}"
-                return self._success(msg)
+                return self._success_post(msg, request_url)
             except Exception as e:
-                return self._error(f"Fehler: {e}")
-        # GET: Formular
+                return self._error_post(f"Fehler: {e}", request_url)
         content = """
         <div class="alert alert-warning">
             <strong>⚠️ Warnung:</strong> Massen-Aktionen betreffen sofort alle angegebenen User. Mit Bedacht verwenden!
