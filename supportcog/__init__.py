@@ -8354,7 +8354,7 @@ class SupportCog(commands.Cog):
     # AUFGABEN-SYSTEM (TASKS / TODO)
     # ============================================
 
-    @commands.group(name="aufgabe", aliases=["task", "todo", "aufgaben"])
+    @commands.group(name="aufgabe", aliases=["stask", "saufgabe", "aufgaben"])
     @commands.guild_only()
     async def team_task(self, ctx: commands.Context):
         """Team-Aufgaben-System (To-Do-Liste fürs Team)."""
@@ -9680,7 +9680,7 @@ class SupportCog(commands.Cog):
     # TEAM-STATISTIKEN / LEADERBOARD
     # ============================================
 
-    @commands.command(name="teamstats", aliases=["leaderboard", "teamleaderboard", "tbstats"])
+    @commands.command(name="teamstats", aliases=["teamleaderboard", "tbstats"])
     @commands.guild_only()
     async def team_stats_cmd(self, ctx: commands.Context, category: str = "all"):
         """Zeigt Team-Aktivitäts-Statistiken. Kategorien: all, tickets, warns, tasks, messages.
@@ -11651,7 +11651,7 @@ class SupportCog(commands.Cog):
     # TICKET-STAFF-BEFEHLE
     # ============================================
 
-    @commands.command(name="claim", aliases=["claimticket"])
+    @commands.command(name="sclaim", aliases=["sclaimticket", "ticketclaim"])
     @commands.guild_only()
     async def claim_ticket(self, ctx: commands.Context):
         """Übernimmt ein Ticket (Claim-System). Zeigt anderen Teammitgliedern dass du zuständig bist."""
@@ -11692,7 +11692,7 @@ class SupportCog(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name="unclaim", aliases=["unclaimticket", "tunclaim"])
+    @commands.command(name="sunclaim", aliases=["sunclaimticket", "stunclaim", "ticketunclaim"])
     @commands.guild_only()
     async def unclaim_ticket(self, ctx: commands.Context):
         """Gibt ein geclaimtes Ticket wieder ab (Unclaim). Das Ticket ist danach wieder für alle Teammitglieder offen."""
