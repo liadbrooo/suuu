@@ -2,20 +2,9 @@
 Diese Datei macht alle wichtigen Funktionen des supportcog über das
 Web-Dashboard von AAA3A (https://github.com/AAA3A-AAA3A/AAA3A-cogs) verfügbar.
 
-Funktionen die im Dashboard verfügbar sind:
-- Übersicht / Stats
-- Support-Konfiguration
-- Mod-Aktionen (Ban/Kick/Timeout/Warn)
-- Tickets & Kategorien
-- Bewerbungen
-- Aufgaben (Tasks)
-- Snippets
-- Watchlist
-- Team-Stats / Leaderboard
-- Anti-Link Konfiguration
-- BanSync Konfiguration
-- Modlog Konfiguration
-- Warn-System Konfiguration
+WICHTIG: Die Funktionsparameter 'guild' und 'member' MÜSSEN explizit in der
+Signatur stehen (nicht nur via kwargs.get). Das Dashboard leitet daraus ab,
+dass die Seite guild-scoped ist und injiziert automatisch die Live-Objekte.
 """
 import typing
 import json
@@ -45,7 +34,6 @@ class DashboardIntegration:
         """Wird aufgerufen wenn das Dashboard-Cog geladen wird.
         Registriert diesen Cog als Third-Party-Integration."""
         try:
-            # Warten bis der Cog vollständig initialisiert ist
             if hasattr(self, "settings") and hasattr(self.settings, "commands_added"):
                 await self.settings.commands_added.wait()
         except Exception:
@@ -61,45 +49,6 @@ class DashboardIntegration:
     # ============================================
     # HELPER
     # ============================================
-
-    def _embed_to_html(self, embed) -> str:
-        """Konvertiert ein Discord.Embed in einfaches HTML für das Dashboard."""
-        try:
-            color = "#5865F2"
-            if embed.color:
-                color = "#{:06x}".format(embed.color.value)
-            html = f'<div style="border-left:4px solid {color};padding:12px;margin:8px 0;background:#2b2d31;border-radius:4px;">'
-            if embed.title:
-                html += f'<h3 style="margin:0 0 8px 0;color:#fff;">{embed.title}</h3>'
-            if embed.description:
-                html += f'<div style="color:#dbdee1;margin-bottom:8px;">{embed.description}</div>'
-            for field in getattr(embed, "_fields", []):
-                html += f'<div style="margin-top:8px;"><strong style="color:#fff;">{field.get("name","")}</strong><br><span style="color:#dbdee1;">{field.get("value","")}</span></div>'
-            html += '</div>'
-            return html
-        except Exception:
-            return "<div>Embed-Anzeige fehlgeschlagen</div>"
-
-    def _config_to_form_fields(self, config_dict: dict, prefix: str = "") -> list:
-        """Erstellt Formular-Felder aus einem Config-Dictionary."""
-        fields = []
-        for key, value in config_dict.items():
-            field_name = f"{prefix}{key}" if prefix else key
-            field_type = "text"
-            if isinstance(value, bool):
-                field_type = "checkbox"
-            elif isinstance(value, int):
-                field_type = "number"
-            elif isinstance(value, list):
-                field_type = "text"
-                value = ", ".join(str(v) for v in value)
-            fields.append({
-                "name": field_name,
-                "label": key.replace("_", " ").title(),
-                "type": field_type,
-                "value": value if not isinstance(value, list) else ", ".join(str(v) for v in value),
-            })
-        return fields
 
     def _success(self, message: str, **extra) -> dict:
         return {
@@ -134,14 +83,10 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name=None, description="SupportCog Übersicht", methods=("GET",))
-    async def rpc_overview(self, **kwargs) -> dict:
+    async def rpc_overview(self, guild, **kwargs) -> dict:
         """Hauptseite: Übersicht über alle SupportCog-Statistiken."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         try:
             config = self.config.guild(guild)
-            # Statistiken sammeln
             tickets = await config.tickets() or {}
             apps = await config.team_applications() or {}
             tasks = await config.team_tasks() or {}
@@ -149,7 +94,6 @@ class DashboardIntegration:
             snippets = await config.snippets() or {}
             watchlist = await config.watchlist() or {}
             activity = await config.team_activity() or {}
-            # Zählen
             open_tickets = sum(1 for t in tickets.values() if t.get("status") == "open")
             pending_apps = sum(1 for a in apps.values() if a.get("status") == "pending")
             open_tasks = sum(1 for t in tasks.values() if t.get("status") in ("open", "in_progress"))
@@ -247,11 +191,9 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="modactions", description="Mod-Aktionen ausführen", methods=("GET", "POST"))
-    async def rpc_mod_actions(self, **kwargs) -> dict:
-        """Seite für Mod-Aktionen: Ban, Kick, Timeout, Warn."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
+    async def rpc_mod_actions(self, guild, member, **kwargs) -> dict:
+        """Seite für Mod-Aktionen: Ban, Kick, Timeout, Warn.
+        guild und member werden vom Dashboard automatisch injiziert."""
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -266,47 +208,45 @@ class DashboardIntegration:
             except (ValueError, TypeError):
                 return self._error("Ungültige User-ID.")
             try:
-                member = guild.get_member(user_id)
-                if member is None:
-                    member = await guild.fetch_member(user_id)
+                target = guild.get_member(user_id)
+                if target is None:
+                    target = await guild.fetch_member(user_id)
             except Exception:
-                member = None
-            if member is None:
+                target = None
+            if target is None:
                 return self._error("User nicht auf diesem Server gefunden.")
-            # Aktion ausführen
             try:
                 if action == "ban":
                     if anonymous:
-                        dm_sent = await self._send_mod_dm(member, guild, "ban", moderator=kwargs.get("member", guild.me), reason=reason, anonymous=True)
-                        await member.ban(reason=f"Anonymer Ban via Dashboard: {reason}", delete_message_days=1)
+                        await self._send_mod_dm(target, guild, "ban", moderator=member, reason=reason, anonymous=True)
                     else:
-                        dm_sent = await self._send_mod_dm(member, guild, "ban", moderator=kwargs.get("member", guild.me), reason=reason)
-                        await member.ban(reason=f"Ban via Dashboard: {reason}", delete_message_days=1)
-                    await self._punishment_record(guild, member.id, "ban", reason, kwargs.get("member", guild.me))
-                    return self._success(f"🔨 {member.display_name} wurde gebannt.")
+                        await self._send_mod_dm(target, guild, "ban", moderator=member, reason=reason)
+                    await target.ban(reason=f"Ban via Dashboard von {member}: {reason}", delete_message_days=1)
+                    await self._punishment_record(guild, target.id, "ban", reason, member)
+                    return self._success(f"🔨 {target.display_name} wurde gebannt.")
                 elif action == "kick":
                     if anonymous:
-                        dm_sent = await self._send_mod_dm(member, guild, "kick", moderator=kwargs.get("member", guild.me), reason=reason, anonymous=True)
+                        await self._send_mod_dm(target, guild, "kick", moderator=member, reason=reason, anonymous=True)
                     else:
-                        dm_sent = await self._send_mod_dm(member, guild, "kick", moderator=kwargs.get("member", guild.me), reason=reason)
-                    await member.kick(reason=f"Kick via Dashboard: {reason}")
-                    await self._punishment_record(guild, member.id, "kick", reason, kwargs.get("member", guild.me))
-                    return self._success(f"👢 {member.display_name} wurde gekickt.")
+                        await self._send_mod_dm(target, guild, "kick", moderator=member, reason=reason)
+                    await target.kick(reason=f"Kick via Dashboard von {member}: {reason}")
+                    await self._punishment_record(guild, target.id, "kick", reason, member)
+                    return self._success(f"👢 {target.display_name} wurde gekickt.")
                 elif action == "timeout":
                     seconds = self._parse_duration(duration)
                     if seconds is None:
                         return self._error("Ungültige Dauer. Verwende z.B. 30s, 5m, 2h, 1d.")
                     if seconds > 28 * 86400:
                         return self._error("Timeout darf maximal 28 Tage dauern.")
-                    from datetime import timedelta, datetime as _dt
-                    until = _dt.now(tz=member.joined_at.tzinfo if member.joined_at else None) + timedelta(seconds=seconds)
+                    from datetime import timedelta, datetime as _dt, timezone as _tz
+                    until = _dt.now(tz=_tz.utc) + timedelta(seconds=seconds)
                     if anonymous:
-                        await self._send_mod_dm(member, guild, "timeout", moderator=kwargs.get("member", guild.me), reason=reason, duration=duration, anonymous=True)
+                        await self._send_mod_dm(target, guild, "timeout", moderator=member, reason=reason, duration=duration, anonymous=True)
                     else:
-                        await self._send_mod_dm(member, guild, "timeout", moderator=kwargs.get("member", guild.me), reason=reason, duration=duration)
-                    await member.timeout(until, reason=f"Timeout via Dashboard: {reason}")
-                    await self._punishment_record(guild, member.id, "timeout", f"{reason} ({duration})", kwargs.get("member", guild.me))
-                    return self._success(f"⏰ {member.display_name} wurde für {duration} getimeoutet.")
+                        await self._send_mod_dm(target, guild, "timeout", moderator=member, reason=reason, duration=duration)
+                    await target.timeout(until, reason=f"Timeout via Dashboard von {member}: {reason}")
+                    await self._punishment_record(guild, target.id, "timeout", f"{reason} ({duration})", member)
+                    return self._success(f"⏰ {target.display_name} wurde für {duration} getimeoutet.")
                 elif action == "warn":
                     cfg = await self.config.guild(guild).warn_config()
                     counter = await self.config.guild(guild).warn_counter() or 0
@@ -318,24 +258,24 @@ class DashboardIntegration:
                         import time as _time
                         expires_ts = int(_time.time()) + expiry_days * 86400
                     strikes = await self.config.guild(guild).warn_strikes() or {}
-                    user_strikes = strikes.get(str(member.id)) or []
+                    user_strikes = strikes.get(str(target.id)) or []
                     user_strikes.append({
                         "warn_id": warn_id,
                         "reason": f"[{'ANONYM' if anonymous else ''}] {reason}",
-                        "moderator_id": kwargs.get("member", guild.me).id if hasattr(kwargs.get("member", guild.me), 'id') else 0,
-                        "moderator_name": kwargs.get("member", guild.me).display_name if hasattr(kwargs.get("member", guild.me), 'display_name') else "Dashboard",
+                        "moderator_id": member.id,
+                        "moderator_name": f"{member.display_name}{' (anonym)' if anonymous else ''}",
                         "ts": int(__import__('time').time()),
                         "expires_ts": expires_ts,
                     })
-                    strikes[str(member.id)] = user_strikes
+                    strikes[str(target.id)] = user_strikes
                     await self.config.guild(guild).warn_strikes.set(strikes)
                     await self.config.guild(guild).warn_counter.set(counter)
-                    await self._punishment_record(guild, member.id, "warn", reason, kwargs.get("member", guild.me))
+                    await self._punishment_record(guild, target.id, "warn", reason, member)
                     if anonymous:
-                        await self._send_mod_dm(member, guild, "warn", moderator=kwargs.get("member", guild.me), reason=reason, anonymous=True)
+                        await self._send_mod_dm(target, guild, "warn", moderator=member, reason=reason, anonymous=True)
                     else:
-                        await self._send_mod_dm(member, guild, "warn", moderator=kwargs.get("member", guild.me), reason=reason)
-                    return self._success(f"⚠️ {member.display_name} wurde verwarnt ({len(user_strikes)} aktiv).")
+                        await self._send_mod_dm(target, guild, "warn", moderator=member, reason=reason)
+                    return self._success(f"⚠️ {target.display_name} wurde verwarnt ({len(user_strikes)} aktiv).")
                 else:
                     return self._error("Unbekannte Aktion.")
             except Exception as e:
@@ -385,15 +325,11 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="tickets", description="Tickets & Kategorien", methods=("GET",))
-    async def rpc_tickets(self, **kwargs) -> dict:
+    async def rpc_tickets(self, guild, **kwargs) -> dict:
         """Tickets-Übersicht und Kategorien."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         try:
             tickets = await self.config.guild(guild).tickets() or {}
             categories = await self.config.guild(guild).ticket_categories() or {}
-            # Tickets auflisten
             tickets_html = ""
             if tickets:
                 tickets_html = '<table class="table table-striped"><thead><tr><th>ID</th><th>User</th><th>Channel</th><th>Status</th><th>Erstellt</th></tr></thead><tbody>'
@@ -404,7 +340,6 @@ class DashboardIntegration:
                 tickets_html += '</tbody></table>'
             else:
                 tickets_html = '<div class="alert alert-info">Keine Tickets vorhanden.</div>'
-            # Kategorien
             cats_html = ""
             if categories:
                 cats_html = '<div class="row">'
@@ -439,11 +374,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="applications", description="Bewerbungen verwalten", methods=("GET", "POST"))
-    async def rpc_applications(self, **kwargs) -> dict:
+    async def rpc_applications(self, guild, member, **kwargs) -> dict:
         """Bewerbungen anzeigen und entscheiden."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -460,26 +392,25 @@ class DashboardIntegration:
                     return self._error("Bewerbung wurde bereits entschieden.")
                 new_status = "accepted" if decision == "accept" else "rejected"
                 app["status"] = new_status
+                app["decided_by"] = member.id
                 app["decided_ts"] = int(__import__('time').time())
                 app["decision_reason"] = reason[:500] if reason else None
                 apps[app_id] = app
                 await self.config.guild(guild).team_applications.set(apps)
-                # Auto-Rolle vergeben
                 if new_status == "accepted":
                     accepted_role_id = await self.config.guild(guild).team_applications_accepted_role()
                     if accepted_role_id:
                         try:
-                            member = guild.get_member(app.get("user_id"))
-                            if member:
+                            target = guild.get_member(app.get("user_id"))
+                            if target:
                                 role = guild.get_role(accepted_role_id)
                                 if role:
-                                    await member.add_roles(role, reason=f"Bewerbung #{app_id} angenommen via Dashboard")
+                                    await target.add_roles(role, reason=f"Bewerbung #{app_id} angenommen via Dashboard von {member}")
                         except Exception:
                             pass
                 return self._success(f"Bewerbung #{app_id} wurde {new_status}.")
             except Exception as e:
                 return self._error(f"Fehler: {e}")
-        # GET: Liste anzeigen
         try:
             apps = await self.config.guild(guild).team_applications() or {}
             pending = {k: v for k, v in apps.items() if v.get("status") == "pending"}
@@ -529,11 +460,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="tasks", description="Aufgaben verwalten", methods=("GET", "POST"))
-    async def rpc_tasks(self, **kwargs) -> dict:
+    async def rpc_tasks(self, guild, member, **kwargs) -> dict:
         """Aufgaben anzeigen und Status ändern."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -547,6 +475,7 @@ class DashboardIntegration:
                 tasks[task_id]["status"] = new_status
                 if new_status == "done":
                     import time as _time
+                    tasks[task_id]["completed_by"] = member.id
                     tasks[task_id]["completed_ts"] = int(_time.time())
                 await self.config.guild(guild).team_tasks.set(tasks)
                 return self._success(f"Aufgabe #{task_id} auf '{new_status}' gesetzt.")
@@ -593,11 +522,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="snippets", description="Snippets verwalten", methods=("GET", "POST"))
-    async def rpc_snippets(self, **kwargs) -> dict:
+    async def rpc_snippets(self, guild, member, **kwargs) -> dict:
         """Snippets anzeigen, hinzufügen, bearbeiten, löschen."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -612,8 +538,8 @@ class DashboardIntegration:
                         return self._error("Name und Inhalt erforderlich.")
                     snippets[name] = {
                         "content": content_text,
-                        "created_by": 0,
-                        "created_by_name": "Dashboard",
+                        "created_by": member.id,
+                        "created_by_name": member.display_name,
                         "created_ts": int(__import__('time').time()),
                         "last_used": None,
                         "uses_count": 0,
@@ -679,11 +605,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="watchlist", description="Watchlist verwalten", methods=("GET", "POST"))
-    async def rpc_watchlist(self, **kwargs) -> dict:
+    async def rpc_watchlist(self, guild, member, **kwargs) -> dict:
         """Watchlist anzeigen und User hinzufügen/entfernen."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -698,21 +621,21 @@ class DashboardIntegration:
                         user_id = int(user_id)
                     except (ValueError, TypeError):
                         return self._error("Ungültige User-ID.")
-                    member = guild.get_member(user_id)
-                    if not member:
+                    target = guild.get_member(user_id)
+                    if not target:
                         return self._error("User nicht auf diesem Server.")
                     wl[str(user_id)] = {
-                        "added_by": 0,
-                        "added_by_name": "Dashboard",
+                        "added_by": member.id,
+                        "added_by_name": member.display_name,
                         "added_ts": int(__import__('time').time()),
                         "reason": reason,
                         "notify_on_message": True,
                         "notify_on_voice": True,
                         "notify_on_rejoin": True,
-                        "username": member.display_name,
+                        "username": target.display_name,
                     }
                     await self.config.guild(guild).watchlist.set(wl)
-                    return self._success(f"{member.display_name} zur Watchlist hinzugefügt.")
+                    return self._success(f"{target.display_name} zur Watchlist hinzugefügt.")
                 elif action == "remove":
                     user_id = form_data.get("user_id", "")
                     if user_id in wl:
@@ -770,16 +693,12 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="teamstats", description="Team-Statistiken", methods=("GET",))
-    async def rpc_team_stats(self, **kwargs) -> dict:
+    async def rpc_team_stats(self, guild, **kwargs) -> dict:
         """Team-Statistiken und Leaderboard."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         try:
             activity = await self.config.guild(guild).team_activity() or {}
             if not activity:
                 return self._page("📊 Team-Stats", '<div class="alert alert-info">Noch keine Team-Aktivität erfasst.</div>')
-            # Score berechnen und sortieren
             def _score(d):
                 return (
                     d.get("tickets_closed", 0) * 5
@@ -791,8 +710,8 @@ class DashboardIntegration:
             content = '<table class="table table-striped"><thead><tr><th>Rang</th><th>Mitglied</th><th>Tickets</th><th>Warns</th><th>Aufgaben</th><th>Nachrichten</th><th>Score</th></tr></thead><tbody>'
             medals = ["🥇", "🥈", "🥉"]
             for i, (uid, data) in enumerate(sorted_act[:25]):
-                member = guild.get_member(int(uid))
-                name = member.display_name if member else data.get("username", f"User {uid}")
+                m = guild.get_member(int(uid))
+                name = m.display_name if m else data.get("username", f"User {uid}")
                 rank = medals[i] if i < 3 else f"#{i+1}"
                 score = _score(data)
                 content += f"""
@@ -816,11 +735,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="warns", description="Warn-System", methods=("GET", "POST"))
-    async def rpc_warns(self, **kwargs) -> dict:
+    async def rpc_warns(self, guild, member, **kwargs) -> dict:
         """Warn-System Konfiguration und Liste."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -891,11 +807,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="antilink", description="Anti-Link Konfiguration", methods=("GET", "POST"))
-    async def rpc_antilink(self, **kwargs) -> dict:
+    async def rpc_antilink(self, guild, member, **kwargs) -> dict:
         """Anti-Link System konfigurieren."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -958,11 +871,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="bansync", description="BanSync Konfiguration", methods=("GET", "POST"))
-    async def rpc_bansync(self, **kwargs) -> dict:
+    async def rpc_bansync(self, guild, member, **kwargs) -> dict:
         """BanSync System konfigurieren."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -1023,11 +933,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="modlog", description="Modlog Konfiguration", methods=("GET",))
-    async def rpc_modlog(self, **kwargs) -> dict:
+    async def rpc_modlog(self, guild, **kwargs) -> dict:
         """Modlog-Übersicht."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         try:
             modlog_channels = await self.config.guild(guild).modlog_channels() or {}
             ignored_channels = await self.config.guild(guild).modlog_ignored_channels() or []
@@ -1035,10 +942,10 @@ class DashboardIntegration:
             <h3>📜 Modlog-Kanäle</h3>
             """
             if modlog_channels:
-                content += '<table class="table table-striped"><thead><tr><th>Event-Typ</th><th>Channel-ID</th></tr></thead><tbody>'
+                content += '<table class="table table-striped"><thead><tr><th>Event-Typ</th><th>Channel</th></tr></thead><tbody>'
                 for event_type, ch_id in modlog_channels.items():
                     ch = guild.get_channel(ch_id) if ch_id else None
-                    ch_name = ch.mention if ch else f"Channel {ch_id} (gelöscht)"
+                    ch_name = f"#{ch.name}" if ch else f"Channel {ch_id} (gelöscht)"
                     content += f'<tr><td>{event_type}</td><td>{ch_name}</td></tr>'
                 content += '</tbody></table>'
             else:
@@ -1050,7 +957,7 @@ class DashboardIntegration:
                 content += '<ul>'
                 for ch_id in ignored_channels:
                     ch = guild.get_channel(ch_id)
-                    content += f'<li>{ch.mention if ch else f"Channel {ch_id} (gelöscht)"}</li>'
+                    content += f'<li>#{ch.name} if ch else f"Channel {ch_id} (gelöscht)"</li>'
                 content += '</ul>'
             else:
                 content += '<div class="alert alert-info">Keine Channels ignoriert.</div>'
@@ -1064,11 +971,8 @@ class DashboardIntegration:
     # ============================================
 
     @dashboard_page(name="supportconfig", description="Support-Konfiguration", methods=("GET", "POST"))
-    async def rpc_support_config(self, **kwargs) -> dict:
+    async def rpc_support_config(self, guild, member, **kwargs) -> dict:
         """Support-System Konfiguration."""
-        guild = kwargs.get("guild")
-        if guild is None:
-            return self._error("Keine Guild angegeben.")
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
