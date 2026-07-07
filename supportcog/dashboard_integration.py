@@ -2,18 +2,19 @@
 Diese Datei macht alle wichtigen Funktionen des supportcog über das
 Web-Dashboard von AAA3A (https://github.com/AAA3A-AAA3A/AAA3A-cogs) verfügbar.
 
-WICHTIG: Die Funktionsparameter 'guild' und 'member' MÜSSEN explizit in der
-Signatur stehen (nicht nur via kwargs.get). Das Dashboard leitet daraus ab,
-dass die Seite guild-scoped ist und injiziert automatisch die Live-Objekte.
+WICHTIG:
+- 'guild' und 'member' müssen explizit als Funktionsparameter stehen (nicht via kwargs.get)
+- Keine hardcoded <a href> Links ins Dashboard verwenden (bricht die SPA)
+- Keine manuellen CSRF-Tokens (das Dashboard kümmert sich selbst drum)
+- web_content.standalone=False damit Dashboard-Layout erhalten bleibt
 """
 import typing
 import json
+import time as _time
 from redbot.core import commands
 from redbot.core.bot import Red
 
 # Lokaler dashboard_page Decorator-Stub.
-# WICHTIG: Nicht "from dashboard.rpc.third_parties import dashboard_page" verwenden,
-# denn das Dashboard-Cog ist möglicherweise nicht installiert!
 # Das Dashboard-Cog ersetzt diesen Stub beim Laden durch den echten Decorator.
 def dashboard_page(*args, **kwargs):
     def decorator(func):
@@ -23,16 +24,13 @@ def dashboard_page(*args, **kwargs):
 
 
 class DashboardIntegration:
-    """Mixin für die AAA3A Dashboard-Integration.
-    Der SupportCog erbt von dieser Klasse, damit alle mit @dashboard_page
-    markierten Methoden automatisch im Web-Dashboard verfügbar sind."""
+    """Mixin für die AAA3A Dashboard-Integration."""
 
     bot: Red
 
     @commands.Cog.listener()
     async def on_dashboard_cog_add(self, dashboard_cog: commands.Cog) -> None:
-        """Wird aufgerufen wenn das Dashboard-Cog geladen wird.
-        Registriert diesen Cog als Third-Party-Integration."""
+        """Wird aufgerufen wenn das Dashboard-Cog geladen wird."""
         try:
             if hasattr(self, "settings") and hasattr(self.settings, "commands_added"):
                 await self.settings.commands_added.wait()
@@ -77,6 +75,17 @@ class DashboardIntegration:
             "web_content": {"source": html, "standalone": False, "fullscreen": False},
             **extra,
         }
+
+    def _fmt_ts(self, ts) -> str:
+        """Formatiert einen Timestamp lesbar."""
+        try:
+            if not ts:
+                return "—"
+            from datetime import datetime
+            dt = datetime.fromtimestamp(int(ts))
+            return dt.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return str(ts) if ts else "—"
 
     # ============================================
     # 1. ÜBERSICHT / STATS
@@ -164,22 +173,10 @@ class DashboardIntegration:
                     </div>
                 </div>
             </div>
-            <div class="mt-4">
-                <h3>Verfügbare Seiten</h3>
-                <div class="list-group">
-                    <a href="/third_parties/supportcog/modactions" class="list-group-item list-group-item-action">🔨 Mod-Aktionen (Ban/Kick/Timeout/Warn)</a>
-                    <a href="/third_parties/supportcog/tickets" class="list-group-item list-group-item-action">🎫 Tickets & Kategorien</a>
-                    <a href="/third_parties/supportcog/applications" class="list-group-item list-group-item-action">📋 Bewerbungen</a>
-                    <a href="/third_parties/supportcog/tasks" class="list-group-item list-group-item-action">📝 Aufgaben</a>
-                    <a href="/third_parties/supportcog/snippets" class="list-group-item list-group-item-action">💬 Snippets</a>
-                    <a href="/third_parties/supportcog/watchlist" class="list-group-item list-group-item-action">👁️ Watchlist</a>
-                    <a href="/third_parties/supportcog/teamstats" class="list-group-item list-group-item-action">📊 Team-Stats</a>
-                    <a href="/third_parties/supportcog/warns" class="list-group-item list-group-item-action">⚠️ Warn-System</a>
-                    <a href="/third_parties/supportcog/antilink" class="list-group-item list-group-item-action">🔗 Anti-Link</a>
-                    <a href="/third_parties/supportcog/bansync" class="list-group-item list-group-item-action">🔄 BanSync</a>
-                    <a href="/third_parties/supportcog/modlog" class="list-group-item list-group-item-action">📜 Modlog</a>
-                    <a href="/third_parties/supportcog/supportconfig" class="list-group-item list-group-item-action">⚙️ Support-Konfiguration</a>
-                </div>
+            <div class="alert alert-info mt-4">
+                <h5>📖 Available Pages</h5>
+                <p class="mb-0">Verwende die Seitenleiste um zu den einzelnen Seiten zu navigieren.<br>
+                Verfügbare Seiten: Mod-Aktionen, Tickets, Bewerbungen, Aufgaben, Snippets, Watchlist, Team-Stats, Warns, Anti-Link, BanSync, Modlog, Support-Konfig, Member-Suche, Server-Info, Embed-Builder, Modlog-Viewer, Slowmode/Lock.</p>
             </div>
             """
             return self._page("SupportCog Übersicht", content)
@@ -187,13 +184,12 @@ class DashboardIntegration:
             return self._error(f"Fehler beim Laden der Übersicht: {e}")
 
     # ============================================
-    # 2. MOD-AKTIONEN (Ban/Kick/Timeout/Warn)
+    # 2. MOD-AKTIONEN
     # ============================================
 
     @dashboard_page(name="modactions", description="Mod-Aktionen ausführen", methods=("GET", "POST"))
     async def rpc_mod_actions(self, guild, member, **kwargs) -> dict:
-        """Seite für Mod-Aktionen: Ban, Kick, Timeout, Warn.
-        guild und member werden vom Dashboard automatisch injiziert."""
+        """Seite für Mod-Aktionen: Ban, Kick, Timeout, Warn."""
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -255,7 +251,6 @@ class DashboardIntegration:
                     expires_ts = None
                     expiry_days = cfg.get("warn_expiry_days", 30)
                     if expiry_days > 0:
-                        import time as _time
                         expires_ts = int(_time.time()) + expiry_days * 86400
                     strikes = await self.config.guild(guild).warn_strikes() or {}
                     user_strikes = strikes.get(str(target.id)) or []
@@ -264,7 +259,7 @@ class DashboardIntegration:
                         "reason": f"[{'ANONYM' if anonymous else ''}] {reason}",
                         "moderator_id": member.id,
                         "moderator_name": f"{member.display_name}{' (anonym)' if anonymous else ''}",
-                        "ts": int(__import__('time').time()),
+                        "ts": int(_time.time()),
                         "expires_ts": expires_ts,
                     })
                     strikes[str(target.id)] = user_strikes
@@ -280,10 +275,8 @@ class DashboardIntegration:
                     return self._error("Unbekannte Aktion.")
             except Exception as e:
                 return self._error(f"Aktion fehlgeschlagen: {e}")
-        # GET: Formular anzeigen
         content = """
         <form method="POST" class="needs-validation" novalidate>
-            <input type="hidden" name="csrf_token" id="csrf_token">
             <div class="mb-3">
                 <label for="action" class="form-label">Aktion</label>
                 <select class="form-select" id="action" name="action" required>
@@ -312,16 +305,11 @@ class DashboardIntegration:
             </div>
             <button type="submit" class="btn btn-danger">Aktion ausführen</button>
         </form>
-        <script>
-        document.getElementById('action').addEventListener('change', function() {
-            document.getElementById('duration_div').style.display = this.value === 'timeout' ? 'block' : 'none';
-        });
-        </script>
         """
         return self._page("🔨 Mod-Aktionen", content)
 
     # ============================================
-    # 3. TICKETS & KATEGORIEN
+    # 3. TICKETS
     # ============================================
 
     @dashboard_page(name="tickets", description="Tickets & Kategorien", methods=("GET",))
@@ -393,7 +381,7 @@ class DashboardIntegration:
                 new_status = "accepted" if decision == "accept" else "rejected"
                 app["status"] = new_status
                 app["decided_by"] = member.id
-                app["decided_ts"] = int(__import__('time').time())
+                app["decided_ts"] = int(_time.time())
                 app["decision_reason"] = reason[:500] if reason else None
                 apps[app_id] = app
                 await self.config.guild(guild).team_applications.set(apps)
@@ -405,7 +393,7 @@ class DashboardIntegration:
                             if target:
                                 role = guild.get_role(accepted_role_id)
                                 if role:
-                                    await target.add_roles(role, reason=f"Bewerbung #{app_id} angenommen via Dashboard von {member}")
+                                    await target.add_roles(role, reason=f"Bewerbung #{app_id} via Dashboard von {member}")
                         except Exception:
                             pass
                 return self._success(f"Bewerbung #{app_id} wurde {new_status}.")
@@ -415,23 +403,18 @@ class DashboardIntegration:
             apps = await self.config.guild(guild).team_applications() or {}
             pending = {k: v for k, v in apps.items() if v.get("status") == "pending"}
             decided = {k: v for k, v in apps.items() if v.get("status") != "pending"}
-            content = f"""
-            <h3>⏳ Offene Bewerbungen ({len(pending)})</h3>
-            """
+            content = f"<h3>⏳ Offene Bewerbungen ({len(pending)})</h3>"
             if pending:
                 for app_id, app in list(pending.items())[-15:]:
                     content += f"""
                     <div class="card mb-3">
-                        <div class="card-header">
-                            Bewerbung #{app_id} — {app.get('position', '?')}
-                        </div>
+                        <div class="card-header">Bewerbung #{app_id} — {app.get('position', '?')}</div>
                         <div class="card-body">
                             <p><strong>Bewerber:</strong> {app.get('username', '?')} (<code>{app.get('user_id', '?')}</code>)</p>
                             <p><strong>Bewerbungstext:</strong></p>
                             <div class="bg-light p-2 rounded">{app.get('application_text', 'Kein Text')[:500]}</div>
                             <form method="POST" class="mt-3">
                                 <input type="hidden" name="app_id" value="{app_id}">
-                                <input type="hidden" name="csrf_token" id="csrf_token">
                                 <div class="mb-2">
                                     <input type="text" class="form-control" name="reason" placeholder="Begründung (optional)">
                                 </div>
@@ -456,7 +439,7 @@ class DashboardIntegration:
             return self._error(f"Fehler: {e}")
 
     # ============================================
-    # 5. AUFGABEN (TASKS)
+    # 5. AUFGABEN
     # ============================================
 
     @dashboard_page(name="tasks", description="Aufgaben verwalten", methods=("GET", "POST"))
@@ -474,7 +457,6 @@ class DashboardIntegration:
                     return self._error("Aufgabe nicht gefunden.")
                 tasks[task_id]["status"] = new_status
                 if new_status == "done":
-                    import time as _time
                     tasks[task_id]["completed_by"] = member.id
                     tasks[task_id]["completed_ts"] = int(_time.time())
                 await self.config.guild(guild).team_tasks.set(tasks)
@@ -499,7 +481,6 @@ class DashboardIntegration:
                         <td>
                             <form method="POST" style="display:inline-flex;">
                                 <input type="hidden" name="task_id" value="{tid}">
-                                <input type="hidden" name="csrf_token" id="csrf_token">
                                 <select name="status" class="form-select form-select-sm" style="width:auto;" onchange="this.form.submit()">
                                     <option value="open" {'selected' if status=='open' else ''}>Offen</option>
                                     <option value="in_progress" {'selected' if status=='in_progress' else ''}>In Bearbeitung</option>
@@ -523,7 +504,7 @@ class DashboardIntegration:
 
     @dashboard_page(name="snippets", description="Snippets verwalten", methods=("GET", "POST"))
     async def rpc_snippets(self, guild, member, **kwargs) -> dict:
-        """Snippets anzeigen, hinzufügen, bearbeiten, löschen."""
+        """Snippets anzeigen, hinzufügen, löschen."""
         method = kwargs.get("method", "GET")
         data = kwargs.get("data", {})
         form_data = data.get("form", {}) if isinstance(data, dict) else {}
@@ -540,7 +521,7 @@ class DashboardIntegration:
                         "content": content_text,
                         "created_by": member.id,
                         "created_by_name": member.display_name,
-                        "created_ts": int(__import__('time').time()),
+                        "created_ts": int(_time.time()),
                         "last_used": None,
                         "uses_count": 0,
                     }
@@ -552,12 +533,6 @@ class DashboardIntegration:
                         await self.config.guild(guild).snippets.set(snippets)
                         return self._success(f"Snippet '{name}' gelöscht.")
                     return self._error("Snippet nicht gefunden.")
-                elif action == "edit":
-                    if name in snippets:
-                        snippets[name]["content"] = content_text
-                        await self.config.guild(guild).snippets.set(snippets)
-                        return self._success(f"Snippet '{name}' aktualisiert.")
-                    return self._error("Snippet nicht gefunden.")
             except Exception as e:
                 return self._error(f"Fehler: {e}")
         try:
@@ -566,7 +541,6 @@ class DashboardIntegration:
             <h3>💬 Neues Snippet</h3>
             <form method="POST" class="mb-4">
                 <input type="hidden" name="snippet_action" value="add">
-                <input type="hidden" name="csrf_token" id="csrf_token">
                 <div class="mb-2">
                     <input type="text" class="form-control" name="name" placeholder="Snippet-Name (z.B. rules)" required>
                 </div>
@@ -588,7 +562,6 @@ class DashboardIntegration:
                             <form method="POST" style="display:inline;">
                                 <input type="hidden" name="snippet_action" value="delete">
                                 <input type="hidden" name="name" value="{name}">
-                                <input type="hidden" name="csrf_token" id="csrf_token">
                                 <button type="submit" class="btn btn-danger btn-sm">🗑️ Löschen</button>
                             </form>
                         </div>
@@ -627,7 +600,7 @@ class DashboardIntegration:
                     wl[str(user_id)] = {
                         "added_by": member.id,
                         "added_by_name": member.display_name,
-                        "added_ts": int(__import__('time').time()),
+                        "added_ts": int(_time.time()),
                         "reason": reason,
                         "notify_on_message": True,
                         "notify_on_voice": True,
@@ -651,7 +624,6 @@ class DashboardIntegration:
             <h3>👁️ User hinzufügen</h3>
             <form method="POST" class="mb-4">
                 <input type="hidden" name="wl_action" value="add">
-                <input type="hidden" name="csrf_token" id="csrf_token">
                 <div class="mb-2">
                     <input type="number" class="form-control" name="user_id" placeholder="User-ID" required>
                 </div>
@@ -670,12 +642,11 @@ class DashboardIntegration:
                     <tr>
                         <td>{data.get('username', '?')} (<code>{uid}</code>)</td>
                         <td>{data.get('reason', '?')[:100]}</td>
-                        <td>{data.get('added_ts', '?')}</td>
+                        <td>{self._fmt_ts(data.get('added_ts'))}</td>
                         <td>
                             <form method="POST" style="display:inline;">
                                 <input type="hidden" name="wl_action" value="remove">
                                 <input type="hidden" name="user_id" value="{uid}">
-                                <input type="hidden" name="csrf_token" id="csrf_token">
                                 <button type="submit" class="btn btn-danger btn-sm">❌ Entfernen</button>
                             </form>
                         </td>
@@ -689,7 +660,7 @@ class DashboardIntegration:
             return self._error(f"Fehler: {e}")
 
     # ============================================
-    # 8. TEAM-STATS / LEADERBOARD
+    # 8. TEAM-STATS
     # ============================================
 
     @dashboard_page(name="teamstats", description="Team-Statistiken", methods=("GET",))
@@ -731,7 +702,7 @@ class DashboardIntegration:
             return self._error(f"Fehler: {e}")
 
     # ============================================
-    # 9. WARN-SYSTEM KONFIGURATION
+    # 9. WARN-SYSTEM
     # ============================================
 
     @dashboard_page(name="warns", description="Warn-System", methods=("GET", "POST"))
@@ -763,7 +734,6 @@ class DashboardIntegration:
             content = f"""
             <h3>⚙️ Warn-Konfiguration</h3>
             <form method="POST" class="mb-4">
-                <input type="hidden" name="csrf_token" id="csrf_token">
                 <div class="mb-2">
                     <label>Auto-Action Threshold (ab wie vielen Warns)</label>
                     <input type="number" class="form-control" name="threshold" value="{cfg.get('auto_action_threshold', 3)}">
@@ -803,7 +773,7 @@ class DashboardIntegration:
             return self._error(f"Fehler: {e}")
 
     # ============================================
-    # 10. ANTI-LINK KONFIGURATION
+    # 10. ANTI-LINK
     # ============================================
 
     @dashboard_page(name="antilink", description="Anti-Link Konfiguration", methods=("GET", "POST"))
@@ -834,7 +804,6 @@ class DashboardIntegration:
             warn_msg = await self.config.guild(guild).antilink_warning_message()
             content = f"""
             <form method="POST">
-                <input type="hidden" name="csrf_token" id="csrf_token">
                 <div class="mb-3 form-check">
                     <input type="checkbox" class="form-check-input" name="enabled" id="enabled" {'checked' if enabled else ''}>
                     <label class="form-check-label" for="enabled">Anti-Link aktiviert</label>
@@ -867,7 +836,7 @@ class DashboardIntegration:
             return self._error(f"Fehler: {e}")
 
     # ============================================
-    # 11. BANSYNC KONFIGURATION
+    # 11. BANSYNC
     # ============================================
 
     @dashboard_page(name="bansync", description="BanSync Konfiguration", methods=("GET", "POST"))
@@ -896,7 +865,6 @@ class DashboardIntegration:
             sync_roles = await self.config.guild(guild).sync_roles()
             content = f"""
             <form method="POST">
-                <input type="hidden" name="csrf_token" id="csrf_token">
                 <div class="form-check mb-2">
                     <input type="checkbox" class="form-check-input" name="sync_bans" id="sync_bans" {'checked' if sync_bans else ''}>
                     <label class="form-check-label" for="sync_bans">🔨 Bans synchronisieren</label>
@@ -929,7 +897,7 @@ class DashboardIntegration:
             return self._error(f"Fehler: {e}")
 
     # ============================================
-    # 12. MODLOG KONFIGURATION
+    # 12. MODLOG
     # ============================================
 
     @dashboard_page(name="modlog", description="Modlog Konfiguration", methods=("GET",))
@@ -938,9 +906,7 @@ class DashboardIntegration:
         try:
             modlog_channels = await self.config.guild(guild).modlog_channels() or {}
             ignored_channels = await self.config.guild(guild).modlog_ignored_channels() or []
-            content = f"""
-            <h3>📜 Modlog-Kanäle</h3>
-            """
+            content = "<h3>📜 Modlog-Kanäle</h3>"
             if modlog_channels:
                 content += '<table class="table table-striped"><thead><tr><th>Event-Typ</th><th>Channel</th></tr></thead><tbody>'
                 for event_type, ch_id in modlog_channels.items():
@@ -950,14 +916,13 @@ class DashboardIntegration:
                 content += '</tbody></table>'
             else:
                 content += '<div class="alert alert-info">Keine Modlog-Kanäle konfiguriert. Verwende <code>[p]extmodlog channel</code> im Discord.</div>'
-            content += f"""
-            <h3>🚫 Ignorierte Channels ({len(ignored_channels)})</h3>
-            """
+            content += f"<h3>🚫 Ignorierte Channels ({len(ignored_channels)})</h3>"
             if ignored_channels:
                 content += '<ul>'
                 for ch_id in ignored_channels:
                     ch = guild.get_channel(ch_id)
-                    content += f'<li>#{ch.name} if ch else f"Channel {ch_id} (gelöscht)"</li>'
+                    ch_name = f"#{ch.name}" if ch else f"Channel {ch_id} (gelöscht)"
+                    content += f'<li>{ch_name}</li>'
                 content += '</ul>'
             else:
                 content += '<div class="alert alert-info">Keine Channels ignoriert.</div>'
@@ -967,7 +932,7 @@ class DashboardIntegration:
             return self._error(f"Fehler: {e}")
 
     # ============================================
-    # 13. SUPPORT-KONFIGURATION
+    # 13. SUPPORT-KONFIG
     # ============================================
 
     @dashboard_page(name="supportconfig", description="Support-Konfiguration", methods=("GET", "POST"))
@@ -987,7 +952,6 @@ class DashboardIntegration:
             enabled = await self.config.guild(guild).enabled()
             content = f"""
             <form method="POST">
-                <input type="hidden" name="csrf_token" id="csrf_token">
                 <div class="form-check mb-3">
                     <input type="checkbox" class="form-check-input" name="enabled" id="enabled" {'checked' if enabled else ''}>
                     <label class="form-check-label" for="enabled">Support-System aktiviert</label>
@@ -1013,3 +977,515 @@ class DashboardIntegration:
             return self._page("⚙️ Support-Konfiguration", content)
         except Exception as e:
             return self._error(f"Fehler: {e}")
+
+    # ============================================
+    # 14. MEMBER-SUCHE (NEU)
+    # ============================================
+
+    @dashboard_page(name="membersearch", description="Member-Suche mit Bestrafungs-Historie", methods=("GET", "POST"))
+    async def rpc_member_search(self, guild, member, **kwargs) -> dict:
+        """Member-Info mit Bestrafungs-Historie anzeigen."""
+        method = kwargs.get("method", "GET")
+        data = kwargs.get("data", {})
+        form_data = data.get("form", {}) if isinstance(data, dict) else {}
+        search_query = form_data.get("query", "") if method == "POST" else ""
+        if not search_query:
+            content = """
+            <h3>🔍 Member suchen</h3>
+            <form method="POST" class="mb-4">
+                <div class="mb-2">
+                    <input type="text" class="form-control" name="query" placeholder="User-ID, Name oder Mention" required>
+                </div>
+                <button type="submit" class="btn btn-primary">🔍 Suchen</button>
+            </form>
+            """
+            return self._page("🔍 Member-Suche", content)
+        # Suche ausführen
+        target = None
+        # Versuchen als ID
+        try:
+            uid = int(search_query.replace("<@", "").replace(">", "").replace("!", ""))
+            target = guild.get_member(uid)
+            if target is None:
+                target = await guild.fetch_member(uid)
+        except (ValueError, TypeError):
+            pass
+        # Falls nicht gefunden, nach Namen suchen
+        if target is None:
+            for m in guild.members:
+                if search_query.lower() in m.display_name.lower() or search_query.lower() in m.name.lower():
+                    target = m
+                    break
+        if target is None:
+            return self._error(f"Kein Member gefunden für '{search_query}'.")
+        # Info sammeln
+        try:
+            strikes = await self.config.guild(guild).warn_strikes() or {}
+            user_strikes = strikes.get(str(target.id)) or []
+            active_warns = [s for s in user_strikes if not s.get("expires_ts") or s["expires_ts"] > _time.time()]
+            punishment_history = await self.config.guild(guild).punishment_history() or {}
+            user_punishments = punishment_history.get(str(target.id)) or []
+            watchlist = await self.config.guild(guild).watchlist() or {}
+            on_watchlist = str(target.id) in watchlist
+            # Account- & Server-Alter
+            from datetime import datetime, timezone
+            account_age = (datetime.now(timezone.utc) - target.created_at).days
+            join_age = (datetime.now(timezone.utc) - target.joined_at).days if target.joined_at else 0
+            content = f"""
+            <div class="card mb-3">
+                <div class="card-header d-flex align-items-center">
+                    <img src="{target.display_avatar.url}" class="rounded-circle me-3" style="width:48px;height:48px;" alt="Avatar">
+                    <div>
+                        <h5 class="mb-0">{target.display_name}</h5>
+                        <small class="text-muted">{target.name}#{target.discriminator} • ID: {target.id}</small>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <p><strong>📊 Account-Alter:</strong> {account_age} Tage</p>
+                            <p><strong>🏠 Auf Server seit:</strong> {join_age} Tagen</p>
+                            <p><strong>👥 Rollen:</strong> {len(target.roles) - 1}</p>
+                            <p><strong>⏰ Getimeoutet:</strong> {'Ja' if target.is_timed_out() else 'Nein'}</p>
+                        </div>
+                        <div class="col-md-6">
+                            <p><strong>⚠️ Aktive Verwarnungen:</strong> {len(active_warns)}</p>
+                            <p><strong>📋 Bestrafungs-Historie:</strong> {len(user_punishments)} Einträge</p>
+                            <p><strong>👁️ Auf Watchlist:</strong> {'Ja ⚠️' if on_watchlist else 'Nein'}</p>
+                            <p><strong>🤖 Bot:</strong> {'Ja' if target.bot else 'Nein'}</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <h3>⚠️ Verwarnungen</h3>
+            """
+            if active_warns:
+                content += '<table class="table table-sm"><thead><tr><th>ID</th><th>Grund</th><th>Moderator</th><th>Datum</th></tr></thead><tbody>'
+                for s in active_warns[-10:]:
+                    content += f'<tr><td>#{s.get("warn_id","?")}</td><td>{s.get("reason","?")[:100]}</td><td>{s.get("moderator_name","?")}</td><td>{self._fmt_ts(s.get("ts"))}</td></tr>'
+                content += '</tbody></table>'
+            else:
+                content += '<div class="alert alert-success">Keine aktiven Verwarnungen.</div>'
+            content += "<h3>📜 Bestrafungs-Historie</h3>"
+            if user_punishments:
+                content += '<table class="table table-sm"><thead><tr><th>Typ</th><th>Grund</th><th>Moderator</th><th>Datum</th></tr></thead><tbody>'
+                for p in user_punishments[-15:]:
+                    content += f'<tr><td><span class="badge bg-{ "danger" if p.get("type") in ("ban","kick") else "warning" if p.get("type")=="warn" else "info"}">{p.get("type","?")}</span></td><td>{p.get("reason","?")[:100]}</td><td>{p.get("moderator_name","?")}</td><td>{self._fmt_ts(p.get("ts"))}</td></tr>'
+                content += '</tbody></table>'
+            else:
+                content += '<div class="alert alert-success">Keine Bestrafungs-Historie.</div>'
+            if on_watchlist:
+                wl_data = watchlist[str(target.id)]
+                content += f"""
+                <h3>👁️ Watchlist-Eintrag</h3>
+                <div class="alert alert-warning">
+                    <p><strong>Grund:</strong> {wl_data.get('reason', '?')}</p>
+                    <p><strong>Hinzugefügt von:</strong> {wl_data.get('added_by_name', '?')} am {self._fmt_ts(wl_data.get('added_ts'))}</p>
+                </div>
+                """
+            content += """
+            <hr>
+            <h3>🔍 Neue Suche</h3>
+            <form method="POST">
+                <div class="mb-2">
+                    <input type="text" class="form-control" name="query" placeholder="User-ID, Name oder Mention" required>
+                </div>
+                <button type="submit" class="btn btn-primary">🔍 Suchen</button>
+            </form>
+            """
+            return self._page(f"🔍 Member: {target.display_name}", content)
+        except Exception as e:
+            return self._error(f"Fehler: {e}")
+
+    # ============================================
+    # 15. SERVER-INFO (NEU)
+    # ============================================
+
+    @dashboard_page(name="serverinfo", description="Server-Informationen", methods=("GET",))
+    async def rpc_server_info(self, guild, **kwargs) -> dict:
+        """Server-Statistiken anzeigen."""
+        try:
+            # Generelle Server-Info
+            member_count = guild.member_count
+            channel_count = len(guild.channels)
+            text_channels = len(guild.text_channels)
+            voice_channels = len(guild.voice_channels)
+            role_count = len(guild.roles)
+            emoji_count = len(guild.emojis)
+            boost_level = guild.premium_tier
+            boost_count = guild.premium_subscription_count
+            from datetime import datetime, timezone
+            created_days = (datetime.now(timezone.utc) - guild.created_at).days
+            # SupportCog Stats
+            tickets = await self.config.guild(guild).tickets() or {}
+            apps = await self.config.guild(guild).team_applications() or {}
+            strikes = await self.config.guild(guild).warn_strikes() or {}
+            content = f"""
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="card mb-3">
+                        <div class="card-header">📊 Server-Statistiken</div>
+                        <div class="card-body">
+                            <p><strong>👥 Mitglieder:</strong> {member_count}</p>
+                            <p><strong>📺 Channels:</strong> {channel_count} ({text_channels} Text, {voice_channels} Voice)</p>
+                            <p><strong>🎭 Rollen:</strong> {role_count}</p>
+                            <p><strong>😀 Emojis:</strong> {emoji_count}</p>
+                            <p><strong>💎 Boost-Level:</strong> {boost_level} ({boost_count} Boosts)</p>
+                            <p><strong>📅 Erstellt vor:</strong> {created_days} Tagen</p>
+                            <p><strong>🆔 Server-ID:</strong> <code>{guild.id}</code></p>
+                            <p><strong>👑 Besitzer:</strong> <@{guild.owner_id}></p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card mb-3">
+                        <div class="card-header">🎫 SupportCog-Statistiken</div>
+                        <div class="card-body">
+                            <p><strong>🎫 Tickets gesamt:</strong> {len(tickets)}</p>
+                            <p><strong>📋 Bewerbungen:</strong> {len(apps)}</p>
+                            <p><strong>⚠️ User mit Verwarnungen:</strong> {len(strikes)}</p>
+                            <p><strong>🤖 Bot-Status:</strong> {'Online' if guild.me.status else 'Offline'}</p>
+                            <p><strong>📌 Bot-Nickname:</strong> {guild.me.display_name}</p>
+                            <p><strong>👀 Bot-Rollen:</strong> {len(guild.me.roles) - 1}</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """
+            return self._page(f"📊 Server-Info: {guild.name}", content)
+        except Exception as e:
+            return self._error(f"Fehler: {e}")
+
+    # ============================================
+    # 16. EMBED-BUILDER (NEU)
+    # ============================================
+
+    @dashboard_page(name="embedbuilder", description="Embed Builder", methods=("GET", "POST"))
+    async def rpc_embed_builder(self, guild, member, **kwargs) -> dict:
+        """Embeds erstellen und senden."""
+        method = kwargs.get("method", "GET")
+        data = kwargs.get("data", {})
+        form_data = data.get("form", {}) if isinstance(data, dict) else {}
+        if method == "POST":
+            try:
+                channel_id = form_data.get("channel_id", "")
+                title = form_data.get("title", "")
+                description = form_data.get("description", "")
+                color = form_data.get("color", "0x5865F2")
+                footer = form_data.get("footer", "")
+                image_url = form_data.get("image_url", "")
+                thumbnail_url = form_data.get("thumbnail_url", "")
+                try:
+                    channel_id = int(channel_id)
+                except (ValueError, TypeError):
+                    return self._error("Ungültige Channel-ID.")
+                channel = guild.get_channel(channel_id)
+                if not channel:
+                    return self._error("Channel nicht gefunden.")
+                # Color parsen
+                try:
+                    if color.startswith("0x"):
+                        color_int = int(color, 16)
+                    elif color.startswith("#"):
+                        color_int = int(color[1:], 16)
+                    else:
+                        color_int = int(color)
+                except (ValueError, TypeError):
+                    color_int = 0x5865F2
+                # Embed bauen
+                import discord
+                embed = discord.Embed(
+                    title=title[:256] if title else None,
+                    description=description[:4096] if description else None,
+                    color=color_int,
+                )
+                if footer:
+                    embed.set_footer(text=footer[:2048])
+                if image_url:
+                    embed.set_image(url=image_url)
+                if thumbnail_url:
+                    embed.set_thumbnail(url=thumbnail_url)
+                await channel.send(embed=embed)
+                return self._success(f"Embed an {channel.mention} gesendet.")
+            except Exception as e:
+                return self._error(f"Fehler: {e}")
+        # GET: Formular
+        try:
+            channels_html = ""
+            for ch in guild.text_channels[:50]:
+                channels_html += f'<option value="{ch.id}">#{ch.name}</option>'
+            content = f"""
+            <form method="POST">
+                <div class="mb-3">
+                    <label>Channel</label>
+                    <select class="form-select" name="channel_id" required>
+                        <option value="">-- Channel wählen --</option>
+                        {channels_html}
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label>Titel</label>
+                    <input type="text" class="form-control" name="title" placeholder="Embed-Titel" maxlength="256">
+                </div>
+                <div class="mb-3">
+                    <label>Beschreibung</label>
+                    <textarea class="form-control" name="description" rows="4" placeholder="Embed-Beschreibung..." maxlength="4096"></textarea>
+                </div>
+                <div class="mb-3">
+                    <label>Farbe (Hex)</label>
+                    <input type="text" class="form-control" name="color" placeholder="0x5865F2 oder #5865F2" value="0x5865F2">
+                </div>
+                <div class="mb-3">
+                    <label>Footer</label>
+                    <input type="text" class="form-control" name="footer" placeholder="Footer-Text" maxlength="2048">
+                </div>
+                <div class="mb-3">
+                    <label>Thumbnail URL</label>
+                    <input type="url" class="form-control" name="thumbnail_url" placeholder="https://...">
+                </div>
+                <div class="mb-3">
+                    <label>Image URL</label>
+                    <input type="url" class="form-control" name="image_url" placeholder="https://...">
+                </div>
+                <button type="submit" class="btn btn-primary">📤 Embed senden</button>
+            </form>
+            """
+            return self._page("📝 Embed Builder", content)
+        except Exception as e:
+            return self._error(f"Fehler: {e}")
+
+    # ============================================
+    # 17. MODLOG-VIEWER (NEU)
+    # ============================================
+
+    @dashboard_page(name="modlogviewer", description="Bestrafungs-Historie durchsuchen", methods=("GET",))
+    async def rpc_modlog_viewer(self, guild, **kwargs) -> dict:
+        """Bestrafungs-Historie aller User durchsuchen."""
+        try:
+            punishment_history = await self.config.guild(guild).punishment_history() or {}
+            # Alle Punishments in eine flache Liste bringen
+            all_punishments = []
+            for uid, plist in punishment_history.items():
+                for p in plist:
+                    p["user_id"] = uid
+                    all_punishments.append(p)
+            # Nach Datum sortieren (neueste zuerst)
+            all_punishments.sort(key=lambda x: x.get("ts", 0), reverse=True)
+            content = f"<h3>📜 Bestrafungs-Historie ({len(all_punishments)} Einträge)</h3>"
+            if all_punishments:
+                content += '<table class="table table-striped"><thead><tr><th>Datum</th><th>User-ID</th><th>Typ</th><th>Grund</th><th>Moderator</th></tr></thead><tbody>'
+                for p in all_punishments[:50]:  # letzte 50
+                    ptype = p.get("type", "?")
+                    badge_class = "danger" if ptype in ("ban", "kick") else "warning" if ptype == "warn" else "info"
+                    content += f"""
+                    <tr>
+                        <td>{self._fmt_ts(p.get('ts'))}</td>
+                        <td><code>{p.get('user_id', '?')}</code></td>
+                        <td><span class="badge bg-{badge_class}">{ptype}</span></td>
+                        <td>{p.get('reason', '?')[:100]}</td>
+                        <td>{p.get('moderator_name', '?')}</td>
+                    </tr>
+                    """
+                content += '</tbody></table>'
+                if len(all_punishments) > 50:
+                    content += f'<div class="alert alert-info">Zeige die letzten 50 von {len(all_punishments)} Einträgen.</div>'
+            else:
+                content += '<div class="alert alert-info">Noch keine Bestrafungen protokolliert.</div>'
+            return self._page("📜 Modlog-Viewer", content)
+        except Exception as e:
+            return self._error(f"Fehler: {e}")
+
+    # ============================================
+    # 18. SLOWMODE / LOCK (NEU)
+    # ============================================
+
+    @dashboard_page(name="slowmode", description="Slowmode & Channel-Lock", methods=("GET", "POST"))
+    async def rpc_slowmode(self, guild, member, **kwargs) -> dict:
+        """Slowmode und Channel-Lock verwalten."""
+        method = kwargs.get("method", "GET")
+        data = kwargs.get("data", {})
+        form_data = data.get("form", {}) if isinstance(data, dict) else {}
+        if method == "POST":
+            try:
+                action = form_data.get("sm_action", "")
+                channel_id = form_data.get("channel_id", "")
+                try:
+                    channel_id = int(channel_id)
+                except (ValueError, TypeError):
+                    return self._error("Ungültige Channel-ID.")
+                channel = guild.get_channel(channel_id)
+                if not channel:
+                    return self._error("Channel nicht gefunden.")
+                if action == "slowmode":
+                    seconds = int(form_data.get("seconds", "0"))
+                    seconds = max(0, min(seconds, 21600))  # max 6h
+                    await channel.edit(slowmode_delay=seconds, reason=f"Slowmode via Dashboard von {member}")
+                    return self._success(f"Slowmode für #{channel.name} auf {seconds}s gesetzt.")
+                elif action == "lock":
+                    # Lock: @everyone Send Messages entfernen
+                    overwrite = channel.overwrites_for(guild.default_role)
+                    overwrite.send_messages = False
+                    await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=f"Lock via Dashboard von {member}")
+                    return self._success(f"Channel #{channel.name} wurde gesperrt. 🔒")
+                elif action == "unlock":
+                    overwrite = channel.overwrites_for(guild.default_role)
+                    overwrite.send_messages = None
+                    await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=f"Unlock via Dashboard von {member}")
+                    return self._success(f"Channel #{channel.name} wurde entsperrt. 🔓")
+                else:
+                    return self._error("Unbekannte Aktion.")
+            except Exception as e:
+                return self._error(f"Fehler: {e}")
+        # GET: Formular
+        try:
+            channels_html = ""
+            for ch in guild.text_channels[:50]:
+                current_slow = ch.slowmode_delay
+                channels_html += f'<option value="{ch.id}">#{ch.name} (Slow: {current_slow}s)</option>'
+            content = f"""
+            <form method="POST" class="mb-4">
+                <input type="hidden" name="sm_action" value="slowmode">
+                <div class="mb-3">
+                    <label>Channel</label>
+                    <select class="form-select" name="channel_id" required>
+                        <option value="">-- Channel wählen --</option>
+                        {channels_html}
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label>Slowmode (Sekunden, 0 = aus, max 21600)</label>
+                    <input type="number" class="form-control" name="seconds" value="0" min="0" max="21600">
+                </div>
+                <button type="submit" class="btn btn-warning">⏱️ Slowmode setzen</button>
+            </form>
+            <hr>
+            <h3>🔒 Channel sperren/entsperren</h3>
+            <form method="POST" class="mb-3">
+                <input type="hidden" name="sm_action" value="lock">
+                <div class="mb-3">
+                    <label>Channel sperren</label>
+                    <select class="form-select" name="channel_id" required>
+                        <option value="">-- Channel wählen --</option>
+                        {channels_html}
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-danger">🔒 Channel sperren</button>
+            </form>
+            <form method="POST">
+                <input type="hidden" name="sm_action" value="unlock">
+                <div class="mb-3">
+                    <label>Channel entsperren</label>
+                    <select class="form-select" name="channel_id" required>
+                        <option value="">-- Channel wählen --</option>
+                        {channels_html}
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-success">🔓 Channel entsperren</button>
+            </form>
+            """
+            return self._page("⏱️ Slowmode & Channel-Lock", content)
+        except Exception as e:
+            return self._error(f"Fehler: {e}")
+
+    # ============================================
+    # 19. BULK-ACTIONS (NEU)
+    # ============================================
+
+    @dashboard_page(name="bulkactions", description="Massen-Aktionen", methods=("GET", "POST"))
+    async def rpc_bulk_actions(self, guild, member, **kwargs) -> dict:
+        """Mehrere User gleichzeitig bannen/kicken/warnen."""
+        method = kwargs.get("method", "GET")
+        data = kwargs.get("data", {})
+        form_data = data.get("form", {}) if isinstance(data, dict) else {}
+        if method == "POST":
+            try:
+                action = form_data.get("bulk_action", "")
+                user_ids_raw = form_data.get("user_ids", "")
+                reason = form_data.get("reason", "Massen-Aktion via Dashboard")
+                # User-IDs parsen (kommasepariert oder eine pro Zeile)
+                import re as _re
+                id_strings = _re.findall(r'\d{17,20}', user_ids_raw)
+                if not id_strings:
+                    return self._error("Keine gültigen User-IDs gefunden.")
+                success = 0
+                failed = 0
+                failed_ids = []
+                for uid_str in id_strings[:50]:  # max 50 auf einmal
+                    try:
+                        uid = int(uid_str)
+                        if action == "ban":
+                            try:
+                                await guild.ban(discord.Object(id=uid), reason=f"Bulk-Ban via Dashboard von {member}: {reason}", delete_message_days=1)
+                                await self._punishment_record(guild, uid, "ban", reason, member)
+                                success += 1
+                            except Exception:
+                                failed += 1
+                                failed_ids.append(uid_str)
+                        elif action == "kick":
+                            target = guild.get_member(uid)
+                            if target:
+                                await target.kick(reason=f"Bulk-Kick via Dashboard von {member}: {reason}")
+                                await self._punishment_record(guild, uid, "kick", reason, member)
+                                success += 1
+                            else:
+                                failed += 1
+                                failed_ids.append(uid_str)
+                        elif action == "warn":
+                            target = guild.get_member(uid)
+                            if target:
+                                cfg = await self.config.guild(guild).warn_config()
+                                counter = await self.config.guild(guild).warn_counter() or 0
+                                counter += 1
+                                strikes = await self.config.guild(guild).warn_strikes() or {}
+                                user_strikes = strikes.get(str(uid)) or []
+                                user_strikes.append({
+                                    "warn_id": str(counter),
+                                    "reason": reason,
+                                    "moderator_id": member.id,
+                                    "moderator_name": member.display_name,
+                                    "ts": int(_time.time()),
+                                    "expires_ts": None,
+                                })
+                                strikes[str(uid)] = user_strikes
+                                await self.config.guild(guild).warn_strikes.set(strikes)
+                                await self.config.guild(guild).warn_counter.set(counter)
+                                await self._punishment_record(guild, uid, "warn", reason, member)
+                                success += 1
+                            else:
+                                failed += 1
+                                failed_ids.append(uid_str)
+                    except Exception:
+                        failed += 1
+                        failed_ids.append(uid_str)
+                msg = f"✅ {success} User {action}ed."
+                if failed:
+                    msg += f" ❌ {failed} fehlgeschlagen: {', '.join(failed_ids[:5])}"
+                return self._success(msg)
+            except Exception as e:
+                return self._error(f"Fehler: {e}")
+        # GET: Formular
+        content = """
+        <div class="alert alert-warning">
+            <strong>⚠️ Warnung:</strong> Massen-Aktionen betreffen sofort alle angegebenen User. Mit Bedacht verwenden!
+        </div>
+        <form method="POST">
+            <div class="mb-3">
+                <label>Aktion</label>
+                <select class="form-select" name="bulk_action" required>
+                    <option value="ban">🔨 Alle bannen</option>
+                    <option value="kick">👢 Alle kicken</option>
+                    <option value="warn">⚠️ Alle verwarnen</option>
+                </select>
+            </div>
+            <div class="mb-3">
+                <label>User-IDs (eine pro Zeile oder kommasepariert, max 50)</label>
+                <textarea class="form-control" name="user_ids" rows="6" placeholder="123456789012345678&#10;234567890123456789&#10;..." required></textarea>
+            </div>
+            <div class="mb-3">
+                <label>Grund</label>
+                <input type="text" class="form-control" name="reason" placeholder="Grund der Massen-Aktion" required>
+            </div>
+            <button type="submit" class="btn btn-danger" onclick="return confirm('Wirklich alle User diese Aktion ausführen?')">⚠️ Massen-Aktion ausführen</button>
+        </form>
+        """
+        return self._page("📦 Massen-Aktionen", content)
