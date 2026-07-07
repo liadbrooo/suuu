@@ -6303,7 +6303,7 @@ class SupportCog(commands.Cog):
         ignored = await self.config.guild(guild).modlog_ignored_channels() or []
         return channel_id in ignored
 
-    @commands.group(name="modlogset", aliases=["mlset", "modlogconfig"])
+    @commands.group(name="extmodlog", aliases=["eml", "extmodlogset"])
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def modlog_set(self, ctx: commands.Context):
