@@ -6903,11 +6903,11 @@ class SupportCog(commands.Cog):
             await message.delete()
         except (discord.Forbidden, discord.HTTPException):
             pass
-        # Warnungs-Nachricht
+        # Warnungs-Nachricht (kurz sichtbar, verschwindet automatisch nach 6 Sekunden)
         warn_msg = await self.config.guild(message.guild).antilink_warning_message() or "⚠️ Links sind nicht erlaubt!"
         mode_text = "Discord-Invite" if mode == "discord" else "Link"
         try:
-            await message.channel.send(f"{message.author.mention} {warn_msg} ({mode_text} entfernt)", delete_after=10)
+            await message.channel.send(f"{message.author.mention} {warn_msg} ({mode_text} entfernt)", delete_after=6, silent=True)
         except (discord.Forbidden, discord.HTTPException):
             pass
         # Aktion ausführen
