@@ -8642,7 +8642,7 @@ class SupportCog(commands.Cog):
     # WARN-SYSTEM MIT STRIKES & AUTO-ACTION
     # ============================================
 
-    @commands.group(name="warnset", aliases=["warnconfig"])
+    @commands.group(name="swarnset", aliases=["swarnconfig"])
     @checks.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
     async def warn_set(self, ctx: commands.Context):
@@ -8720,12 +8720,12 @@ class SupportCog(commands.Cog):
         embed.add_field(name="DM-Benachrichtigung", value="✅ An" if cfg.get("notify_user_dm", True) else "❌ Aus", inline=True)
         await ctx.send(embed=embed)
 
-    @commands.command(name="warn", aliases=["verwarnung", "verwarne"])
+    @commands.command(name="swarn", aliases=["sverwarnung", "sverwarne"])
     @commands.guild_only()
     @checks.mod_or_permissions(moderate_members=True)
     async def warn_cmd(self, ctx: commands.Context, member: discord.Member, *, reason: str):
         """Verwarnt einen User. Nach X Verwarnungen greift die Auto-Action.
-        Beispiel: `[p]warn @User Spamming in Channels`
+        Beispiel: `[p]swarn @User Spamming in Channels`
         """
         if len(reason) > 500:
             await ctx.send("❌ Grund zu lang (max 500 Zeichen).")
@@ -8836,7 +8836,7 @@ class SupportCog(commands.Cog):
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
         await ctx.send(f"✅ {member.mention} verwarnt ({len(user_strikes)} aktive Verwarnung(en)){dm_status}.")
 
-    @commands.command(name="warns", aliases=["verwarnungen", "warnlist"])
+    @commands.command(name="swarns", aliases=["sverwarnungen", "swarnlist"])
     @commands.guild_only()
     async def warn_list(self, ctx: commands.Context, member: discord.Member = None):
         """Zeigt alle Verwarnungen eines Users (oder deine eigenen)."""
@@ -8875,7 +8875,7 @@ class SupportCog(commands.Cog):
             embed.add_field(name="墓 Verfallene Verwarnungen", value=expired_text[:1024], inline=False)
         await ctx.send(embed=embed)
 
-    @commands.command(name="unwarn", aliases=["removewarn", "delwarn"])
+    @commands.command(name="sunwarn", aliases=["sremovewarn", "sdelwarn"])
     @commands.guild_only()
     @checks.mod_or_permissions(moderate_members=True)
     async def unwarn_cmd(self, ctx: commands.Context, member: discord.Member, warn_id: str):
@@ -8900,7 +8900,7 @@ class SupportCog(commands.Cog):
         await self._modlog_send(ctx.guild, "mod_action", log_embed)
         await ctx.send(f"✅ Verwarnung #{warn_id} von {member.mention} entfernt.")
 
-    @commands.command(name="clearwarns", aliases=["resetwarns"])
+    @commands.command(name="sclearwarns", aliases=["sresetwarns"])
     @commands.guild_only()
     @checks.mod_or_permissions(moderate_members=True)
     async def clearwarns_cmd(self, ctx: commands.Context, member: discord.Member):
@@ -8958,13 +8958,13 @@ class SupportCog(commands.Cog):
         except (discord.Forbidden, discord.HTTPException):
             return False
 
-    @commands.command(name="ban", aliases=["bann", "banne", "verbannen"])
+    @commands.command(name="sban", aliases=["sbann", "sbanne", "sverbannen"])
     @commands.guild_only()
     @checks.admin_or_permissions(ban_members=True)
     @commands.bot_has_permissions(ban_members=True)
     async def ban_cmd(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
         """Bannt ein Mitglied vom Server. Sendet VOR dem Ban eine DM mit Grund und Moderator.
-        Beispiel: `[p]ban @User Spamming wiederholter Verstöße`
+        Beispiel: `[p]sban @User Spamming wiederholter Verstöße`
         """
         if member.bot:
             await ctx.send("❌ Bots können nicht gebannt werden.")
@@ -9009,13 +9009,13 @@ class SupportCog(commands.Cog):
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
         await ctx.send(f"🔨 {member.mention} (`{member.id}`) wurde gebannt{dm_status}.\n**Grund:** {reason}")
 
-    @commands.command(name="unban", aliases=["entbannen", "unbanne"])
+    @commands.command(name="sunban", aliases=["sentbannen", "sunbanne"])
     @commands.guild_only()
     @checks.admin_or_permissions(ban_members=True)
     @commands.bot_has_permissions(ban_members=True)
     async def unban_cmd(self, ctx: commands.Context, user_id: int, *, reason: str = "Kein Grund angegeben"):
         """Entbannt einen User anhand seiner User-ID. Sendet eine DM an den User.
-        Beispiel: `[p]unban 123456789012345678 Frist abgelaufen`
+        Beispiel: `[p]sunban 123456789012345678 Frist abgelaufen`
         """
         try:
             user = await self.bot.fetch_user(user_id)
@@ -9057,13 +9057,13 @@ class SupportCog(commands.Cog):
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
         await ctx.send(f"✅ {user.mention} (`{user.id}`) wurde entbannt{dm_status}.")
 
-    @commands.command(name="kick", aliases=["kicken", "rauswerfen"])
+    @commands.command(name="skick", aliases=["skicken", "srauswerfen"])
     @commands.guild_only()
     @checks.admin_or_permissions(kick_members=True)
     @commands.bot_has_permissions(kick_members=True)
     async def kick_cmd(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
         """Kickt ein Mitglied vom Server. Sendet VOR dem Kick eine DM mit Grund und Moderator.
-        Beispiel: `[p]kick @User Regelverstoß`
+        Beispiel: `[p]skick @User Regelverstoß`
         """
         if member.bot:
             await ctx.send("❌ Bots können nicht gekickt werden.")
@@ -9108,14 +9108,14 @@ class SupportCog(commands.Cog):
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
         await ctx.send(f"👢 {member.mention} (`{member.id}`) wurde gekickt{dm_status}.\n**Grund:** {reason}")
 
-    @commands.command(name="timeout", aliases=["mute", "strafen", "time", "to"])
+    @commands.command(name="stimeout", aliases=["smute", "sstrafen", "stime", "sto"])
     @commands.guild_only()
     @checks.mod_or_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def timeout_cmd(self, ctx: commands.Context, member: discord.Member, duration: str, *, reason: str = "Kein Grund angegeben"):
         """Timeoute ein Mitglied. Dauer-Formate: 30s, 5m, 2h, 1d, oder Kombinationen wie 1h30m.
         Sendet VOR dem Timeout eine DM mit Grund und Moderator.
-        Beispiel: `[p]timeout @User 1h Spamming`
+        Beispiel: `[p]stimeout @User 1h Spamming`
         """
         if member.bot:
             await ctx.send("❌ Bots können nicht getimeoutet werden.")
@@ -9176,13 +9176,13 @@ class SupportCog(commands.Cog):
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
         await ctx.send(f"⏰ {member.mention} (`{member.id}`) für **{duration_str}** getimeoutet{dm_status}.\n**Grund:** {reason}")
 
-    @commands.command(name="untimeout", aliases=["unmute", "untime", "unto"])
+    @commands.command(name="suntimeout", aliases=["sunmute", "suntime", "sunto"])
     @commands.guild_only()
     @checks.mod_or_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def untimeout_cmd(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
         """Hebt einen Timeout auf. Sendet eine DM an den User.
-        Beispiel: `[p]untimeout @User Timeout war zu lang`
+        Beispiel: `[p]suntimeout @User Timeout war zu lang`
         """
         if member.bot:
             await ctx.send("❌ Bots können nicht timeouteret werden.")
@@ -9531,7 +9531,7 @@ class SupportCog(commands.Cog):
     # WATCHLIST-SYSTEM
     # ============================================
 
-    @commands.group(name="watchlist", aliases=["wl", "beobachten"])
+    @commands.group(name="watchlist", aliases=["watch", "beobachten"])
     @commands.guild_only()
     @checks.mod_or_permissions(moderate_members=True)
     async def watchlist_cmd(self, ctx: commands.Context):
