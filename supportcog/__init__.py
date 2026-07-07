@@ -8827,14 +8827,14 @@ class SupportCog(commands.Cog):
                     )
                     await self._modlog_send(ctx.guild, "mod_action", auto_embed)
                     dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
-                    await ctx.send(f"✅ {member.mention} verwarnt ({len(user_strikes)} aktiv){dm_status}.\n🤖 {action_msg}")
+                    await ctx.send(f"✅ {member.mention} verwarnt ({len(user_strikes)} aktiv){dm_status}.\n🤖 {action_msg}", delete_after=6)
                     return
             except (discord.Forbidden, discord.HTTPException) as e:
                 dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
-                await ctx.send(f"✅ {member.mention} verwarnt ({len(user_strikes)} aktiv){dm_status}.\n⚠️ Auto-Action fehlgeschlagen: `{e}`")
+                await ctx.send(f"✅ {member.mention} verwarnt ({len(user_strikes)} aktiv){dm_status}.\n⚠️ Auto-Action fehlgeschlagen: `{e}`", delete_after=6)
                 return
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
-        await ctx.send(f"✅ {member.mention} verwarnt ({len(user_strikes)} aktive Verwarnung(en)){dm_status}.")
+        await ctx.send(f"✅ {member.mention} verwarnt ({len(user_strikes)} aktive Verwarnung(en)){dm_status}.", delete_after=6)
 
     @commands.command(name="swarns", aliases=["sverwarnungen", "swarnlist"])
     @commands.guild_only()
@@ -9007,7 +9007,7 @@ class SupportCog(commands.Cog):
         await self._modlog_send(ctx.guild, "mod_action", log_embed)
         # BanSync wird automatisch durch on_member_ban Listener getriggert
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
-        await ctx.send(f"🔨 {member.mention} (`{member.id}`) wurde gebannt{dm_status}.\n**Grund:** {reason}")
+        await ctx.send(f"🔨 {member.mention} (`{member.id}`) wurde gebannt{dm_status}.\n**Grund:** {reason}", delete_after=6)
 
     @commands.command(name="sunban", aliases=["sentbannen", "sunbanne"])
     @commands.guild_only()
@@ -9055,7 +9055,7 @@ class SupportCog(commands.Cog):
         await self._modlog_send(ctx.guild, "mod_action", log_embed)
         # BanSync wird automatisch durch on_member_unban Listener getriggert
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
-        await ctx.send(f"✅ {user.mention} (`{user.id}`) wurde entbannt{dm_status}.")
+        await ctx.send(f"✅ {user.mention} (`{user.id}`) wurde entbannt{dm_status}.", delete_after=6)
 
     @commands.command(name="skick", aliases=["skicken", "srauswerfen"])
     @commands.guild_only()
@@ -9106,7 +9106,7 @@ class SupportCog(commands.Cog):
         await self._modlog_send(ctx.guild, "mod_action", log_embed)
         # BanSync: kick propagation wird durch on_member_remove + audit log getriggert
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
-        await ctx.send(f"👢 {member.mention} (`{member.id}`) wurde gekickt{dm_status}.\n**Grund:** {reason}")
+        await ctx.send(f"👢 {member.mention} (`{member.id}`) wurde gekickt{dm_status}.\n**Grund:** {reason}", delete_after=6)
 
     @commands.command(name="stimeout", aliases=["smute", "sstrafen", "stime", "sto"])
     @commands.guild_only()
@@ -9174,7 +9174,7 @@ class SupportCog(commands.Cog):
         await self._modlog_send(ctx.guild, "mod_action", log_embed)
         # BanSync: timeout propagation wird durch on_member_update getriggert
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
-        await ctx.send(f"⏰ {member.mention} (`{member.id}`) für **{duration_str}** getimeoutet{dm_status}.\n**Grund:** {reason}")
+        await ctx.send(f"⏰ {member.mention} (`{member.id}`) für **{duration_str}** getimeoutet{dm_status}.\n**Grund:** {reason}", delete_after=6)
 
     @commands.command(name="suntimeout", aliases=["sunmute", "suntime", "sunto"])
     @commands.guild_only()
@@ -9216,7 +9216,7 @@ class SupportCog(commands.Cog):
         log_embed.add_field(name="DM gesendet", value="✅ Ja" if dm_sent else "❌ Nein", inline=True)
         await self._modlog_send(ctx.guild, "mod_action", log_embed)
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
-        await ctx.send(f"✅ Timeout von {member.mention} (`{member.id}`) aufgehoben{dm_status}.")
+        await ctx.send(f"✅ Timeout von {member.mention} (`{member.id}`) aufgehoben{dm_status}.", delete_after=6)
 
     def _parse_duration(self, duration_str: str) -> int:
         """Parst eine Dauer-Zeichenkette wie '1h30m', '2d', '45s' in Sekunden. Gibt None bei Fehler zurück."""
