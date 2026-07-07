@@ -584,6 +584,50 @@ class SupportCog(DashboardIntegration, commands.Cog):
             pass
         # EmbedBuilderStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
         # TeamApplicationStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
+        # AAA3A Dashboard: Falls das Dashboard-Cog schon geladen ist, manuell registrieren
+        # (falls on_dashboard_cog_add Event verpasst wurde)
+        if _DASHBOARD_AVAILABLE:
+            asyncio.create_task(self._try_dashboard_register())
+
+    async def _try_dashboard_register(self):
+        """Versucht sich beim Dashboard-Cog zu registrieren falls es schon geladen ist."""
+        await asyncio.sleep(3)  # kurz warten bis alles initialisiert ist
+        try:
+            # Prüfen ob Dashboard-Cog schon geladen ist
+            dashboard_cog = self.bot.get_cog("Dashboard")
+            if dashboard_cog is None:
+                # Versuch mit alternativen Namen
+                for cog_name in ["Dashboard", "DashboardRPC", "dashboard"]:
+                    dashboard_cog = self.bot.get_cog(cog_name)
+                    if dashboard_cog is not None:
+                        break
+            if dashboard_cog is None:
+                import logging
+                logging.getLogger("red.supportcog.dashboard").info(
+                    "Dashboard-Cog nicht gefunden. Wird auf on_dashboard_cog_add Event gewartet."
+                )
+                return
+            # Prüfen ob wir schon registriert sind
+            if hasattr(dashboard_cog, "rpc") and hasattr(dashboard_cog.rpc, "third_parties_handler"):
+                # Schauen ob wir schon in der Liste sind
+                handler = dashboard_cog.rpc.third_parties_handler
+                if hasattr(handler, "cogs") and self in getattr(handler, "cogs", []):
+                    import logging
+                    logging.getLogger("red.supportcog.dashboard").info("SupportCog schon beim Dashboard registriert.")
+                    return
+                # Manuell registrieren
+                import logging
+                page_count = sum(1 for name in dir(self) if hasattr(getattr(self, name, None), '__dashboard_decorator_params__'))
+                logging.getLogger("red.supportcog.dashboard").info(
+                    "Manuelle Registration beim Dashboard (Cog schon geladen). %d Pages gefunden.", page_count
+                )
+                handler.add_third_party(self)
+                logging.getLogger("red.supportcog.dashboard").info("✅ SupportCog manuell beim Dashboard registriert!")
+        except Exception as e:
+            import logging
+            logging.getLogger("red.supportcog.dashboard").exception(
+                "❌ Manuelle Dashboard-Registration fehlgeschlagen: %s", e
+            )
 
     async def _ticket_register_persistent_views(self):
         """Registriert persistente Multi-Panel Views nach Guild-Ready."""

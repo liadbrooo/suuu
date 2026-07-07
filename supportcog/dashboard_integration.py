@@ -31,42 +31,45 @@ class DashboardIntegration:
     @commands.Cog.listener()
     async def on_dashboard_cog_add(self, dashboard_cog: commands.Cog) -> None:
         """Wird aufgerufen wenn das Dashboard-Cog geladen wird."""
+        import logging
+        logger = logging.getLogger("red.supportcog.dashboard")
+        logger.info("on_dashboard_cog_add empfangen! Versuche Registration...")
         try:
             if hasattr(self, "settings") and hasattr(self.settings, "commands_added"):
                 await self.settings.commands_added.wait()
         except Exception:
             pass
         try:
+            # Prüfen ob das Dashboard-Cog die erwartete Struktur hat
+            if not hasattr(dashboard_cog, "rpc"):
+                logger.error("Dashboard-Cog hat kein 'rpc' Attribut! Attribute: %s", [a for a in dir(dashboard_cog) if not a.startswith('_')])
+                return
+            if not hasattr(dashboard_cog.rpc, "third_parties_handler"):
+                logger.error("Dashboard rpc hat kein 'third_parties_handler'! Attribute: %s", [a for a in dir(dashboard_cog.rpc) if not a.startswith('_')])
+                return
+            # Anzahl der @dashboard_page Methoden zählen
+            page_count = sum(1 for name in dir(self) if hasattr(getattr(self, name), '__dashboard_decorator_params__'))
+            logger.info("Registriere SupportCog mit %d Dashboard-Pages...", page_count)
             dashboard_cog.rpc.third_parties_handler.add_third_party(self)
+            logger.info("✅ SupportCog erfolgreich beim Dashboard registriert!")
         except Exception as e:
-            import logging
-            logging.getLogger("red.supportcog.dashboard").exception(
-                "Konnte SupportCog nicht beim Dashboard registrieren: %s", e
-            )
+            logger.exception("❌ Konnte SupportCog nicht beim Dashboard registrieren: %s", e)
 
     # ============================================
     # HELPER (wichtig: korrekte Response-Schema!)
     # ============================================
 
-    def _page(self, title: str, content: str, **extra) -> dict:
+    def _page(self, title, content):
         """Für GET-Seiten: rendert HTML im Dashboard-Layout."""
-        html = f"""
-        <div class="container-fluid">
-            <h1 class="mb-4">{title}</h1>
-            {content}
-        </div>
-        """
+        html = '<div class="container-fluid"><h1 class="mb-4">' + title + '</h1>' + content + '</div>'
         return {
             "status": 0,
             "web_content": {
                 "source": html,
-                "standalone": False,
-                "fullscreen": False,
             },
-            **extra,
         }
 
-    def _success_post(self, message: str, request_url: str) -> dict:
+    def _success_post(self, message, request_url):
         """Für POST-Erfolg: redirect zur GET-URL + Flash-Message."""
         return {
             "status": 0,
@@ -74,7 +77,7 @@ class DashboardIntegration:
             "redirect_url": request_url,
         }
 
-    def _error_post(self, message: str, request_url: str) -> dict:
+    def _error_post(self, message, request_url):
         """Für POST-Fehler: redirect zur GET-URL + Flash-Message (danger)."""
         return {
             "status": 1,
@@ -82,27 +85,17 @@ class DashboardIntegration:
             "redirect_url": request_url,
         }
 
-    def _error_page(self, message: str) -> dict:
+    def _error_page(self, message):
         """Für GET-Fehler: rendert Fehlermeldung im Dashboard-Layout."""
-        html = f"""
-        <div class="container-fluid">
-            <div class="alert alert-danger">
-                <h4 class="alert-heading">Fehler</h4>
-                <p class="mb-0">{message}</p>
-            </div>
-        </div>
-        """
+        html = '<div class="container-fluid"><div class="alert alert-danger"><h4>Fehler</h4><p>' + message + '</p></div></div>'
         return {
             "status": 1,
             "web_content": {
                 "source": html,
-                "standalone": False,
-                "fullscreen": False,
             },
-            "notifications": [{"message": message, "category": "danger"}],
         }
 
-    def _fmt_ts(self, ts) -> str:
+    def _fmt_ts(self, ts):
         """Formatiert einen Timestamp lesbar."""
         try:
             if not ts:
