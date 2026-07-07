@@ -11441,7 +11441,7 @@ class SupportCog(commands.Cog):
         
         await ctx.send(embed=embed)
 
-    @commands.command(name="staffinfo", aliases=["teaminfo", "memberinfo"])
+    @commands.command(name="staffinfo", aliases=["teaminfo"])
     async def staffinfo(self, ctx: commands.Context, member: discord.Member = None):
         """
         Zeigt Informationen über ein Teammitglied an.
