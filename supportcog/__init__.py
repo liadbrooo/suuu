@@ -100,6 +100,16 @@ import hashlib
 import logging
 import re
 
+# AAA3A Dashboard Integration (optional — funktioniert auch ohne Dashboard-Cog)
+try:
+    from .dashboard_integration import DashboardIntegration
+    _DASHBOARD_AVAILABLE = True
+except ImportError:
+    _DASHBOARD_AVAILABLE = False
+    # Fallback: leere Mixin-Klasse, damit Vererbung nicht scheitert
+    class DashboardIntegration:
+        pass
+
 _ = Translator("SupportCog", __file__)
 log = logging.getLogger("red.supportcog")
 
@@ -171,7 +181,7 @@ def _fmt_h_m(seconds: int) -> str:
     return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
 
-class SupportCog(commands.Cog):
+class SupportCog(DashboardIntegration, commands.Cog):
     """Cog für Support-Warteraum Benachrichtigungen mit Button-Duty-System"""
 
     def __init__(self, bot: Red):
@@ -8925,33 +8935,37 @@ class SupportCog(commands.Cog):
     # MOD-AKTIONEN: BAN / KICK / TIMEOUT / UNBAN / UNTIMEOUT (mit DM vorher)
     # ============================================
 
-    async def _send_mod_dm(self, user: discord.abc.User, guild: discord.Guild, action: str, *, moderator, reason: str, duration: str = None) -> bool:
+    async def _send_mod_dm(self, user: discord.abc.User, guild: discord.Guild, action: str, *, moderator, reason: str, duration: str = None, anonymous: bool = False) -> bool:
         """Sendet eine Mod-DM an einen User. Gibt True zurück bei Erfolg, False bei Misserfolg.
-        action: ban, kick, timeout, warn, unban, untimeout"""
+        action: ban, kick, timeout, warn, unban, untimeout
+        anonymous: wenn True, wird der Moderator nicht namentlich genannt (nur 'Server-Team')"""
         if not await self.config.guild(guild).mod_dm_enabled():
             return False
         template_key = f"mod_dm_{action}_template"
         template = await self.config.guild(guild).get_raw(template_key)
         if not template:
             return False
+        # Moderator-Anzeige: anonym → "Server-Team", sonst Mention
+        moderator_display = "Server-Team" if anonymous else (moderator.mention if hasattr(moderator, 'mention') else str(moderator))
         # Platzhalter ersetzen
         msg = template.format(
             user=user.display_name if hasattr(user, 'display_name') else str(user),
-            moderator=moderator.mention if hasattr(moderator, 'mention') else str(moderator),
+            moderator=moderator_display,
             reason=reason or "Kein Grund angegeben",
             server=guild.name,
             duration=duration or "—",
             date=_fmt_berlin_full(_now()),
         )
+        # Titel: anonym → kein "von", zeigt nur Aktion
+        action_emoji = '🔨' if action == 'ban' else '👢' if action == 'kick' else '⏰' if action == 'timeout' else '⚠️' if action == 'warn' else '✅'
         embed = discord.Embed(
-            title=f"{'🔨' if action == 'ban' else '👢' if action == 'kick' else '⏰' if action == 'timeout' else '⚠️' if action == 'warn' else '✅'} Mod-Aktion auf {guild.name}",
+            title=f"{action_emoji} Mod-Aktion auf {guild.name}",
             description=msg,
             color=discord.Color.red() if action in ("ban", "kick", "timeout") else (discord.Color.orange() if action == "warn" else discord.Color.green()),
             timestamp=_now(),
         )
         if hasattr(guild, 'icon') and guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
-        embed.set_footer(text=f"Server-ID: {guild.id}")
         try:
             await user.send(embed=embed)
             return True
@@ -9217,6 +9231,256 @@ class SupportCog(commands.Cog):
         await self._modlog_send(ctx.guild, "mod_action", log_embed)
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
         await ctx.send(f"✅ Timeout von {member.mention} (`{member.id}`) aufgehoben{dm_status}.", delete_after=6)
+
+    # ============================================
+    # ANONYME MOD-AKTIONEN (Moderator wird in DM nicht genannt)
+    # ============================================
+
+    @commands.command(name="ab", aliases=["aban", "anban"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(ban_members=True)
+    @commands.bot_has_permissions(ban_members=True)
+    async def anonymous_ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Bannt ein Mitglied ANONYM. In der DM an den User steht 'Server-Team' statt deinem Namen.
+        Beispiel: `[p]ab @User Spamming`"""
+        if member.bot:
+            await ctx.send("❌ Bots können nicht gebannt werden.", delete_after=6)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Du kannst dich nicht selbst bannen.", delete_after=6)
+            return
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            await ctx.send("❌ Du kannst kein Mitglied bannen das eine höhere oder gleiche Rolle hat wie du.", delete_after=6)
+            return
+        if not ctx.guild.me.top_role > member.top_role:
+            await ctx.send("❌ Ich kann dieses Mitglied nicht bannen (meine Rolle ist zu niedrig).", delete_after=6)
+            return
+        if len(reason) > 500:
+            reason = reason[:500]
+        # ANONYME DM VOR dem Ban senden
+        dm_sent = await self._send_mod_dm(member, ctx.guild, "ban", moderator=ctx.author, reason=reason, anonymous=True)
+        # Ban ausführen (Reason enthält weiterhin den Moderator für Audit-Log)
+        try:
+            await member.ban(reason=f"Anonymer Ban von {ctx.author} ({ctx.author.id}): {reason}", delete_message_days=1)
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung zum Bannen.", delete_after=6)
+            return
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Ban fehlgeschlagen: `{e}`", delete_after=6)
+            return
+        await self._punishment_record(ctx.guild, member.id, "ban", f"[ANONYM] {reason}", ctx.author)
+        await self._team_activity_update(ctx.guild, ctx.author.id, warns_issued=1)
+        # Modlog (intern wird der Moderator trotzdem genannt, nur in der User-DM anonym!)
+        log_embed = discord.Embed(
+            title="🔨 Mitglied anonym gebannt",
+            description=f"**User:** {member.mention} (`{member.id}`)\n**Moderator:** {ctx.author.mention} (anonym)\n**Grund:** {reason}",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        log_embed.set_thumbnail(url=member.display_avatar.url)
+        log_embed.add_field(name="DM gesendet", value="✅ Ja" if dm_sent else "❌ Nein", inline=True)
+        log_embed.add_field(name="Anonym", value="🕵️ Ja (User sieht 'Server-Team')", inline=True)
+        await self._modlog_send(ctx.guild, "mod_action", log_embed)
+        dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
+        await ctx.send(f"🔨 {member.mention} (`{member.id}`) wurde anonym gebannt{dm_status}.\n**Grund:** {reason}", delete_after=6)
+
+    @commands.command(name="ak", aliases=["akick", "akicken"])
+    @commands.guild_only()
+    @checks.admin_or_permissions(kick_members=True)
+    @commands.bot_has_permissions(kick_members=True)
+    async def anonymous_kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Kickt ein Mitglied ANONYM. In der DM an den User steht 'Server-Team' statt deinem Namen.
+        Beispiel: `[p]ak @User Regelverstoß`"""
+        if member.bot:
+            await ctx.send("❌ Bots können nicht gekickt werden.", delete_after=6)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Du kannst dich nicht selbst kicken.", delete_after=6)
+            return
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            await ctx.send("❌ Du kannst kein Mitglied kicken das eine höhere oder gleiche Rolle hat wie du.", delete_after=6)
+            return
+        if not ctx.guild.me.top_role > member.top_role:
+            await ctx.send("❌ Ich kann dieses Mitglied nicht kicken (meine Rolle ist zu niedrig).", delete_after=6)
+            return
+        if len(reason) > 500:
+            reason = reason[:500]
+        # ANONYME DM VOR dem Kick
+        dm_sent = await self._send_mod_dm(member, ctx.guild, "kick", moderator=ctx.author, reason=reason, anonymous=True)
+        try:
+            await member.kick(reason=f"Anonymer Kick von {ctx.author} ({ctx.author.id}): {reason}")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung zum Kicken.", delete_after=6)
+            return
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Kick fehlgeschlagen: `{e}`", delete_after=6)
+            return
+        await self._punishment_record(ctx.guild, member.id, "kick", f"[ANONYM] {reason}", ctx.author)
+        await self._team_activity_update(ctx.guild, ctx.author.id, warns_issued=1)
+        log_embed = discord.Embed(
+            title="👢 Mitglied anonym gekickt",
+            description=f"**User:** {member.mention} (`{member.id}`)\n**Moderator:** {ctx.author.mention} (anonym)\n**Grund:** {reason}",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        log_embed.set_thumbnail(url=member.display_avatar.url)
+        log_embed.add_field(name="DM gesendet", value="✅ Ja" if dm_sent else "❌ Nein", inline=True)
+        log_embed.add_field(name="Anonym", value="🕵️ Ja", inline=True)
+        await self._modlog_send(ctx.guild, "mod_action", log_embed)
+        dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
+        await ctx.send(f"👢 {member.mention} (`{member.id}`) wurde anonym gekickt{dm_status}.\n**Grund:** {reason}", delete_after=6)
+
+    @commands.command(name="at", aliases=["atimeout", "amute", "ato"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(moderate_members=True)
+    @commands.bot_has_permissions(moderate_members=True)
+    async def anonymous_timeout(self, ctx: commands.Context, member: discord.Member, duration: str, *, reason: str = "Kein Grund angegeben"):
+        """Timeoute ein Mitglied ANONYM. In der DM an den User steht 'Server-Team' statt deinem Namen.
+        Beispiel: `[p]at @User 1h Spamming`"""
+        if member.bot:
+            await ctx.send("❌ Bots können nicht getimeoutet werden.", delete_after=6)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Du kannst dich nicht selbst timeouteren.", delete_after=6)
+            return
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            await ctx.send("❌ Du kannst kein Mitglied timeouteren das eine höhere oder gleiche Rolle hat wie du.", delete_after=6)
+            return
+        if not ctx.guild.me.top_role > member.top_role:
+            await ctx.send("❌ Ich kann dieses Mitglied nicht timeouteren (meine Rolle ist zu niedrig).", delete_after=6)
+            return
+        if len(reason) > 500:
+            reason = reason[:500]
+        seconds = self._parse_duration(duration)
+        if seconds is None:
+            await ctx.send("❌ Ungültige Dauer. Verwende Formate wie: 30s, 5m, 2h, 1d, oder 1h30m", delete_after=6)
+            return
+        if seconds > 28 * 86400:
+            await ctx.send("❌ Timeout darf maximal 28 Tage dauern.", delete_after=6)
+            return
+        if seconds < 60:
+            await ctx.send("❌ Timeout muss mindestens 60 Sekunden dauern.", delete_after=6)
+            return
+        until = _now() + timedelta(seconds=seconds)
+        duration_str = self._format_duration(seconds)
+        # ANONYME DM VOR dem Timeout
+        dm_sent = await self._send_mod_dm(member, ctx.guild, "timeout", moderator=ctx.author, reason=reason, duration=duration_str, anonymous=True)
+        try:
+            await member.timeout(until, reason=f"Anonymer Timeout von {ctx.author} ({ctx.author.id}): {reason}")
+        except discord.Forbidden:
+            await ctx.send("❌ Ich habe keine Berechtigung zum Timeouteren.", delete_after=6)
+            return
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Timeout fehlgeschlagen: `{e}`", delete_after=6)
+            return
+        await self._punishment_record(ctx.guild, member.id, "timeout", f"[ANONYM] {reason} (Dauer: {duration_str})", ctx.author)
+        await self._team_activity_update(ctx.guild, ctx.author.id, warns_issued=1)
+        log_embed = discord.Embed(
+            title="⏰ Mitglied anonym getimeoutet",
+            description=f"**User:** {member.mention} (`{member.id}`)\n**Moderator:** {ctx.author.mention} (anonym)\n**Grund:** {reason}",
+            color=discord.Color.dark_orange(),
+            timestamp=_now(),
+        )
+        log_embed.set_thumbnail(url=member.display_avatar.url)
+        log_embed.add_field(name="Dauer", value=duration_str, inline=True)
+        log_embed.add_field(name="DM gesendet", value="✅ Ja" if dm_sent else "❌ Nein", inline=True)
+        log_embed.add_field(name="Anonym", value="🕵️ Ja", inline=True)
+        await self._modlog_send(ctx.guild, "mod_action", log_embed)
+        dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
+        await ctx.send(f"⏰ {member.mention} (`{member.id}`) für **{duration_str}** anonym getimeoutet{dm_status}.\n**Grund:** {reason}", delete_after=6)
+
+    @commands.command(name="aw", aliases=["awarn", "anwarn"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(moderate_members=True)
+    async def anonymous_warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
+        """Verwarnt ein Mitglied ANONYM. In der DM an den User steht 'Server-Team' statt deinem Namen.
+        Beispiel: `[p]aw @User Spamming`"""
+        if member.bot:
+            await ctx.send("❌ Bots können nicht verwarnt werden.", delete_after=6)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Du kannst dich nicht selbst verwarnten.", delete_after=6)
+            return
+        if len(reason) > 500:
+            await ctx.send("❌ Grund zu lang (max 500 Zeichen).", delete_after=6)
+            return
+        cfg = await self.config.guild(ctx.guild).warn_config()
+        # Warn hinzufügen
+        counter = await self.config.guild(ctx.guild).warn_counter() or 0
+        counter += 1
+        warn_id = str(counter)
+        expires_ts = None
+        expiry_days = cfg.get("warn_expiry_days", 30)
+        if expiry_days > 0:
+            expires_ts = _now_ts() + expiry_days * 86400
+        strikes = await self.config.guild(ctx.guild).warn_strikes() or {}
+        user_strikes = strikes.get(str(member.id)) or []
+        if expires_ts is not None or expiry_days > 0:
+            user_strikes = [s for s in user_strikes if not s.get("expires_ts") or s["expires_ts"] > _now_ts()]
+        user_strikes.append({
+            "warn_id": warn_id,
+            "reason": f"[ANONYM] {reason}",
+            "moderator_id": ctx.author.id,
+            "moderator_name": f"{ctx.author.display_name} (anonym)",
+            "ts": _now_ts(),
+            "expires_ts": expires_ts,
+        })
+        strikes[str(member.id)] = user_strikes
+        await self.config.guild(ctx.guild).warn_strikes.set(strikes)
+        await self.config.guild(ctx.guild).warn_counter.set(counter)
+        await self._punishment_record(ctx.guild, member.id, "warn", f"[ANONYM] {reason}", ctx.author)
+        await self._team_activity_update(ctx.guild, ctx.author.id, warns_issued=1)
+        # Modlog (intern mit Moderator, anonym markiert)
+        log_embed = discord.Embed(
+            title="⚠️ User anonym verwarnt",
+            description=f"**User:** {member.mention} (`{member.id}`)\n**Moderator:** {ctx.author.mention} (anonym)\n**Grund:** {reason}",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        log_embed.add_field(name="Aktive Verwarnungen", value=str(len(user_strikes)), inline=True)
+        log_embed.add_field(name="Anonym", value="🕵️ Ja", inline=True)
+        log_embed.set_thumbnail(url=member.display_avatar.url)
+        await self._modlog_send(ctx.guild, "mod_action", log_embed)
+        # ANONYME DM an User
+        dm_sent = False
+        if cfg.get("notify_user_dm", True):
+            dm_sent = await self._send_mod_dm(member, ctx.guild, "warn", moderator=ctx.author, reason=reason, anonymous=True)
+        # Auto-Action (gleiche Logik wie normaler Warn)
+        threshold = cfg.get("auto_action_threshold", 3)
+        action_type = cfg.get("auto_action_type", "timeout")
+        if threshold > 0 and len(user_strikes) >= threshold and action_type != "none":
+            try:
+                if action_type == "timeout":
+                    timeout_min = cfg.get("auto_action_timeout_minutes", 60)
+                    until_action = _now() + timedelta(minutes=timeout_min)
+                    await member.timeout(until_action, reason=f"Auto-Action: {len(user_strikes)} Verwarnungen")
+                    action_msg = f"⏰ {member.mention} wurde automatisch getimeoutet ({timeout_min} Min)."
+                elif action_type == "kick":
+                    await member.kick(reason=f"Auto-Action: {len(user_strikes)} Verwarnungen")
+                    action_msg = f"👢 {member.mention} wurde automatisch gekickt."
+                elif action_type == "ban":
+                    await member.ban(reason=f"Auto-Action: {len(user_strikes)} Verwarnungen", delete_message_days=1)
+                    action_msg = f"🔨 {member.mention} wurde automatisch gebannt."
+                else:
+                    action_msg = ""
+                if action_msg:
+                    await self._punishment_record(ctx.guild, member.id, action_type, f"Auto-Action: {len(user_strikes)} Verwarnungen", ctx.bot.user)
+                    auto_embed = discord.Embed(
+                        title=f"🤖 Auto-Action nach anonymer Warnung: {action_type.upper()}",
+                        description=f"**User:** {member.mention} (`{member.id}`)\n**Aktion:** {action_type}\n**Grund:** {len(user_strikes)} aktive Verwarnungen",
+                        color=discord.Color.red(),
+                        timestamp=_now(),
+                    )
+                    await self._modlog_send(ctx.guild, "mod_action", auto_embed)
+                    dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
+                    await ctx.send(f"✅ {member.mention} anonym verwarnt ({len(user_strikes)} aktiv){dm_status}.\n🤖 {action_msg}", delete_after=6)
+                    return
+            except (discord.Forbidden, discord.HTTPException) as e:
+                dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
+                await ctx.send(f"✅ {member.mention} anonym verwarnt ({len(user_strikes)} aktiv){dm_status}.\n⚠️ Auto-Action fehlgeschlagen: `{e}`", delete_after=6)
+                return
+        dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
+        await ctx.send(f"✅ {member.mention} anonym verwarnt ({len(user_strikes)} aktive Verwarnung(en)){dm_status}.", delete_after=6)
 
     def _parse_duration(self, duration_str: str) -> int:
         """Parst eine Dauer-Zeichenkette wie '1h30m', '2d', '45s' in Sekunden. Gibt None bei Fehler zurück."""
