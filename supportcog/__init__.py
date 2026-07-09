@@ -9421,7 +9421,7 @@ class SupportCog(commands.Cog):
     # CLEAR MESSAGES (Massen-Löschung)
     # ============================================
 
-    @commands.command(name="clearmsgs", aliases=["clearmessages", "clearmsg", "massclear", "mc", "purge"])
+    @commands.command(name="clearmsgs", aliases=["clearmessages", "clearmsg", "massclear", "mc"])
     @commands.guild_only()
     @checks.mod_or_permissions(manage_messages=True)
     @commands.bot_has_permissions(manage_messages=True)
@@ -19725,7 +19725,7 @@ class ModlogWizardView(discord.ui.View):
     # SERVER-STATISTIKEN
     # ============================================
 
-    @commands.command(name="serverstats", aliases=["sstats", "stats", "serverinfo", "sinfo"])
+    @commands.command(name="serverstats", aliases=["sstats", "sinfo"])
     @commands.guild_only()
     async def server_stats_cmd(self, ctx: commands.Context):
         """Zeigt detaillierte Server-Statistiken."""
