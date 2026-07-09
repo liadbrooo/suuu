@@ -19722,15 +19722,81 @@ class TeamAbmeldungPanelView(discord.ui.View):
                 pass
 
     @discord.ui.button(label="Anmelden", style=discord.ButtonStyle.success, emoji="✅", custom_id="team_anmeldung_panel")
-    async def open_anmeldung_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def anmelden_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Anmelden-Button: meldet den User sofort an (ohne Modal).
+        Entfernt alle seine Abmeldungen und bearbeitet die Abmeldungs-Nachrichten im Channel."""
         try:
             if not isinstance(interaction.user, discord.Member):
                 await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
                 return
-            modal = TeamAnmeldungModal(self.cog)
-            await interaction.response.send_modal(modal)
+            guild = interaction.guild
+            member = interaction.user
+            # Bestehende Abmeldungen dieses Users finden
+            abmeldungen = await self.cog.config.guild(guild).team_abmeldungen() or {}
+            removed_ids = []
+            removed_abm_data = []
+            for abm_id, abm in list(abmeldungen.items()):
+                if abm.get("user_id") == member.id:
+                    removed_ids.append(abm_id)
+                    removed_abm_data.append((abm_id, abm))
+                    del abmeldungen[abm_id]
+            if removed_ids:
+                await self.cog.config.guild(guild).team_abmeldungen.set(abmeldungen)
+            # Abmeldungs-Nachrichten im Channel bearbeiten
+            ch_id = await self.cog.config.guild(guild).team_abmeldungen_channel()
+            if ch_id and removed_abm_data:
+                channel = guild.get_channel(ch_id)
+                if channel:
+                    for abm_id, abm in removed_abm_data:
+                        try:
+                            async for msg in channel.history(limit=100):
+                                if msg.author.id == guild.me.id and msg.embeds:
+                                    embed = msg.embeds[0]
+                                    if embed.title and f"#{abm_id}" in embed.title and "Abmeldung" in embed.title:
+                                        edited_embed = discord.Embed(
+                                            title=f"✅ Abmeldung #{abm_id} — Wieder angemeldet",
+                                            description=(
+                                                f"**Name:** {abm.get('name', '?')}\n"
+                                                f"**Ehemals abgemeldet von:** {member.mention}\n\n"
+                                                f"✅ **Wieder verfügbar seit:** {_fmt_berlin_full(_now())} (MEZ/MESZ)"
+                                            ),
+                                            color=discord.Color.green(),
+                                            timestamp=_now(),
+                                        )
+                                        edited_embed.add_field(
+                                            name="📦 Ursprüngliche Abmeldung",
+                                            value=(
+                                                f"📅 {abm.get('von', '?')} – {abm.get('bis', '?')}\n"
+                                                f"📞 {abm.get('erreichbarkeit', '?')[:200]}"
+                                            ),
+                                            inline=False,
+                                        )
+                                        edited_embed.set_thumbnail(url=member.display_avatar.url)
+                                        try:
+                                            await msg.edit(embed=edited_embed)
+                                        except (discord.Forbidden, discord.HTTPException):
+                                            pass
+                                        break
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
+            # Bestätigung an User per DM
+            try:
+                confirm_embed = discord.Embed(
+                    title="✅ Angemeldet",
+                    description="Du wurdest als verfügbar angemeldet." + (f"\nDeine Abmeldung(en) #{', #'.join(removed_ids)} wurde(n) als 'wieder angemeldet' markiert." if removed_ids else ""),
+                    color=discord.Color.green(),
+                    timestamp=_now(),
+                )
+                await member.send(embed=confirm_embed)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            # Bestätigung am Button (ephemeral)
+            if removed_ids:
+                await interaction.response.send_message(f"✅ Du wurdest angemeldet! Deine Abmeldung(en) #{', #'.join(removed_ids)} wurde(n) als 'wieder angemeldet' markiert.", ephemeral=True)
+            else:
+                await interaction.response.send_message("✅ Du bist angemeldet (warst nicht abgemeldet).", ephemeral=True)
         except Exception as e:
-            log.exception("Fehler beim Öffnen des Anmeldungs-Modals")
+            log.exception("Fehler beim Anmelden via Button")
             try:
                 if not interaction.response.is_done():
                     await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
@@ -19841,143 +19907,6 @@ class TeamAbmeldungModal(discord.ui.Modal):
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.exception("Fehler im TeamAbmeldungModal", exc_info=error)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
-        except discord.HTTPException:
-            pass
-
-
-class TeamAnmeldungModal(discord.ui.Modal):
-    """Modal für die Team-Anmeldung (Wieder-Verfügbarkeit / Abmeldung zurückziehen)."""
-
-    def __init__(self, cog):
-        super().__init__(title="✅ Team-Anmeldung", timeout=600)
-        self.cog = cog
-        self.name_input = discord.ui.TextInput(
-            label="Name (dein Name im Team)",
-            placeholder="z.B. Max / dein Team-Name",
-            required=True,
-            max_length=100,
-            custom_id="anm_name",
-        )
-        self.add_item(self.name_input)
-        self.verfuegbar_input = discord.ui.TextInput(
-            label="Ab wann bist du wieder verfügbar?",
-            placeholder="z.B. sofort oder ab 20.07.2026 18:00",
-            required=True,
-            max_length=200,
-            custom_id="anm_verfuegbar",
-        )
-        self.add_item(self.verfuegbar_input)
-        self.notiz_input = discord.ui.TextInput(
-            label="Notiz (optional)",
-            placeholder="Zusätzliche Infos, z.B. abgeschlossene Abmeldung",
-            required=False,
-            max_length=500,
-            style=discord.TextStyle.paragraph,
-            custom_id="anm_notiz",
-        )
-        self.add_item(self.notiz_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        name = self.name_input.value.strip()
-        verfuegbar = self.verfuegbar_input.value.strip()
-        notiz = self.notiz_input.value.strip() if self.notiz_input.value else ""
-        guild = interaction.guild
-        member = interaction.user
-        if not name or not verfuegbar:
-            await interaction.response.send_message("❌ Bitte fülle alle Pflichtfelder aus.", ephemeral=True)
-            return
-        try:
-            # Bestehende Abmeldungen dieses Users finden
-            abmeldungen = await self.cog.config.guild(guild).team_abmeldungen() or {}
-            removed_ids = []
-            removed_abm_data = []
-            for abm_id, abm in list(abmeldungen.items()):
-                if abm.get("user_id") == member.id:
-                    removed_ids.append(abm_id)
-                    removed_abm_data.append((abm_id, abm))
-                    del abmeldungen[abm_id]
-            if removed_ids:
-                await self.cog.config.guild(guild).team_abmeldungen.set(abmeldungen)
-            # Die ursprünglichen Abmeldungs-Nachrichten im Channel bearbeiten (statt neue Nachricht)
-            ch_id = await self.cog.config.guild(guild).team_abmeldungen_channel()
-            if ch_id and removed_abm_data:
-                channel = guild.get_channel(ch_id)
-                if channel:
-                    for abm_id, abm in removed_abm_data:
-                        # Ursprüngliche Nachricht suchen: wir hatten sie nicht gespeichert,
-                        # deshalb suchen wir nach dem Embed-Titel "Neue Team-Abmeldung #{abm_id}"
-                        try:
-                            async for msg in channel.history(limit=100):
-                                if msg.author.id == guild.me.id and msg.embeds:
-                                    embed = msg.embeds[0]
-                                    if embed.title and f"#{abm_id}" in embed.title and "Abmeldung" in embed.title:
-                                        # Gefunden! Bearbeiten
-                                        edited_embed = discord.Embed(
-                                            title=f"✅ Abmeldung #{abm_id} — Wieder angemeldet",
-                                            description=(
-                                                f"**Name:** {abm.get('name', '?')}\n"
-                                                f"**Ehemals abgemeldet von:** {member.mention}\n\n"
-                                                f"✅ **Wieder verfügbar seit:** {_fmt_berlin_full(_now())} (MEZ/MESZ)\n"
-                                                f"📝 **Angemeldet von:** {name}\n"
-                                                f"📅 **Begründung:** {verfuegbar[:300]}"
-                                            ),
-                                            color=discord.Color.green(),
-                                            timestamp=_now(),
-                                        )
-                                        if notiz:
-                                            edited_embed.add_field(name="📝 Notiz", value=notiz[:500], inline=False)
-                                        # Ursprüngliche Abmeldungs-Daten (für Archiv)
-                                        edited_embed.add_field(
-                                            name="📦 Ursprüngliche Abmeldung",
-                                            value=(
-                                                f"📅 {abm.get('von', '?')} – {abm.get('bis', '?')}\n"
-                                                f"📞 {abm.get('erreichbarkeit', '?')[:200]}"
-                                            ),
-                                            inline=False,
-                                        )
-                                        edited_embed.set_thumbnail(url=member.display_avatar.url)
-                                        try:
-                                            await msg.edit(embed=edited_embed)
-                                        except (discord.Forbidden, discord.HTTPException):
-                                            pass
-                                        break
-                        except (discord.Forbidden, discord.HTTPException):
-                            pass
-            # Bestätigung an User per DM
-            try:
-                confirm_embed = discord.Embed(
-                    title="✅ Anmeldung eingereicht",
-                    description="Du wurdest als verfügbar angemeldet." + (f"\nDeine Abmeldung(en) #{', #'.join(removed_ids)} wurde(n) im Channel als 'wieder angemeldet' markiert." if removed_ids else ""),
-                    color=discord.Color.green(),
-                    timestamp=_now(),
-                )
-                confirm_embed.add_field(name="📅 Wieder verfügbar", value=verfuegbar[:500], inline=False)
-                if notiz:
-                    confirm_embed.add_field(name="📝 Notiz", value=notiz[:500], inline=False)
-                await member.send(embed=confirm_embed)
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-            if removed_ids:
-                await interaction.response.send_message(f"✅ Du wurdest angemeldet! Deine Abmeldung(en) #{', #'.join(removed_ids)} wurde(n) als 'wieder angemeldet' markiert.", ephemeral=True)
-            else:
-                await interaction.response.send_message("✅ Du bist angemeldet (warst nicht abgemeldet).", ephemeral=True)
-        except Exception as e:
-            log.exception("Fehler beim Erstellen der Anmeldung")
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
-                else:
-                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
-            except Exception:
-                pass
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        log.exception("Fehler im TeamAnmeldungModal", exc_info=error)
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
