@@ -15566,6 +15566,256 @@ class SupportCog(DashboardIntegration, commands.Cog):
         await ctx.send("✅ Anti-Nuke Tracker zurückgesetzt.")
 
 
+
+    # ============================================
+    # NEUE FEATURES (clearmsgs, ben, kik, serverstats, cogfeatures, activityreport)
+    # ============================================
+
+    @commands.command(name="clearmsgs", aliases=["clearmessages", "clearmsg", "massclear"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True)
+    async def clear_messages(self, ctx: commands.Context, count: int):
+        """Löscht eine Anzahl von Nachrichten im aktuellen Channel (2-100)."""
+        if count < 2:
+            await ctx.send("❌ Mindestens 2 Nachrichten (Discord-Limit).", delete_after=10)
+            return
+        if count > 100:
+            await ctx.send("❌ Maximal 100 Nachrichten (Discord-Limit).", delete_after=10)
+            return
+        try:
+            deleted = await ctx.channel.purge(limit=count + 1, bulk=True)
+            await ctx.send(f"🧹 **{len(deleted) - 1}** Nachrichten gelöscht.", delete_after=6)
+        except discord.Forbidden:
+            await ctx.send("❌ Keine Berechtigung.", delete_after=10)
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
+
+    @commands.command(name="clearuser", aliases=["clearu", "userpurge"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True)
+    async def clear_user_messages(self, ctx: commands.Context, member: discord.Member, count: int = 100):
+        """Löscht Nachrichten eines bestimmten Users im aktuellen Channel."""
+        if count < 1 or count > 500:
+            await ctx.send("❌ Anzahl muss 1-500 sein.", delete_after=10)
+            return
+        try:
+            def check(m):
+                return m.author.id == member.id
+            deleted = await ctx.channel.purge(limit=count + 5, check=check, bulk=True)
+            await ctx.send(f"🧹 **{len(deleted)}** Nachrichten von {member.mention} gelöscht.", delete_after=6)
+        except discord.Forbidden:
+            await ctx.send("❌ Keine Berechtigung.", delete_after=10)
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
+
+    @commands.command(name="ben", aliases=["fakeban", "fban"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(ban_members=True)
+    async def fake_ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Sendet eine FAKE BAN-DM an einen User. Der User wird NICHT gebannt."""
+        if member.bot:
+            await ctx.send("❌ Bots können keine DMs erhalten.", delete_after=10)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Nicht sich selbst.", delete_after=10)
+            return
+        if len(reason) > 500:
+            reason = reason[:500]
+        dm_sent = await self._send_mod_dm(member, ctx.guild, "ban", moderator=ctx.author, reason=reason)
+        if dm_sent:
+            await ctx.send(f"🎭 **Fake-Ban.** {member.mention} hat eine BAN-DM erhalten, wurde aber NICHT gebannt.\n**Grund:** {reason}", delete_after=15)
+        else:
+            await ctx.send(f"⚠️ Fake-Ban: DM nicht zustellbar. {member.mention} wurde NICHT gebannt.", delete_after=15)
+
+    @commands.command(name="kik", aliases=["fakekick", "fkick"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(kick_members=True)
+    async def fake_kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Sendet eine FAKE KICK-DM an einen User. Der User wird NICHT gekickt."""
+        if member.bot:
+            await ctx.send("❌ Bots können keine DMs erhalten.", delete_after=10)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Nicht sich selbst.", delete_after=10)
+            return
+        if len(reason) > 500:
+            reason = reason[:500]
+        dm_sent = await self._send_mod_dm(member, ctx.guild, "kick", moderator=ctx.author, reason=reason)
+        if dm_sent:
+            await ctx.send(f"🎭 **Fake-Kick.** {member.mention} hat eine KICK-DM erhalten, wurde aber NICHT gekickt.\n**Grund:** {reason}", delete_after=15)
+        else:
+            await ctx.send(f"⚠️ Fake-Kick: DM nicht zustellbar. {member.mention} wurde NICHT gekickt.", delete_after=15)
+
+    @commands.command(name="cogfeatures", aliases=["coginfo", "funktionen"])
+    @commands.guild_only()
+    async def cog_features_cmd(self, ctx: commands.Context):
+        """Zeigt eine Übersicht aller Funktionen des SupportCogs."""
+        embed = discord.Embed(
+            title="🛠️ SupportCog — Alle Funktionen",
+            description="Übersicht aller verfügbaren Command-Gruppen. Verwende `[p]help <command>` für Details.",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="🎫 Support & Whitelist", value="• `[p]supportset` • `[p]whitelistset`\n• `[p]supportstats` • `[p]feedbackpanel`\n• `[p]wlstats` • `[p]wlcheck` • `[p]wltemp`\n• `[p]whitelistuser` • `[p]removewhitelist`", inline=False)
+        embed.add_field(name="🎫 Tickets", value="• `[p]ticketset` • `[p]ticketworkload`\n• `[p]ticketpriority` • `[p]ticketnote`\n• `[p]ticketassign` • `[p]tickethistory`\n• `[p]sclaim` • `[p]sunclaim`", inline=False)
+        embed.add_field(name="🔨 Moderation", value="• `[p]sban` • `[p]sunban` • `[p]skick`\n• `[p]stimeout` • `[p]suntimeout`\n• `[p]swarn` • `[p]swarns` • `[p]sunwarn`\n• `[p]ab` • `[p]ak` • `[p]at` • `[p]aw` (anonym)\n• `[p]ben` • `[p]kik` (fake)\n• `[p]clearmsgs` • `[p]clearuser`\n• `[p]moddm` • `[p]memberinfo`", inline=False)
+        embed.add_field(name="🔗 Anti-Link & Anti-Nuke", value="• `[p]antilink` • Anti-Nuke (automatisch)", inline=False)
+        embed.add_field(name="🔄 BanSync", value="• `[p]syncset` — Cross-Server Sync", inline=False)
+        embed.add_field(name="📜 Extended Modlog", value="• `[p]extmodlog` • `[p]extmodlog setup`\n• 22+ Event-Typen • Separate Channels", inline=False)
+        embed.add_field(name="👥 Team Management", value="• `[p]teampanel` • `[p]teammeeting`\n• `[p]teamapp` • `[p]teamtermin`\n• `[p]teamstats` • `[p]teamactivity`\n• `[p]aufgabe` • `[p]snippet` • `[p]watchlist`", inline=False)
+        embed.add_field(name="📊 Utility", value="• `[p]serverstats` — Server-Statistiken\n• `[p]activityreport` — Auto Activity-Report\n• `[p]activityreportset` — Report-Konfig\n• `[p]embedbuilder` — Custom Embeds\n• `[p]cogfeatures` — Diese Übersicht", inline=False)
+        embed.set_footer(text=f"SupportCog • {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="serverstats", aliases=["sstats", "sinfo"])
+    @commands.guild_only()
+    async def server_stats_cmd(self, ctx: commands.Context):
+        """Zeigt detaillierte Server-Statistiken."""
+        guild = ctx.guild
+        member_count = guild.member_count or len(guild.members)
+        bot_count = sum(1 for m in guild.members if m.bot)
+        human_count = member_count - bot_count
+        online_count = sum(1 for m in guild.members if m.status == discord.Status.online)
+        from datetime import datetime, timezone
+        created_days = (datetime.now(timezone.utc) - guild.created_at).days
+        tickets = await self.config.guild(guild).tickets() or {}
+        apps = await self.config.guild(guild).team_applications() or {}
+        strikes = await self.config.guild(guild).warn_strikes() or {}
+        embed = discord.Embed(
+            title=f"📊 Server-Statistiken — {guild.name}",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        embed.add_field(name="👥 Mitglieder", value=str(member_count), inline=True)
+        embed.add_field(name="👤 Menschen", value=str(human_count), inline=True)
+        embed.add_field(name="🤖 Bots", value=str(bot_count), inline=True)
+        embed.add_field(name="🟢 Online", value=str(online_count), inline=True)
+        embed.add_field(name="📺 Channels", value=f"Text: {len(guild.text_channels)}\nVoice: {len(guild.voice_channels)}", inline=True)
+        embed.add_field(name="🎭 Rollen", value=str(len(guild.roles)), inline=True)
+        embed.add_field(name="😀 Emojis", value=str(len(guild.emojis)), inline=True)
+        embed.add_field(name="💎 Boost", value=f"Level {guild.premium_tier}\n{guild.premium_subscription_count} Boosts", inline=True)
+        embed.add_field(name="📅 Alter", value=f"{created_days} Tage", inline=True)
+        embed.add_field(name="👑 Besitzer", value=f"<@{guild.owner_id}>", inline=True)
+        embed.add_field(name="🎫 Tickets", value=str(len(tickets)), inline=True)
+        embed.add_field(name="📋 Bewerbungen", value=str(len(apps)), inline=True)
+        embed.add_field(name="⚠️ Verwarnte User", value=str(len(strikes)), inline=True)
+        embed.set_footer(text=f"Erstellt am {_fmt_berlin_full(guild.created_at)} (MEZ/MESZ)")
+        await ctx.send(embed=embed)
+
+    @commands.group(name="activityreportset", aliases=["arset", "reportset"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def activity_report_set(self, ctx: commands.Context):
+        """Konfiguriert den automatischen Activity-Report."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @activity_report_set.command(name="toggle")
+    async def ar_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert den automatischen Activity-Report."""
+        current = await self.config.guild(ctx.guild).activity_report_enabled()
+        await self.config.guild(ctx.guild).activity_report_enabled.set(not current)
+        await ctx.send(f"✅ Auto Activity-Report **{'aktiviert' if not current else 'deaktiviert'}**.")
+
+    @activity_report_set.command(name="channel")
+    async def ar_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel in den der Report gesendet wird."""
+        if channel is None:
+            await self.config.guild(ctx.guild).activity_report_channel.set(None)
+            await ctx.send("✅ Report-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).activity_report_channel.set(channel.id)
+        await ctx.send(f"✅ Report-Channel: {channel.mention}.")
+
+    @activity_report_set.command(name="interval")
+    async def ar_interval(self, ctx: commands.Context, hours: int):
+        """Setzt das Sende-Intervall in Stunden (24=täglich, 168=wöchentlich)."""
+        if hours < 1 or hours > 2160:
+            await ctx.send("❌ 1-2160 Stunden.")
+            return
+        await self.config.guild(ctx.guild).activity_report_interval_hours.set(hours)
+        await ctx.send(f"✅ Intervall: **{hours}h**.")
+
+    @activity_report_set.command(name="day")
+    async def ar_day(self, ctx: commands.Context, day: str):
+        """Setzt den Wochentag (Mo, Di, Mi, Do, Fr, Sa, So)."""
+        days_map = {"mo": 0, "di": 1, "mi": 2, "do": 3, "fr": 4, "sa": 5, "so": 6,
+                     "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+        if day.lower() not in days_map:
+            await ctx.send("❌ Mo/Di/Mi/Do/Fr/Sa/So")
+            return
+        await self.config.guild(ctx.guild).activity_report_day_of_week.set(days_map[day.lower()])
+        await ctx.send(f"✅ Tag: **{day.title()}**.")
+
+    @activity_report_set.command(name="hour")
+    async def ar_hour(self, ctx: commands.Context, hour: int):
+        """Setzt die Stunde (0-23, MEZ/MESZ)."""
+        if hour < 0 or hour > 23:
+            await ctx.send("❌ 0-23.")
+            return
+        await self.config.guild(ctx.guild).activity_report_hour.set(hour)
+        await ctx.send(f"✅ Stunde: **{hour}:00**.")
+
+    @activity_report_set.command(name="show")
+    async def ar_show(self, ctx: commands.Context):
+        """Zeigt die aktuelle Konfiguration."""
+        enabled = await self.config.guild(ctx.guild).activity_report_enabled()
+        ch_id = await self.config.guild(ctx.guild).activity_report_channel()
+        interval = await self.config.guild(ctx.guild).activity_report_interval_hours()
+        embed = discord.Embed(title="📊 Activity-Report Konfig", color=discord.Color.blurple(), timestamp=_now())
+        embed.add_field(name="Status", value="✅ An" if enabled else "❌ Aus", inline=True)
+        embed.add_field(name="Channel", value=f"<#{ch_id}>" if ch_id else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Intervall", value=f"{interval}h", inline=True)
+        await ctx.send(embed=embed)
+
+    @commands.command(name="activityreport", aliases=["teamreport"])
+    @commands.guild_only()
+    async def activity_report_cmd(self, ctx: commands.Context):
+        """Erstellt einen Activity-Report manuell."""
+        ch_id = await self.config.guild(ctx.guild).activity_report_channel()
+        if not ch_id:
+            await ctx.send("❌ Kein Report-Channel gesetzt. Verwende `[p]activityreportset channel #channel`.")
+            return
+        channel = ctx.guild.get_channel(ch_id)
+        if not channel:
+            await ctx.send("❌ Channel nicht gefunden.")
+            return
+        activity = await self.config.guild(ctx.guild).team_activity() or {}
+        tickets = await self.config.guild(ctx.guild).tickets() or {}
+        apps = await self.config.guild(ctx.guild).team_applications() or {}
+        warns = await self.config.guild(ctx.guild).warn_strikes() or {}
+        def _score(d):
+            return (d.get("tickets_closed", 0) * 5 + d.get("warns_issued", 0) * 2 + d.get("tasks_completed", 0) * 3 + min(d.get("messages_sent", 0), 1000) / 100)
+        sorted_act = sorted(activity.items(), key=lambda x: _score(x[1]), reverse=True)
+        embed = discord.Embed(
+            title=f"📊 Activity-Report — {ctx.guild.name}",
+            description=f"Generiert: {_fmt_berlin_full(_now())} (MEZ/MESZ)",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        if ctx.guild.icon:
+            embed.set_thumbnail(url=ctx.guild.icon.url)
+        embed.add_field(name="🎫 Tickets", value=str(len(tickets)), inline=True)
+        embed.add_field(name="📋 Bewerbungen", value=str(len(apps)), inline=True)
+        embed.add_field(name="⚠️ Verwarnte User", value=str(len(warns)), inline=True)
+        if sorted_act:
+            lb = ""
+            medals = ["🥇", "🥈", "🥉"]
+            for i, (uid, data) in enumerate(sorted_act[:10]):
+                m = ctx.guild.get_member(int(uid))
+                name = m.display_name if m else data.get("username", f"User {uid}")
+                rank = medals[i] if i < 3 else f"#{i+1}"
+                lb += f"{rank} **{name}** — {_score(data):.1f}\n"
+            embed.add_field(name="🏆 Leaderboard", value=lb[:1024], inline=False)
+        await channel.send(embed=embed)
+        await self.config.guild(ctx.guild).activity_report_last_sent.set(_now_ts())
+        await ctx.send("✅ Activity-Report gesendet.", delete_after=10)
+
+
 class DutyButtonView(discord.ui.View):
     """Button-View für Duty An-/Abmeldung mit erweiterten Funktionen"""
     
@@ -19339,255 +19589,6 @@ class ModlogWizardView(discord.ui.View):
             await interaction.response.send_message(embed=embed, ephemeral=True)
         except Exception:
             log.exception("Fehler im Modlog Show Config Button")
-
-    # ============================================
-    # NEUE FEATURES (clearmsgs, ben, kik, serverstats, cogfeatures, activityreport)
-    # ============================================
-
-    @commands.command(name="clearmsgs", aliases=["clearmessages", "clearmsg", "massclear", "mc"])
-    @commands.guild_only()
-    @checks.mod_or_permissions(manage_messages=True)
-    @commands.bot_has_permissions(manage_messages=True)
-    async def clear_messages(self, ctx: commands.Context, count: int):
-        """Löscht eine Anzahl von Nachrichten im aktuellen Channel (2-100)."""
-        if count < 2:
-            await ctx.send("❌ Mindestens 2 Nachrichten (Discord-Limit).", delete_after=10)
-            return
-        if count > 100:
-            await ctx.send("❌ Maximal 100 Nachrichten (Discord-Limit).", delete_after=10)
-            return
-        try:
-            deleted = await ctx.channel.purge(limit=count + 1, bulk=True)
-            await ctx.send(f"🧹 **{len(deleted) - 1}** Nachrichten gelöscht.", delete_after=6)
-        except discord.Forbidden:
-            await ctx.send("❌ Keine Berechtigung.", delete_after=10)
-        except discord.HTTPException as e:
-            await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
-
-    @commands.command(name="clearuser", aliases=["clearu", "userpurge"])
-    @commands.guild_only()
-    @checks.mod_or_permissions(manage_messages=True)
-    @commands.bot_has_permissions(manage_messages=True)
-    async def clear_user_messages(self, ctx: commands.Context, member: discord.Member, count: int = 100):
-        """Löscht Nachrichten eines bestimmten Users im aktuellen Channel."""
-        if count < 1 or count > 500:
-            await ctx.send("❌ Anzahl muss 1-500 sein.", delete_after=10)
-            return
-        try:
-            def check(m):
-                return m.author.id == member.id
-            deleted = await ctx.channel.purge(limit=count + 5, check=check, bulk=True)
-            await ctx.send(f"🧹 **{len(deleted)}** Nachrichten von {member.mention} gelöscht.", delete_after=6)
-        except discord.Forbidden:
-            await ctx.send("❌ Keine Berechtigung.", delete_after=10)
-        except discord.HTTPException as e:
-            await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
-
-    @commands.command(name="ben", aliases=["fakeban", "fban"])
-    @commands.guild_only()
-    @checks.mod_or_permissions(ban_members=True)
-    async def fake_ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
-        """Sendet eine FAKE BAN-DM an einen User. Der User wird NICHT gebannt."""
-        if member.bot:
-            await ctx.send("❌ Bots können keine DMs erhalten.", delete_after=10)
-            return
-        if member == ctx.author:
-            await ctx.send("❌ Nicht sich selbst.", delete_after=10)
-            return
-        if len(reason) > 500:
-            reason = reason[:500]
-        dm_sent = await self._send_mod_dm(member, ctx.guild, "ban", moderator=ctx.author, reason=reason)
-        if dm_sent:
-            await ctx.send(f"🎭 **Fake-Ban.** {member.mention} hat eine BAN-DM erhalten, wurde aber NICHT gebannt.\n**Grund:** {reason}", delete_after=15)
-        else:
-            await ctx.send(f"⚠️ Fake-Ban: DM nicht zustellbar. {member.mention} wurde NICHT gebannt.", delete_after=15)
-
-    @commands.command(name="kik", aliases=["fakekick", "fkick"])
-    @commands.guild_only()
-    @checks.mod_or_permissions(kick_members=True)
-    async def fake_kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
-        """Sendet eine FAKE KICK-DM an einen User. Der User wird NICHT gekickt."""
-        if member.bot:
-            await ctx.send("❌ Bots können keine DMs erhalten.", delete_after=10)
-            return
-        if member == ctx.author:
-            await ctx.send("❌ Nicht sich selbst.", delete_after=10)
-            return
-        if len(reason) > 500:
-            reason = reason[:500]
-        dm_sent = await self._send_mod_dm(member, ctx.guild, "kick", moderator=ctx.author, reason=reason)
-        if dm_sent:
-            await ctx.send(f"🎭 **Fake-Kick.** {member.mention} hat eine KICK-DM erhalten, wurde aber NICHT gekickt.\n**Grund:** {reason}", delete_after=15)
-        else:
-            await ctx.send(f"⚠️ Fake-Kick: DM nicht zustellbar. {member.mention} wurde NICHT gekickt.", delete_after=15)
-
-    @commands.command(name="cogfeatures", aliases=["coginfo", "funktionen"])
-    @commands.guild_only()
-    async def cog_features_cmd(self, ctx: commands.Context):
-        """Zeigt eine Übersicht aller Funktionen des SupportCogs."""
-        embed = discord.Embed(
-            title="🛠️ SupportCog — Alle Funktionen",
-            description="Übersicht aller verfügbaren Command-Gruppen. Verwende `[p]help <command>` für Details.",
-            color=discord.Color.blurple(),
-            timestamp=_now(),
-        )
-        embed.add_field(name="🎫 Support & Whitelist", value="• `[p]supportset` • `[p]whitelistset`\n• `[p]supportstats` • `[p]feedbackpanel`\n• `[p]wlstats` • `[p]wlcheck` • `[p]wltemp`\n• `[p]whitelistuser` • `[p]removewhitelist`", inline=False)
-        embed.add_field(name="🎫 Tickets", value="• `[p]ticketset` • `[p]ticketworkload`\n• `[p]ticketpriority` • `[p]ticketnote`\n• `[p]ticketassign` • `[p]tickethistory`\n• `[p]sclaim` • `[p]sunclaim`", inline=False)
-        embed.add_field(name="🔨 Moderation", value="• `[p]sban` • `[p]sunban` • `[p]skick`\n• `[p]stimeout` • `[p]suntimeout`\n• `[p]swarn` • `[p]swarns` • `[p]sunwarn`\n• `[p]ab` • `[p]ak` • `[p]at` • `[p]aw` (anonym)\n• `[p]ben` • `[p]kik` (fake)\n• `[p]clearmsgs` • `[p]clearuser`\n• `[p]moddm` • `[p]memberinfo`", inline=False)
-        embed.add_field(name="🔗 Anti-Link & Anti-Nuke", value="• `[p]antilink` • Anti-Nuke (automatisch)", inline=False)
-        embed.add_field(name="🔄 BanSync", value="• `[p]syncset` — Cross-Server Sync", inline=False)
-        embed.add_field(name="📜 Extended Modlog", value="• `[p]extmodlog` • `[p]extmodlog setup`\n• 22+ Event-Typen • Separate Channels", inline=False)
-        embed.add_field(name="👥 Team Management", value="• `[p]teampanel` • `[p]teammeeting`\n• `[p]teamapp` • `[p]teamtermin`\n• `[p]teamstats` • `[p]teamactivity`\n• `[p]aufgabe` • `[p]snippet` • `[p]watchlist`", inline=False)
-        embed.add_field(name="📊 Utility", value="• `[p]serverstats` — Server-Statistiken\n• `[p]activityreport` — Auto Activity-Report\n• `[p]activityreportset` — Report-Konfig\n• `[p]embedbuilder` — Custom Embeds\n• `[p]cogfeatures` — Diese Übersicht", inline=False)
-        embed.set_footer(text=f"SupportCog • {ctx.guild.name}")
-        await ctx.send(embed=embed)
-
-    @commands.command(name="serverstats", aliases=["sstats", "sinfo"])
-    @commands.guild_only()
-    async def server_stats_cmd(self, ctx: commands.Context):
-        """Zeigt detaillierte Server-Statistiken."""
-        guild = ctx.guild
-        member_count = guild.member_count or len(guild.members)
-        bot_count = sum(1 for m in guild.members if m.bot)
-        human_count = member_count - bot_count
-        online_count = sum(1 for m in guild.members if m.status == discord.Status.online)
-        from datetime import datetime, timezone
-        created_days = (datetime.now(timezone.utc) - guild.created_at).days
-        tickets = await self.config.guild(guild).tickets() or {}
-        apps = await self.config.guild(guild).team_applications() or {}
-        strikes = await self.config.guild(guild).warn_strikes() or {}
-        embed = discord.Embed(
-            title=f"📊 Server-Statistiken — {guild.name}",
-            color=discord.Color.blurple(),
-            timestamp=_now(),
-        )
-        if guild.icon:
-            embed.set_thumbnail(url=guild.icon.url)
-        embed.add_field(name="👥 Mitglieder", value=str(member_count), inline=True)
-        embed.add_field(name="👤 Menschen", value=str(human_count), inline=True)
-        embed.add_field(name="🤖 Bots", value=str(bot_count), inline=True)
-        embed.add_field(name="🟢 Online", value=str(online_count), inline=True)
-        embed.add_field(name="📺 Channels", value=f"Text: {len(guild.text_channels)}\nVoice: {len(guild.voice_channels)}", inline=True)
-        embed.add_field(name="🎭 Rollen", value=str(len(guild.roles)), inline=True)
-        embed.add_field(name="😀 Emojis", value=str(len(guild.emojis)), inline=True)
-        embed.add_field(name="💎 Boost", value=f"Level {guild.premium_tier}\n{guild.premium_subscription_count} Boosts", inline=True)
-        embed.add_field(name="📅 Alter", value=f"{created_days} Tage", inline=True)
-        embed.add_field(name="👑 Besitzer", value=f"<@{guild.owner_id}>", inline=True)
-        embed.add_field(name="🎫 Tickets", value=str(len(tickets)), inline=True)
-        embed.add_field(name="📋 Bewerbungen", value=str(len(apps)), inline=True)
-        embed.add_field(name="⚠️ Verwarnte User", value=str(len(strikes)), inline=True)
-        embed.set_footer(text=f"Erstellt am {_fmt_berlin_full(guild.created_at)} (MEZ/MESZ)")
-        await ctx.send(embed=embed)
-
-    @commands.group(name="activityreportset", aliases=["arset", "reportset"])
-    @checks.admin_or_permissions(manage_guild=True)
-    @commands.guild_only()
-    async def activity_report_set(self, ctx: commands.Context):
-        """Konfiguriert den automatischen Activity-Report."""
-        if ctx.invoked_subcommand is None:
-            await ctx.send_help()
-
-    @activity_report_set.command(name="toggle")
-    async def ar_toggle(self, ctx: commands.Context):
-        """Aktiviert/deaktiviert den automatischen Activity-Report."""
-        current = await self.config.guild(ctx.guild).activity_report_enabled()
-        await self.config.guild(ctx.guild).activity_report_enabled.set(not current)
-        await ctx.send(f"✅ Auto Activity-Report **{'aktiviert' if not current else 'deaktiviert'}**.")
-
-    @activity_report_set.command(name="channel")
-    async def ar_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
-        """Setzt den Channel in den der Report gesendet wird."""
-        if channel is None:
-            await self.config.guild(ctx.guild).activity_report_channel.set(None)
-            await ctx.send("✅ Report-Channel zurückgesetzt.")
-            return
-        await self.config.guild(ctx.guild).activity_report_channel.set(channel.id)
-        await ctx.send(f"✅ Report-Channel: {channel.mention}.")
-
-    @activity_report_set.command(name="interval")
-    async def ar_interval(self, ctx: commands.Context, hours: int):
-        """Setzt das Sende-Intervall in Stunden (24=täglich, 168=wöchentlich)."""
-        if hours < 1 or hours > 2160:
-            await ctx.send("❌ 1-2160 Stunden.")
-            return
-        await self.config.guild(ctx.guild).activity_report_interval_hours.set(hours)
-        await ctx.send(f"✅ Intervall: **{hours}h**.")
-
-    @activity_report_set.command(name="day")
-    async def ar_day(self, ctx: commands.Context, day: str):
-        """Setzt den Wochentag (Mo, Di, Mi, Do, Fr, Sa, So)."""
-        days_map = {"mo": 0, "di": 1, "mi": 2, "do": 3, "fr": 4, "sa": 5, "so": 6,
-                     "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-        if day.lower() not in days_map:
-            await ctx.send("❌ Mo/Di/Mi/Do/Fr/Sa/So")
-            return
-        await self.config.guild(ctx.guild).activity_report_day_of_week.set(days_map[day.lower()])
-        await ctx.send(f"✅ Tag: **{day.title()}**.")
-
-    @activity_report_set.command(name="hour")
-    async def ar_hour(self, ctx: commands.Context, hour: int):
-        """Setzt die Stunde (0-23, MEZ/MESZ)."""
-        if hour < 0 or hour > 23:
-            await ctx.send("❌ 0-23.")
-            return
-        await self.config.guild(ctx.guild).activity_report_hour.set(hour)
-        await ctx.send(f"✅ Stunde: **{hour}:00**.")
-
-    @activity_report_set.command(name="show")
-    async def ar_show(self, ctx: commands.Context):
-        """Zeigt die aktuelle Konfiguration."""
-        enabled = await self.config.guild(ctx.guild).activity_report_enabled()
-        ch_id = await self.config.guild(ctx.guild).activity_report_channel()
-        interval = await self.config.guild(ctx.guild).activity_report_interval_hours()
-        embed = discord.Embed(title="📊 Activity-Report Konfig", color=discord.Color.blurple(), timestamp=_now())
-        embed.add_field(name="Status", value="✅ An" if enabled else "❌ Aus", inline=True)
-        embed.add_field(name="Channel", value=f"<#{ch_id}>" if ch_id else "❌ Nicht gesetzt", inline=True)
-        embed.add_field(name="Intervall", value=f"{interval}h", inline=True)
-        await ctx.send(embed=embed)
-
-    @commands.command(name="activityreport", aliases=["ar", "report"])
-    @commands.guild_only()
-    async def activity_report_cmd(self, ctx: commands.Context):
-        """Erstellt einen Activity-Report manuell."""
-        ch_id = await self.config.guild(ctx.guild).activity_report_channel()
-        if not ch_id:
-            await ctx.send("❌ Kein Report-Channel gesetzt. Verwende `[p]activityreportset channel #channel`.")
-            return
-        channel = ctx.guild.get_channel(ch_id)
-        if not channel:
-            await ctx.send("❌ Channel nicht gefunden.")
-            return
-        activity = await self.config.guild(ctx.guild).team_activity() or {}
-        tickets = await self.config.guild(ctx.guild).tickets() or {}
-        apps = await self.config.guild(ctx.guild).team_applications() or {}
-        warns = await self.config.guild(ctx.guild).warn_strikes() or {}
-        def _score(d):
-            return (d.get("tickets_closed", 0) * 5 + d.get("warns_issued", 0) * 2 + d.get("tasks_completed", 0) * 3 + min(d.get("messages_sent", 0), 1000) / 100)
-        sorted_act = sorted(activity.items(), key=lambda x: _score(x[1]), reverse=True)
-        embed = discord.Embed(
-            title=f"📊 Activity-Report — {ctx.guild.name}",
-            description=f"Generiert: {_fmt_berlin_full(_now())} (MEZ/MESZ)",
-            color=discord.Color.gold(),
-            timestamp=_now(),
-        )
-        if ctx.guild.icon:
-            embed.set_thumbnail(url=ctx.guild.icon.url)
-        embed.add_field(name="🎫 Tickets", value=str(len(tickets)), inline=True)
-        embed.add_field(name="📋 Bewerbungen", value=str(len(apps)), inline=True)
-        embed.add_field(name="⚠️ Verwarnte User", value=str(len(warns)), inline=True)
-        if sorted_act:
-            lb = ""
-            medals = ["🥇", "🥈", "🥉"]
-            for i, (uid, data) in enumerate(sorted_act[:10]):
-                m = ctx.guild.get_member(int(uid))
-                name = m.display_name if m else data.get("username", f"User {uid}")
-                rank = medals[i] if i < 3 else f"#{i+1}"
-                lb += f"{rank} **{name}** — {_score(data):.1f}\n"
-            embed.add_field(name="🏆 Leaderboard", value=lb[:1024], inline=False)
-        await channel.send(embed=embed)
-        await self.config.guild(ctx.guild).activity_report_last_sent.set(_now_ts())
-        await ctx.send("✅ Activity-Report gesendet.", delete_after=10)
-
 
 async def setup(bot: Red):
     """Lädt den Cog"""
