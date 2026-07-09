@@ -100,6 +100,16 @@ import hashlib
 import logging
 import re
 
+# AAA3A Dashboard Integration (optional — funktioniert auch ohne Dashboard-Cog)
+try:
+    from .dashboard_integration import DashboardIntegration
+    _DASHBOARD_AVAILABLE = True
+except ImportError:
+    _DASHBOARD_AVAILABLE = False
+    # Fallback: leere Mixin-Klasse, damit Vererbung nicht scheitert
+    class DashboardIntegration:
+        pass
+
 _ = Translator("SupportCog", __file__)
 log = logging.getLogger("red.supportcog")
 
@@ -171,7 +181,7 @@ def _fmt_h_m(seconds: int) -> str:
     return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
 
-class SupportCog(commands.Cog):
+class SupportCog(DashboardIntegration, commands.Cog):
     """Cog für Support-Warteraum Benachrichtigungen mit Button-Duty-System"""
 
     def __init__(self, bot: Red):
@@ -301,7 +311,6 @@ class SupportCog(commands.Cog):
                 "member_roles": True,
                 "member_nickname": True,
                 "member_timeout": True,
-                "member_prune": True,
                 "message_delete": True,
                 "message_edit": True,
                 "channel_create": True,
@@ -312,19 +321,10 @@ class SupportCog(commands.Cog):
                 "voice_join": True,
                 "voice_leave": True,
                 "voice_move": True,
-                "voice_mute": True,
-                "voice_deafen": True,
-                "voice_stream": True,
-                "voice_video": True,
                 "guild_update": True,
                 "thread_create": True,
                 "thread_delete": True,
                 "thread_update": True,
-                "emoji_update": True,
-                "invite_create": True,
-                "invite_delete": True,
-                "mod_action": True,
-                "antilink_block": True,
             },
             "modlog_ignored_channels": [],    # Channel-IDs die nicht geloggt werden (z.B. Bot-Commands)
             # PUNISHMENT HISTORY (für userinfo Command)
@@ -383,16 +383,6 @@ class SupportCog(commands.Cog):
             "watchlist_log_channel": None,  # Optional: Channel für Watchlist-Notifications
             "team_activity": {},  # {user_id: {tickets_closed, warns_issued, tasks_completed, messages_sent, last_active_ts}}
             "team_stats_channel": None,  # Optional: Channel für auto-updating Team-Stats
-            # ============================================
-            # ACTIVITY-REPORT SYSTEM
-            # ============================================
-            "activity_report_enabled": False,
-            "activity_report_channel": None,  # Channel in den der Report gesendet wird
-            "activity_report_interval_hours": 168,  # 168 = wöchentlich
-            "activity_report_last_sent": 0,  # Timestamp des letzten Reports
-            "activity_report_role_mention": None,  # Rolle die gepingt wird (optional)
-            "activity_report_day_of_week": 1,  # 0=Mo, 1=Di, ... 6=So (für wöchentliche Reports)
-            "activity_report_hour": 9,  # Stunde (0-23) zu der der Report gesendet wird
             # ============================================
             # MOD-DM TEMPLATES (anpassbare DM-Nachrichten für Mod-Aktionen)
             # Platzhalter: {user}, {moderator}, {reason}, {server}, {duration}, {case_id}
@@ -567,9 +557,6 @@ class SupportCog(commands.Cog):
         # Background loop: team appointment reminders (15 Min vor Termin)
         if not hasattr(self, "_team_reminder_task") or self._team_reminder_task is None or self._team_reminder_task.done():
             self._team_reminder_task = asyncio.create_task(self._team_reminder_loop())
-        # Background loop: activity report (stündlich prüfen)
-        if not hasattr(self, "_activity_report_task") or self._activity_report_task is None or self._activity_report_task.done():
-            self._activity_report_task = asyncio.create_task(self._activity_report_loop())
         # Team-Management persistente Views registrieren
         try:
             self.bot.add_view(TeamMeetingView(self, "0"))  # Dummy für Registrierung
@@ -597,6 +584,50 @@ class SupportCog(commands.Cog):
             pass
         # EmbedBuilderStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
         # TeamApplicationStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
+        # AAA3A Dashboard: Falls das Dashboard-Cog schon geladen ist, manuell registrieren
+        # (falls on_dashboard_cog_add Event verpasst wurde)
+        if _DASHBOARD_AVAILABLE:
+            asyncio.create_task(self._try_dashboard_register())
+
+    async def _try_dashboard_register(self):
+        """Versucht sich beim Dashboard-Cog zu registrieren falls es schon geladen ist."""
+        await asyncio.sleep(3)  # kurz warten bis alles initialisiert ist
+        try:
+            # Prüfen ob Dashboard-Cog schon geladen ist
+            dashboard_cog = self.bot.get_cog("Dashboard")
+            if dashboard_cog is None:
+                # Versuch mit alternativen Namen
+                for cog_name in ["Dashboard", "DashboardRPC", "dashboard"]:
+                    dashboard_cog = self.bot.get_cog(cog_name)
+                    if dashboard_cog is not None:
+                        break
+            if dashboard_cog is None:
+                import logging
+                logging.getLogger("red.supportcog.dashboard").info(
+                    "Dashboard-Cog nicht gefunden. Wird auf on_dashboard_cog_add Event gewartet."
+                )
+                return
+            # Prüfen ob wir schon registriert sind
+            if hasattr(dashboard_cog, "rpc") and hasattr(dashboard_cog.rpc, "third_parties_handler"):
+                # Schauen ob wir schon in der Liste sind
+                handler = dashboard_cog.rpc.third_parties_handler
+                if hasattr(handler, "cogs") and self in getattr(handler, "cogs", []):
+                    import logging
+                    logging.getLogger("red.supportcog.dashboard").info("SupportCog schon beim Dashboard registriert.")
+                    return
+                # Manuell registrieren
+                import logging
+                page_count = sum(1 for name in dir(self) if hasattr(getattr(self, name, None), '__dashboard_decorator_params__'))
+                logging.getLogger("red.supportcog.dashboard").info(
+                    "Manuelle Registration beim Dashboard (Cog schon geladen). %d Pages gefunden.", page_count
+                )
+                handler.add_third_party(self)
+                logging.getLogger("red.supportcog.dashboard").info("✅ SupportCog manuell beim Dashboard registriert!")
+        except Exception as e:
+            import logging
+            logging.getLogger("red.supportcog.dashboard").exception(
+                "❌ Manuelle Dashboard-Registration fehlgeschlagen: %s", e
+            )
 
     async def _ticket_register_persistent_views(self):
         """Registriert persistente Multi-Panel Views nach Guild-Ready."""
@@ -1451,49 +1482,17 @@ class SupportCog(commands.Cog):
             return
 
         # Modlog: Voice Events
-        try:
-            if before.channel is None and after.channel is not None:
-                log_embed = discord.Embed(title="🎤 Voice beigetreten", description=f"**{member.mention}**\n📍 {after.channel.mention}", color=discord.Color.green(), timestamp=_now())
-                log_embed.set_thumbnail(url=member.display_avatar.url)
-                await self._modlog_send(guild, "voice_join", log_embed)
-            elif before.channel is not None and after.channel is None:
-                log_embed = discord.Embed(title="🔇 Voice verlassen", description=f"**{member.mention}**\n📍 {before.channel.mention}", color=discord.Color.red(), timestamp=_now())
-                log_embed.set_thumbnail(url=member.display_avatar.url)
-                await self._modlog_send(guild, "voice_leave", log_embed)
-            elif before.channel is not None and after.channel is not None and before.channel != after.channel:
-                log_embed = discord.Embed(title="🔄 Voice gewechselt", description=f"**{member.mention}**", color=discord.Color.blue(), timestamp=_now())
-                log_embed.add_field(name="Von", value=before.channel.mention, inline=True)
-                log_embed.add_field(name="Nach", value=after.channel.mention, inline=True)
-                log_embed.set_thumbnail(url=member.display_avatar.url)
-                await self._modlog_send(guild, "voice_move", log_embed)
-            # Voice Mute/Deafen/Stream/Video Änderungen (nur wenn im selben Channel)
-            elif before.channel == after.channel and after.channel is not None:
-                # Server Mute
-                if before.mute != after.mute:
-                    title = "🔇 Server-Mute verhängt" if after.mute else "🔊 Server-Mute aufgehoben"
-                    log_embed = discord.Embed(title=title, description=f"**{member.mention}**\n📍 {after.channel.mention}", color=discord.Color.orange() if after.mute else discord.Color.green(), timestamp=_now())
-                    log_embed.set_thumbnail(url=member.display_avatar.url)
-                    await self._modlog_send(guild, "voice_mute", log_embed)
-                # Server Deafen
-                if before.deaf != after.deaf:
-                    title = "🔇 Server-Deafen verhängt" if after.deaf else "🔊 Server-Deafen aufgehoben"
-                    log_embed = discord.Embed(title=title, description=f"**{member.mention}**\n📍 {after.channel.mention}", color=discord.Color.dark_red() if after.deaf else discord.Color.green(), timestamp=_now())
-                    log_embed.set_thumbnail(url=member.display_avatar.url)
-                    await self._modlog_send(guild, "voice_deafen", log_embed)
-                # Stream
-                if before.self_stream != after.self_stream:
-                    title = "📺 Stream gestartet" if after.self_stream else "⏹️ Stream gestoppt"
-                    log_embed = discord.Embed(title=title, description=f"**{member.mention}**\n📍 {after.channel.mention}", color=discord.Color.purple() if after.self_stream else discord.Color.dark_grey(), timestamp=_now())
-                    log_embed.set_thumbnail(url=member.display_avatar.url)
-                    await self._modlog_send(guild, "voice_stream", log_embed)
-                # Video
-                if before.self_video != after.self_video:
-                    title = "🎥 Video aktiviert" if after.self_video else "📷 Video deaktiviert"
-                    log_embed = discord.Embed(title=title, description=f"**{member.mention}**\n📍 {after.channel.mention}", color=discord.Color.purple() if after.self_video else discord.Color.dark_grey(), timestamp=_now())
-                    log_embed.set_thumbnail(url=member.display_avatar.url)
-                    await self._modlog_send(guild, "voice_video", log_embed)
-        except Exception:
-            log.exception("Fehler in Modlog Voice Events")
+        if before.channel is None and after.channel is not None:
+            log_embed = discord.Embed(title="🎤 Voice beigetreten", description=f"**{member.mention}**\n📍 {after.channel.mention}", color=discord.Color.green(), timestamp=_now())
+            await self._modlog_send(guild, "voice_join", log_embed)
+        elif before.channel is not None and after.channel is None:
+            log_embed = discord.Embed(title="🔇 Voice verlassen", description=f"**{member.mention}**\n📍 {before.channel.mention}", color=discord.Color.red(), timestamp=_now())
+            await self._modlog_send(guild, "voice_leave", log_embed)
+        elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+            log_embed = discord.Embed(title="🔄 Voice gewechselt", description=f"**{member.mention}**", color=discord.Color.blue(), timestamp=_now())
+            log_embed.add_field(name="Von", value=before.channel.mention, inline=True)
+            log_embed.add_field(name="Nach", value=after.channel.mention, inline=True)
+            await self._modlog_send(guild, "voice_move", log_embed)
 
         # Watchlist Voice-Notify (nur bei JOIN in einen Voice-Channel)
         if before.channel is None and after.channel is not None:
@@ -6421,20 +6420,10 @@ class SupportCog(commands.Cog):
             "voice_join": "modlog_voice_channel",
             "voice_leave": "modlog_voice_channel",
             "voice_move": "modlog_voice_channel",
-            "voice_mute": "modlog_voice_channel",
-            "voice_deafen": "modlog_voice_channel",
-            "voice_stream": "modlog_voice_channel",
-            "voice_video": "modlog_voice_channel",
             "guild_update": "modlog_channel",
             "thread_create": "modlog_channel_events_channel",
             "thread_delete": "modlog_channel_events_channel",
             "thread_update": "modlog_channel_events_channel",
-            "emoji_update": "modlog_role_channel",
-            "invite_create": "modlog_channel",
-            "invite_delete": "modlog_channel",
-            "mod_action": "modlog_punishment_channel",
-            "antilink_block": "modlog_message_channel",
-            "member_prune": "modlog_punishment_channel",
         }
         config_key = category_map.get(event_type, "modlog_channel")
         ch_id = await self.config.guild(guild).get_attr(config_key)()
@@ -6553,12 +6542,9 @@ class SupportCog(commands.Cog):
     async def modlog_set_event(self, ctx: commands.Context, event_name: str = None):
         """Schaltet einen bestimmten Event-Typ an/aus.
         Verfügbare Events: member_join, member_leave, member_ban, member_unban, member_kick,
-        member_roles, member_nickname, member_timeout, member_prune,
-        message_delete, message_edit, channel_create, channel_delete,
-        role_create, role_delete, role_update,
-        voice_join, voice_leave, voice_move, voice_mute, voice_deafen, voice_stream, voice_video,
-        guild_update, thread_create, thread_delete, thread_update,
-        emoji_update, invite_create, invite_delete, mod_action, antilink_block
+        member_roles, member_nickname, member_timeout, message_delete, message_edit,
+        channel_create, channel_delete, role_create, role_delete, role_update,
+        voice_join, voice_leave, voice_move, guild_update
         Ohne Angabe werden alle Events angezeigt."""
         events = await self.config.guild(ctx.guild).modlog_events() or {}
         if event_name is None:
@@ -6572,21 +6558,12 @@ class SupportCog(commands.Cog):
                 "member_ban": "Mitglied gebannt", "member_unban": "Mitglied entbannt",
                 "member_kick": "Mitglied gekickt", "member_roles": "Rollen-Änderung",
                 "member_nickname": "Nickname-Änderung", "member_timeout": "Timeout-Änderung",
-                "member_prune": "Massen-Kick (Prune)",
                 "message_delete": "Nachricht gelöscht", "message_edit": "Nachricht bearbeitet",
                 "channel_create": "Channel erstellt", "channel_delete": "Channel gelöscht",
                 "role_create": "Rolle erstellt", "role_delete": "Rolle gelöscht",
                 "role_update": "Rolle bearbeitet", "voice_join": "Voice beigetreten",
                 "voice_leave": "Voice verlassen", "voice_move": "Voice gewechselt",
-                "voice_mute": "Voice Mute/Unmute", "voice_deafen": "Voice Deafen/Undeafen",
-                "voice_stream": "Stream gestartet/gestoppt", "voice_video": "Video an/aus",
                 "guild_update": "Server aktualisiert",
-                "thread_create": "Thread erstellt", "thread_delete": "Thread gelöscht",
-                "thread_update": "Thread bearbeitet",
-                "emoji_update": "Emoji geändert", "invite_create": "Invite erstellt",
-                "invite_delete": "Invite gelöscht",
-                "mod_action": "Mod-Aktion (Ban/Kick/Warn/etc.)",
-                "antilink_block": "Anti-Link Blockierung",
             }
             lines = []
             for evt, enabled in sorted(events.items()):
@@ -6594,12 +6571,12 @@ class SupportCog(commands.Cog):
                 status = "✅" if enabled else "❌"
                 lines.append(f"{status} `{evt}` — {de_name}")
             embed.description = "\n".join(lines)
-            embed.set_footer(text="Umschalten mit: [p]extmodlog event <name>")
+            embed.set_footer(text="Umschalten mit: [p]modlogset event <name>")
             await ctx.send(embed=embed)
             return
         event_name = event_name.lower().strip()
         if event_name not in events:
-            await ctx.send(f"❌ Unbekanntes Event: `{event_name}`. Verfügbare Events siehe `[p]extmodlog event`.")
+            await ctx.send(f"❌ Unbekanntes Event: `{event_name}`. Verfügbare Events siehe `[p]modlogset event`.")
             return
         events[event_name] = not events[event_name]
         await self.config.guild(ctx.guild).modlog_events.set(events)
@@ -6722,36 +6699,17 @@ class SupportCog(commands.Cog):
             return
         if await self._modlog_is_ignored(message.guild, message.channel.id):
             return
-        try:
-            # Audit Log: Wer hat die Nachricht gelöscht?
-            deleter = None
-            try:
-                async for entry in message.guild.audit_logs(limit=5, action=discord.AuditLogAction.message_delete):
-                    if entry.target and entry.target.id == message.author.id and (entry.extra and hasattr(entry.extra, 'id') and entry.extra.id == message.channel.id):
-                        if _now_ts() - int(entry.created_at.timestamp()) < 30:
-                            deleter = entry.user
-                            break
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-            embed = discord.Embed(
-                title="🗑️ Nachricht gelöscht",
-                description=f"**Channel:** {message.channel.mention}\n**Autor:** {message.author.mention} (`{message.author.id}`)",
-                color=discord.Color.red(),
-                timestamp=_now(),
-            )
-            if deleter:
-                embed.add_field(name="Gelöscht von", value=f"{deleter.mention} (`{deleter.id}`)", inline=True)
-            embed.add_field(name="Inhalt", value=(message.content or "(kein Text)")[:1024], inline=False)
-            if message.attachments:
-                attach_text = ""
-                for att in message.attachments[:5]:
-                    attach_text += f"[{att.filename}]({att.proxy_url})\n"
-                embed.add_field(name=f"Anhänge ({len(message.attachments)})", value=attach_text[:1024] or str(len(message.attachments)), inline=False)
-            embed.set_thumbnail(url=message.author.display_avatar.url)
-            embed.set_footer(text=f"Message-ID: {message.id}")
-            await self._modlog_send(message.guild, "message_delete", embed)
-        except Exception:
-            log.exception("Fehler in on_message_delete")
+        embed = discord.Embed(
+            title="🗑️ Nachricht gelöscht",
+            description=f"**Channel:** {message.channel.mention}\n**Autor:** {message.author.mention} (`{message.author.id}`)",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Inhalt", value=(message.content or "(kein Text)")[:1024], inline=False)
+        if message.attachments:
+            embed.add_field(name="Anhänge", value=str(len(message.attachments)), inline=True)
+        embed.set_footer(text=f"Message-ID: {message.id}")
+        await self._modlog_send(message.guild, "message_delete", embed)
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
@@ -6760,29 +6718,16 @@ class SupportCog(commands.Cog):
             return
         if await self._modlog_is_ignored(before.guild, before.channel.id):
             return
-        try:
-            embed = discord.Embed(
-                title="✏️ Nachricht bearbeitet",
-                description=f"**Channel:** {before.channel.mention}\n**Autor:** {before.author.mention}\n[👉 Zur Nachricht]({after.jump_url})",
-                color=discord.Color.orange(),
-                timestamp=_now(),
-            )
-            # Diff-artige Anzeige: Wenn kurz, zeige Vorher/Nachher; wenn lang, kürze
-            before_content = (before.content or "(leer)")
-            after_content = (after.content or "(leer)")
-            # Wenn beide kurz genug, zeige beide
-            if len(before_content) + len(after_content) < 1800:
-                embed.add_field(name="Vorher", value=before_content[:1024], inline=False)
-                embed.add_field(name="Nachher", value=after_content[:1024], inline=False)
-            else:
-                # Nur Diff zeigen
-                embed.add_field(name="Vorher (gekürzt)", value=before_content[:500] + ("..." if len(before_content) > 500 else ""), inline=False)
-                embed.add_field(name="Nachher (gekürzt)", value=after_content[:500] + ("..." if len(after_content) > 500 else ""), inline=False)
-            embed.set_thumbnail(url=before.author.display_avatar.url)
-            embed.set_footer(text=f"Message-ID: {before.id}")
-            await self._modlog_send(before.guild, "message_edit", embed)
-        except Exception:
-            log.exception("Fehler in on_message_edit")
+        embed = discord.Embed(
+            title="✏️ Nachricht bearbeitet",
+            description=f"**Channel:** {before.channel.mention}\n**Autor:** {before.author.mention}",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Vorher", value=(before.content or "(leer)")[:1024], inline=False)
+        embed.add_field(name="Nachher", value=(after.content or "(leer)")[:1024], inline=False)
+        embed.set_footer(text=f"[Klick]({after.jump_url})")
+        await self._modlog_send(before.guild, "message_edit", embed)
 
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
@@ -6894,92 +6839,6 @@ class SupportCog(commands.Cog):
             timestamp=_now(),
         )
         await self._modlog_send(after.guild, "thread_update", embed)
-
-    @commands.Cog.listener()
-    async def on_guild_emojis_update(self, guild: discord.Guild, before: tuple, after: tuple):
-        """Log: Emoji erstellt/gelöscht/aktualisiert."""
-        try:
-            before_ids = {e.id for e in before}
-            after_ids = {e.id for e in after}
-            added = [e for e in after if e.id not in before_ids]
-            removed = [e for e in before if e.id not in after_ids]
-            # Bei Änderung einer bestehenden Emoji (Name etc.) ist added/removed leer
-            if not added and not removed:
-                # Etwas wurde geändert (z.B. Name) — versuche Diff
-                for b in before:
-                    for a in after:
-                        if b.id == a.id and b.name != a.name:
-                            embed = discord.Embed(
-                                title="😀 Emoji umbenannt",
-                                description=f"**{b}** (`{b.name}`) → **{a}** (`{a.name}`)",
-                                color=discord.Color.orange(),
-                                timestamp=_now(),
-                            )
-                            await self._modlog_send(guild, "emoji_update", embed)
-                            return
-                return
-            for e in added:
-                embed = discord.Embed(
-                    title="😀 Emoji hinzugefügt",
-                    description=f"**{e}** — `{e.name}`\nAnimiert: {'Ja' if e.animated else 'Nein'}\nID: `{e.id}`",
-                    color=discord.Color.green(),
-                    timestamp=_now(),
-                )
-                try:
-                    embed.set_thumbnail(url=e.url)
-                except Exception:
-                    pass
-                await self._modlog_send(guild, "emoji_update", embed)
-            for e in removed:
-                embed = discord.Embed(
-                    title="🗑️ Emoji gelöscht",
-                    description=f"**:{e.name}:** (`{e.name}`)\nAnimiert: {'Ja' if e.animated else 'Nein'}\nID: `{e.id}`",
-                    color=discord.Color.red(),
-                    timestamp=_now(),
-                )
-                await self._modlog_send(guild, "emoji_update", embed)
-        except Exception:
-            log.exception("Fehler in on_guild_emojis_update")
-
-    @commands.Cog.listener()
-    async def on_invite_create(self, invite: discord.Invite):
-        """Log: Invite erstellt."""
-        try:
-            embed = discord.Embed(
-                title="📨 Invite erstellt",
-                description=f"**Channel:** {invite.channel.mention if hasattr(invite.channel, 'mention') else invite.channel}\n**Code:** `{invite.code}`",
-                color=discord.Color.green(),
-                timestamp=_now(),
-            )
-            if invite.inviter:
-                embed.add_field(name="Erstellt von", value=f"{invite.inviter.mention} (`{invite.inviter.id}`)", inline=True)
-            if invite.max_uses:
-                embed.add_field(name="Max. Verwendungen", value=str(invite.max_uses), inline=True)
-            if invite.max_age:
-                embed.add_field(name="Gültig für", value=f"{invite.max_age}s", inline=True)
-            if invite.temporary:
-                embed.add_field(name="Temporär", value="Ja", inline=True)
-            await self._modlog_send(invite.guild, "invite_create", embed)
-        except Exception:
-            log.exception("Fehler in on_invite_create")
-
-    @commands.Cog.listener()
-    async def on_invite_delete(self, invite: discord.Invite):
-        """Log: Invite gelöscht."""
-        try:
-            embed = discord.Embed(
-                title="🗑️ Invite gelöscht",
-                description=f"**Channel:** {invite.channel.mention if hasattr(invite.channel, 'mention') else invite.channel}\n**Code:** `{invite.code}`",
-                color=discord.Color.red(),
-                timestamp=_now(),
-            )
-            if invite.inviter:
-                embed.add_field(name="Erstellt von", value=f"{invite.inviter.mention} (`{invite.inviter.id}`)", inline=True)
-            if invite.uses:
-                embed.add_field(name="Verwendungen", value=str(invite.uses), inline=True)
-            await self._modlog_send(invite.guild, "invite_delete", embed)
-        except Exception:
-            log.exception("Fehler in on_invite_delete")
 
     # --- PUNISHMENT TRACKING ---
 
@@ -9416,129 +9275,6 @@ class SupportCog(commands.Cog):
         await self._modlog_send(ctx.guild, "mod_action", log_embed)
         dm_status = " (DM zugestellt)" if dm_sent else " (keine DM möglich)"
         await ctx.send(f"✅ Timeout von {member.mention} (`{member.id}`) aufgehoben{dm_status}.", delete_after=6)
-
-    # ============================================
-    # CLEAR MESSAGES (Massen-Löschung)
-    # ============================================
-
-    @commands.command(name="clearmsgs", aliases=["clearmessages", "clearmsg", "massclear", "mc"])
-    @commands.guild_only()
-    @checks.mod_or_permissions(manage_messages=True)
-    @commands.bot_has_permissions(manage_messages=True)
-    async def clear_messages(self, ctx: commands.Context, count: int):
-        """Löscht eine Anzahl von Nachrichten im aktuellen Channel (2-100).
-        Beispiel: `[p]clearmsgs 50`
-        """
-        if count < 2:
-            await ctx.send("❌ Mindestens 2 Nachrichten müssen gelöscht werden (Discord-Limit).", delete_after=10)
-            return
-        if count > 100:
-            await ctx.send("❌ Maximal 100 Nachrichten pro Löschvorgang (Discord-Limit).", delete_after=10)
-            return
-        try:
-            # Nachrichten löschen (inkl. des Command-Aufrufs, daher +1)
-            deleted = await ctx.channel.purge(limit=count + 1, bulk=True)
-            # Modlog-Eintrag
-            log_embed = discord.Embed(
-                title="🧹 Nachrichten gelöscht (Bulk)",
-                description=f"**Channel:** {ctx.channel.mention}\n**Moderator:** {ctx.author.mention}\n**Anzahl:** {len(deleted) - 1} Nachrichten",
-                color=discord.Color.dark_red(),
-                timestamp=_now(),
-            )
-            log_embed.set_thumbnail(url=ctx.author.display_avatar.url)
-            await self._modlog_send(ctx.guild, "message_delete", log_embed)
-            # Team-Aktivität
-            await self._team_activity_update(ctx.guild, ctx.author.id, warns_issued=1)
-            # Bestätigung (verschwindet nach 6 Sekunden)
-            await ctx.send(f"🧹 **{len(deleted) - 1}** Nachrichten gelöscht von {ctx.author.mention}.", delete_after=6)
-        except discord.Forbidden:
-            await ctx.send("❌ Ich habe keine Berechtigung zum Löschen von Nachrichten.", delete_after=10)
-        except discord.HTTPException as e:
-            await ctx.send(f"❌ Löschen fehlgeschlagen: `{e}`", delete_after=10)
-
-    @commands.command(name="clearuser", aliases=["clearu", "purgeuser", "userpurge"])
-    @commands.guild_only()
-    @checks.mod_or_permissions(manage_messages=True)
-    @commands.bot_has_permissions(manage_messages=True)
-    async def clear_user_messages(self, ctx: commands.Context, member: discord.Member, count: int = 100):
-        """Löscht Nachrichten eines bestimmten Users im aktuellen Channel.
-        Beispiel: `[p]clearuser @User 50`
-        """
-        if count < 1:
-            await ctx.send("❌ Anzahl muss ≥ 1 sein.", delete_after=10)
-            return
-        if count > 500:
-            await ctx.send("❌ Maximal 500 Nachrichten (Discord-Limit für User-Filter).", delete_after=10)
-            return
-        try:
-            # Nachrichten des Users finden und löschen
-            def check(m):
-                return m.author.id == member.id
-            deleted = await ctx.channel.purge(limit=count + 5, check=check, bulk=True)
-            log_embed = discord.Embed(
-                title="🧹 User-Nachrichten gelöscht",
-                description=f"**Channel:** {ctx.channel.mention}\n**User:** {member.mention}\n**Moderator:** {ctx.author.mention}\n**Anzahl:** {len(deleted)} Nachrichten",
-                color=discord.Color.dark_red(),
-                timestamp=_now(),
-            )
-            log_embed.set_thumbnail(url=member.display_avatar.url)
-            await self._modlog_send(ctx.guild, "message_delete", log_embed)
-            await self._team_activity_update(ctx.guild, ctx.author.id, warns_issued=1)
-            await ctx.send(f"🧹 **{len(deleted)}** Nachrichten von {member.mention} gelöscht.", delete_after=6)
-        except discord.Forbidden:
-            await ctx.send("❌ Ich habe keine Berechtigung zum Löschen von Nachrichten.", delete_after=10)
-        except discord.HTTPException as e:
-            await ctx.send(f"❌ Löschen fehlgeschlagen: `{e}`", delete_after=10)
-
-    # ============================================
-    # FAKE MOD-AKTIONEN (DM nur, keine echte Aktion)
-    # ============================================
-
-    @commands.command(name="ben", aliases=["fakeban", "fban"])
-    @commands.guild_only()
-    @checks.mod_or_permissions(ban_members=True)
-    async def fake_ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
-        """Sendet eine FAKE BAN-DM an einen User. Der User wird NICHT wirklich gebannt.
-        Beispiel: `[p]ben @User Spamming`
-        """
-        if member.bot:
-            await ctx.send("❌ Bots können keine DMs erhalten.", delete_after=10)
-            return
-        if member == ctx.author:
-            await ctx.send("❌ Du kannst dich nicht selbst \"bannen\".", delete_after=10)
-            return
-        if len(reason) > 500:
-            reason = reason[:500]
-        # DM senden (wie bei echtem Ban)
-        dm_sent = await self._send_mod_dm(member, ctx.guild, "ban", moderator=ctx.author, reason=reason)
-        # Bestätigung an Moderator (nur für diesen sichtbar)
-        if dm_sent:
-            await ctx.send(f"🎭 **Fake-Ban ausgeführt.** {member.mention} hat eine BAN-DM erhalten, wurde aber NICHT wirklich gebannt.\n**Grund:** {reason}", delete_after=15)
-        else:
-            await ctx.send(f"⚠️ Fake-Ban: DM konnte nicht zugestellt werden (DMs deaktiviert?). {member.mention} wurde NICHT gebannt.", delete_after=15)
-
-    @commands.command(name="kik", aliases=["fakekick", "fkick"])
-    @commands.guild_only()
-    @checks.mod_or_permissions(kick_members=True)
-    async def fake_kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
-        """Sendet eine FAKE KICK-DM an einen User. Der User wird NICHT wirklich gekickt.
-        Beispiel: `[p]kik @User Spamming`
-        """
-        if member.bot:
-            await ctx.send("❌ Bots können keine DMs erhalten.", delete_after=10)
-            return
-        if member == ctx.author:
-            await ctx.send("❌ Du kannst dich nicht selbst \"kicken\".", delete_after=10)
-            return
-        if len(reason) > 500:
-            reason = reason[:500]
-        # DM senden (wie bei echtem Kick)
-        dm_sent = await self._send_mod_dm(member, ctx.guild, "kick", moderator=ctx.author, reason=reason)
-        # Bestätigung an Moderator
-        if dm_sent:
-            await ctx.send(f"🎭 **Fake-Kick ausgeführt.** {member.mention} hat eine KICK-DM erhalten, wurde aber NICHT wirklich gekickt.\n**Grund:** {reason}", delete_after=15)
-        else:
-            await ctx.send(f"⚠️ Fake-Kick: DM konnte nicht zugestellt werden (DMs deaktiviert?). {member.mention} wurde NICHT gekickt.", delete_after=15)
 
     # ============================================
     # ANONYME MOD-AKTIONEN (Moderator wird in DM nicht genannt)
@@ -19595,490 +19331,6 @@ class ModlogWizardView(discord.ui.View):
             await interaction.response.send_message(embed=embed, ephemeral=True)
         except Exception:
             log.exception("Fehler im Modlog Show Config Button")
-
-    # ============================================
-    # COG-FEATURES: Übersicht über alle Funktionen
-    # ============================================
-
-    @commands.command(name="cogfeatures", aliases=["coginfo", "features", "coglist", "funktionen"])
-    @commands.guild_only()
-    async def cog_features_cmd(self, ctx: commands.Context):
-        """Zeigt eine Übersicht aller Funktionen des SupportCogs."""
-        embed = discord.Embed(
-            title="🛠️ SupportCog — Alle Funktionen",
-            description=(
-                "Eine Übersicht aller verfügbaren Command-Gruppen und Features.\n"
-                "Verwende `[p]help <command>` für Details zu einem Command."
-            ),
-            color=discord.Color.blurple(),
-            timestamp=_now(),
-        )
-        # Features in Kategorien
-        embed.add_field(
-            name="🎫 Support & Whitelist System",
-            value=(
-                "• `[p]supportset` — Support-Konfiguration\n"
-                "• `[p]whitelistset` — Whitelist-Konfiguration\n"
-                "• `[p]supportdutygrant` — Duty manuell vergeben\n"
-                "• `[p]whitelistdutygrant` — Whitelist-Duty vergeben\n"
-                "• `[p]whitelistinfo` — Whitelist-Info\n"
-                "• `[p]wlstats` — Whitelist-Statistiken\n"
-                "• `[p]wlcheck` — Whitelist prüfen\n"
-                "• `[p]wlnote` / `[p]wldelnote` — Notizen\n"
-                "• `[p]wltemp` — Temporäre Whitelist\n"
-                "• `[p]wllog` — Whitelist-Logs\n"
-                "• `[p]whitelistuser` / `[p]removewhitelist` — User verwalten\n"
-                "• `[p]checkwhitelist` / `[p]whitelistlogfull`\n"
-                "• `[p]supportstats` — Support-Statistiken\n"
-                "• `[p]feedbackpanel` — Feedback-Panel"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🎫 Ticket System",
-            value=(
-                "• `[p]ticketset` — Ticket-Konfiguration\n"
-                "• `[p]ticketworkload` — Auslastung\n"
-                "• `[p]ticketpriority` — Prioritäten\n"
-                "• `[p]ticketnote` — Notizen\n"
-                "• `[p]ticketassign` — Zuweisungen\n"
-                "• `[p]tickethistory` — Verlauf\n"
-                "• `[p]sclaim` / `[p]sunclaim` — Ticket übernehmen/abgeben\n"
-                "• Multi-Kategorie, HTML-Transcript, Surveys, Auto-Close, etc."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🔨 Moderation",
-            value=(
-                "• `[p]sban` / `[p]sunban` — Bannen/Entbannen\n"
-                "• `[p]skick` — Kicken\n"
-                "• `[p]stimeout` / `[p]suntimeout` — Timeout\n"
-                "• `[p]swarn` / `[p]swarns` / `[p]sunwarn` / `[p]sclearwarns`\n"
-                "• `[p]swarnset` — Warn-Konfiguration\n"
-                "• `[p]ab` / `[p]ak` / `[p]at` / `[p]aw` — Anonyme Varianten\n"
-                "• `[p]moddm` — Mod-DM Templates anpassen\n"
-                "• `[p]memberinfo` — User-Info mit Bestrafungs-Historie"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🔗 Anti-Link & Anti-Nuke",
-            value=(
-                "• `[p]antilink` — Anti-Link System\n"
-                "• Anti-Nuke: Automatische Erkennung von Mass-Bans/Kicks\n"
-                "• Konfigurierbare Whitelists (Channels, Rollen, User)"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🔄 BanSync (Cross-Server)",
-            value=(
-                "• `[p]syncset` — Sync-Konfiguration\n"
-                "• Synchronisiert Bans, Unbans, Timeouts, Kicks, Rollen\n"
-                "• Master-Slave oder bidirektionale Sync-Beziehungen"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="📜 Extended Modlog",
-            value=(
-                "• `[p]extmodlog` — Modlog-Konfiguration\n"
-                "• `[p]extmodlog setup` — Setup-Wizard\n"
-                "• 22+ Event-Typen (Member, Voice, Message, Role, Channel, Thread)\n"
-                "• Separate Channels pro Kategorie\n"
-                "• Ignorierbare Channels"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="👥 Team Management",
-            value=(
-                "• `[p]teampanel` — Team-Panel mit Buttons\n"
-                "• `[p]teammeeting` — Meetings\n"
-                "• `[p]teamapp` — Bewerbungen mit Voting, Notizen, Interview\n"
-                "• `[p]teamtermin` — Termine\n"
-                "• `[p]teamstats` — Team-Leaderboard\n"
-                "• `[p]teamactivity` — Eigene Statistiken\n"
-                "• `[p]aufgabe` — Aufgaben (To-Do)\n"
-                "• `[p]snippet` — Text-Snippets\n"
-                "• `[p]watchlist` — User beobachten\n"
-                "• `[p]teamactivityreset` — Aktivität zurücksetzen"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="📝 Embed Builder & Utility",
-            value=(
-                "• `[p]embedbuilder` — Custom Embeds erstellen\n"
-                "• `[p]serverstats` — Server-Statistiken 🆕\n"
-                "• `[p]activityreport` — Auto Activity-Report 🆕\n"
-                "• `[p]activityreportset` — Report-Konfiguration 🆕\n"
-                "• `[p]cogfeatures` — Diese Übersicht"
-            ),
-            inline=False,
-        )
-        embed.set_footer(text=f"SupportCog • {ctx.guild.name} • Verwende [p]help <command> für Hilfe")
-        await ctx.send(embed=embed)
-
-    # ============================================
-    # SERVER-STATISTIKEN
-    # ============================================
-
-    @commands.command(name="serverstats", aliases=["sstats", "sinfo"])
-    @commands.guild_only()
-    async def server_stats_cmd(self, ctx: commands.Context):
-        """Zeigt detaillierte Server-Statistiken."""
-        guild = ctx.guild
-        # Basis-Stats
-        member_count = guild.member_count or len(guild.members)
-        bot_count = sum(1 for m in guild.members if m.bot)
-        human_count = member_count - bot_count
-        online_count = sum(1 for m in guild.members if m.status == discord.Status.online)
-        idle_count = sum(1 for m in guild.members if m.status == discord.Status.idle)
-        dnd_count = sum(1 for m in guild.members if m.status == discord.Status.dnd)
-        offline_count = sum(1 for m in guild.members if m.status == discord.Status.offline)
-        # Channel-Stats
-        text_ch = len(guild.text_channels)
-        voice_ch = len(guild.voice_channels)
-        category_ch = len(guild.categories)
-        forum_ch = len(getattr(guild, "forums", []) or [])
-        stage_ch = len(getattr(guild, "stage_channels", []) or [])
-        # Role & Emoji Stats
-        role_count = len(guild.roles)
-        managed_roles = sum(1 for r in guild.roles if r.managed)
-        emoji_count = len(guild.emojis)
-        animated_emojis = sum(1 for e in guild.emojis if e.animated)
-        sticker_count = len(getattr(guild, "stickers", []) or [])
-        # Server-Alter
-        from datetime import datetime, timezone
-        now_utc = datetime.now(timezone.utc)
-        created_days = (now_utc - guild.created_at).days
-        # Owner
-        owner = guild.get_member(guild.owner_id) or await self.bot.fetch_user(guild.owner_id)
-        owner_str = owner.mention if hasattr(owner, 'mention') else str(owner)
-        # SupportCog-Stats
-        tickets = await self.config.guild(guild).tickets() or {}
-        apps = await self.config.guild(guild).team_applications() or {}
-        strikes = await self.config.guild(guild).warn_strikes() or {}
-        tasks = await self.config.guild(guild).team_tasks() or {}
-        snippets = await self.config.guild(guild).snippets() or {}
-        watchlist = await self.config.guild(guild).watchlist() or {}
-        activity = await self.config.guild(guild).team_activity() or {}
-        # Boost-Info
-        boost_tier = guild.premium_tier
-        boost_count = guild.premium_subscription_count
-        # Status-Emojis für die Verteilung
-        embed = discord.Embed(
-            title=f"📊 Server-Statistiken — {guild.name}",
-            color=discord.Color.blurple(),
-            timestamp=_now(),
-        )
-        if guild.icon:
-            embed.set_thumbnail(url=guild.icon.url)
-        # Haupt-Stats
-        embed.add_field(name="👥 Mitglieder gesamt", value=str(member_count), inline=True)
-        embed.add_field(name="👤 Menschen", value=str(human_count), inline=True)
-        embed.add_field(name="🤖 Bots", value=str(bot_count), inline=True)
-        # Online-Status
-        status_text = (
-            f"🟢 Online: {online_count}\n"
-            f"🟡 Idle: {idle_count}\n"
-            f"🔴 DND: {dnd_count}\n"
-            f"⚫ Offline: {offline_count}"
-        )
-        embed.add_field(name="📡 Status-Verteilung", value=status_text, inline=True)
-        # Channels
-        channel_text = (
-            f"📝 Text: {text_ch}\n"
-            f"🎤 Voice: {voice_ch}\n"
-            f"📂 Kategorien: {category_ch}\n"
-            f"💬 Forum: {forum_ch}\n"
-            f"🎙️ Stage: {stage_ch}"
-        )
-        embed.add_field(name="📺 Channels", value=channel_text, inline=True)
-        # Rollen & Emojis
-        embed.add_field(name="🎭 Rollen", value=f"Gesamt: {role_count}\nBot-gemanagt: {managed_roles}", inline=True)
-        embed.add_field(name="😀 Emojis", value=f"Gesamt: {emoji_count}\nAnimiert: {animated_emojis}", inline=True)
-        embed.add_field(name="🏷️ Sticker", value=str(sticker_count), inline=True)
-        # Boost & Server-Alter
-        boost_text = f"Level {boost_tier}\n{boost_count} Boosts"
-        embed.add_field(name="💎 Server-Boost", value=boost_text, inline=True)
-        embed.add_field(name="📅 Server-Alter", value=f"{created_days} Tage\n(seit {_fmt_berlin_date(guild.created_at)})", inline=True)
-        embed.add_field(name="👑 Besitzer", value=owner_str, inline=True)
-        # IDs
-        embed.add_field(name="🆔 Server-ID", value=f"`{guild.id}`", inline=True)
-        verification_str = {0: "Keine", 1: "Niedrig", 2: "Mittel", 3: "Hoch", 4: "Höchste"}.get(guild.verification_level, str(guild.verification_level))
-        embed.add_field(name="🔒 Verifizierung", value=verification_str, inline=True)
-        # SupportCog-Stats
-        scog_text = (
-            f"🎫 Tickets: {len(tickets)}\n"
-            f"📋 Bewerbungen: {len(apps)}\n"
-            f"⚠️ Verwarnte User: {len(strikes)}\n"
-            f"📝 Aufgaben: {len(tasks)}"
-        )
-        embed.add_field(name="🎫 SupportCog", value=scog_text, inline=True)
-        scog_text2 = (
-            f"💬 Snippets: {len(snippets)}\n"
-            f"👁️ Watchlist: {len(watchlist)}\n"
-            f"👥 Aktive Team-Mitglieder: {len(activity)}"
-        )
-        embed.add_field(name="🎫 SupportCog (II)", value=scog_text2, inline=True)
-        # Features
-        features = []
-        if guild.premium_progress_bar_enabled:
-            features.append("Progress Bar")
-        if guild.vanity_url_code:
-            features.append(f"Vanity: discord.gg/{guild.vanity_url_code}")
-        if guild.community:
-            features.append("Community")
-        if guild.rules_channel:
-            features.append("Rules Channel")
-        if features:
-            embed.add_field(name="✨ Features", value="\n".join(features), inline=False)
-        embed.set_footer(text=f"Erstellt am {_fmt_berlin_full(guild.created_at)} (MEZ/MESZ)")
-        await ctx.send(embed=embed)
-
-    # ============================================
-    # ACTIVITY-REPORT SYSTEM
-    # ============================================
-
-    @commands.group(name="activityreportset", aliases=["arset", "reportset"])
-    @checks.admin_or_permissions(manage_guild=True)
-    @commands.guild_only()
-    async def activity_report_set(self, ctx: commands.Context):
-        """Konfiguriert den automatischen Activity-Report."""
-        if ctx.invoked_subcommand is None:
-            await ctx.send_help()
-
-    @activity_report_set.command(name="toggle")
-    async def ar_toggle(self, ctx: commands.Context):
-        """Aktiviert/deaktiviert den automatischen Activity-Report."""
-        current = await self.config.guild(ctx.guild).activity_report_enabled()
-        await self.config.guild(ctx.guild).activity_report_enabled.set(not current)
-        status = "aktiviert" if not current else "deaktiviert"
-        await ctx.send(f"✅ Automatischer Activity-Report **{status}**.")
-
-    @activity_report_set.command(name="channel", aliases=["ziel", "zielchannel"])
-    async def ar_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
-        """Setzt den Channel in den der Report gesendet wird."""
-        if channel is None:
-            await self.config.guild(ctx.guild).activity_report_channel.set(None)
-            await ctx.send("✅ Report-Channel zurückgesetzt.")
-            return
-        await self.config.guild(ctx.guild).activity_report_channel.set(channel.id)
-        await ctx.send(f"✅ Report-Channel gesetzt auf {channel.mention}.")
-
-    @activity_report_set.command(name="interval", aliases=["intervall"])
-    async def ar_interval(self, ctx: commands.Context, hours: int):
-        """Setzt das Sende-Intervall in Stunden (24=täglich, 168=wöchentlich, 720=monatlich)."""
-        if hours < 1:
-            await ctx.send("❌ Intervall muss ≥ 1 Stunde sein.")
-            return
-        if hours > 2160:  # 90 Tage
-            await ctx.send("❌ Intervall darf max. 2160 Stunden (90 Tage) betragen.")
-            return
-        await self.config.guild(ctx.guild).activity_report_interval_hours.set(hours)
-        if hours == 24:
-            desc = "täglich"
-        elif hours == 168:
-            desc = "wöchentlich"
-        elif hours == 720:
-            desc = "monatlich"
-        else:
-            desc = f"alle {hours} Stunden"
-        await ctx.send(f"✅ Intervall gesetzt auf **{desc}**.")
-
-    @activity_report_set.command(name="role", aliases=["rolle", "ping"])
-    async def ar_role(self, ctx: commands.Context, role: discord.Role = None):
-        """Setzt eine Rolle die beim Report gepingt wird (optional)."""
-        if role is None:
-            await self.config.guild(ctx.guild).activity_report_role_mention.set(None)
-            await ctx.send("✅ Report-Rollen-Ping zurückgesetzt.")
-            return
-        await self.config.guild(ctx.guild).activity_report_role_mention.set(role.id)
-        await ctx.send(f"✅ Rolle {role.mention} wird beim Report gepingt.")
-
-    @activity_report_set.command(name="day", aliases=["tag"])
-    async def ar_day(self, ctx: commands.Context, day: str):
-        """Setzt den Wochentag für wöchentliche Reports. Optionen: Mo, Di, Mi, Do, Fr, Sa, So."""
-        days_map = {"mo": 0, "di": 1, "mi": 2, "do": 3, "fr": 4, "sa": 5, "so": 6,
-                     "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
-                     "montag": 0, "dienstag": 1, "mittwoch": 2, "donnerstag": 3, "freitag": 4, "samstag": 5, "sonntag": 6}
-        day_lower = day.lower()
-        if day_lower not in days_map:
-            await ctx.send("❌ Ungültiger Tag. Optionen: Mo, Di, Mi, Do, Fr, Sa, So")
-            return
-        await self.config.guild(ctx.guild).activity_report_day_of_week.set(days_map[day_lower])
-        await ctx.send(f"✅ Report-Tag gesetzt auf **{day_lower.title()}**.")
-
-    @activity_report_set.command(name="hour", aliases=["stunde", "uhrzeit"])
-    async def ar_hour(self, ctx: commands.Context, hour: int):
-        """Setzt die Stunde (0-23) zu der der Report gesendet wird (Europe/Berlin Zeitzone)."""
-        if hour < 0 or hour > 23:
-            await ctx.send("❌ Stunde muss zwischen 0 und 23 liegen.")
-            return
-        await self.config.guild(ctx.guild).activity_report_hour.set(hour)
-        await ctx.send(f"✅ Report-Stunde gesetzt auf **{hour}:00 Uhr** (MEZ/MESZ).")
-
-    @activity_report_set.command(name="show", aliases=["zeigen"])
-    async def ar_show(self, ctx: commands.Context):
-        """Zeigt die aktuelle Activity-Report Konfiguration."""
-        enabled = await self.config.guild(ctx.guild).activity_report_enabled()
-        ch_id = await self.config.guild(ctx.guild).activity_report_channel()
-        interval = await self.config.guild(ctx.guild).activity_report_interval_hours()
-        last_sent = await self.config.guild(ctx.guild).activity_report_last_sent()
-        role_id = await self.config.guild(ctx.guild).activity_report_role_mention()
-        day = await self.config.guild(ctx.guild).activity_report_day_of_week()
-        hour = await self.config.guild(ctx.guild).activity_report_hour()
-        embed = discord.Embed(title="📊 Activity-Report Konfiguration", color=discord.Color.blurple(), timestamp=_now())
-        embed.add_field(name="Status", value="✅ Aktiviert" if enabled else "❌ Deaktiviert", inline=True)
-        if ch_id:
-            ch = ctx.guild.get_channel(ch_id)
-            embed.add_field(name="Channel", value=ch.mention if ch else f"Channel {ch_id} (gelöscht)", inline=True)
-        else:
-            embed.add_field(name="Channel", value="❌ Nicht gesetzt", inline=True)
-        if interval == 24:
-            interval_str = "täglich"
-        elif interval == 168:
-            interval_str = "wöchentlich"
-        elif interval == 720:
-            interval_str = "monatlich"
-        else:
-            interval_str = f"alle {interval} Stunden"
-        embed.add_field(name="Intervall", value=interval_str, inline=True)
-        days_list = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-        embed.add_field(name="Wochentag", value=days_list[day], inline=True)
-        embed.add_field(name="Uhrzeit", value=f"{hour}:00 Uhr (MEZ/MESZ)", inline=True)
-        if role_id:
-            role = ctx.guild.get_role(role_id)
-            embed.add_field(name="Ping-Rolle", value=role.mention if role else f"Rolle {role_id} (gelöscht)", inline=True)
-        if last_sent:
-            embed.add_field(name="Zuletzt gesendet", value=_fmt_berlin_full(_from_ts(last_sent)) + " (MEZ/MESZ)", inline=True)
-        await ctx.send(embed=embed)
-
-    @commands.command(name="activityreport", aliases=["ar", "report", "teamreport"])
-    @commands.guild_only()
-    async def activity_report_cmd(self, ctx: commands.Context):
-        """Erstellt einen Activity-Report für diesen Server (manuell)."""
-        await self._send_activity_report(ctx.guild, manual=True)
-        await ctx.send("✅ Activity-Report generiert.", delete_after=10)
-
-    async def _send_activity_report(self, guild: discord.Guild, manual: bool = False):
-        """Sendet den Activity-Report in den konfigurierten Channel."""
-        ch_id = await self.config.guild(guild).activity_report_channel()
-        if not ch_id:
-            if manual:
-                return
-            return  # Auto-Report ohne Channel: stillschweigend überspringen
-        channel = guild.get_channel(ch_id)
-        if not channel:
-            return
-        activity = await self.config.guild(guild).team_activity() or {}
-        # Stats sammeln
-        tickets = await self.config.guild(guild).tickets() or {}
-        apps = await self.config.guild(guild).team_applications() or {}
-        tasks = await self.config.guild(guild).team_tasks() or {}
-        warns = await self.config.guild(guild).warn_strikes() or {}
-        snippets = await self.config.guild(guild).snippets() or {}
-        watchlist = await self.config.guild(guild).watchlist() or {}
-        # Zeitraum berechnen
-        interval_h = await self.config.guild(guild).activity_report_interval_hours() or 168
-        period_start_ts = _now_ts() - interval_h * 3600
-        # Leaderboard
-        def _score(d):
-            return (
-                d.get("tickets_closed", 0) * 5
-                + d.get("warns_issued", 0) * 2
-                + d.get("tasks_completed", 0) * 3
-                + min(d.get("messages_sent", 0), 1000) / 100
-            )
-        sorted_act = sorted(activity.items(), key=lambda x: _score(x[1]), reverse=True)
-        # Embed bauen
-        embed = discord.Embed(
-            title=f"📊 Activity-Report — {guild.name}",
-            description=f"Zeitraum: letzte {interval_h} Stunden (seit {_fmt_berlin_full(_from_ts(period_start_ts))} MEZ/MESZ)\n"
-                       f"Generiert: {_fmt_berlin_full(_now())} (MEZ/MESZ)",
-            color=discord.Color.gold(),
-            timestamp=_now(),
-        )
-        if guild.icon:
-            embed.set_thumbnail(url=guild.icon.url)
-        # Allgemeine Stats
-        embed.add_field(name="🎫 Tickets gesamt", value=str(len(tickets)), inline=True)
-        embed.add_field(name="📋 Bewerbungen", value=str(len(apps)), inline=True)
-        embed.add_field(name="📝 Aufgaben", value=str(len(tasks)), inline=True)
-        embed.add_field(name="⚠️ Verwarnte User", value=str(len(warns)), inline=True)
-        embed.add_field(name="💬 Snippets", value=str(len(snippets)), inline=True)
-        embed.add_field(name="👁️ Watchlist", value=str(len(watchlist)), inline=True)
-        # Team-Leaderboard
-        if sorted_act:
-            leaderboard_text = ""
-            medals = ["🥇", "🥈", "🥉"]
-            for i, (uid_str, data) in enumerate(sorted_act[:10]):
-                uid = int(uid_str)
-                member = guild.get_member(uid)
-                name = member.display_name if member else data.get("username", f"User {uid}")
-                rank = medals[i] if i < 3 else f"#{i+1}"
-                score = _score(data)
-                leaderboard_text += f"{rank} **{name}** — Score: {score:.1f}\n"
-                leaderboard_text += f"   🎫 {data.get('tickets_closed', 0)} | ⚠️ {data.get('warns_issued', 0)} | 📝 {data.get('tasks_completed', 0)} | 💬 {data.get('messages_sent', 0)}\n"
-            embed.add_field(name="🏆 Team-Leaderboard (Top 10)", value=leaderboard_text[:1024], inline=False)
-        else:
-            embed.add_field(name="🏆 Team-Leaderboard", value="Noch keine Team-Aktivität erfasst.", inline=False)
-        # Aktive vs inaktive Teammitglieder
-        active_count = sum(1 for d in activity.values() if d.get("last_active_ts", 0) > period_start_ts)
-        embed.add_field(name="👥 Aktive Teammitglieder", value=f"{active_count} / {len(activity)} im Zeitraum", inline=False)
-        embed.set_footer(text="Activity-Report • SupportCog")
-        # Ping-Rolle
-        content = None
-        role_id = await self.config.guild(guild).activity_report_role_mention()
-        if role_id:
-            role = guild.get_role(role_id)
-            if role:
-                content = role.mention
-        try:
-            await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
-        except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"Konnte Activity-Report nicht senden: {e}")
-        # Last-sent aktualisieren
-        await self.config.guild(guild).activity_report_last_sent.set(_now_ts())
-
-    async def _activity_report_loop(self):
-        """Background-Loop: prüft stündlich ob ein Activity-Report gesendet werden muss."""
-        await self.bot.wait_until_red_ready()
-        while True:
-            try:
-                for guild in self.bot.guilds:
-                    try:
-                        enabled = await self.config.guild(guild).activity_report_enabled()
-                        if not enabled:
-                            continue
-                        ch_id = await self.config.guild(guild).activity_report_channel()
-                        if not ch_id:
-                            continue
-                        last_sent = await self.config.guild(guild).activity_report_last_sent() or 0
-                        interval_h = await self.config.guild(guild).activity_report_interval_hours() or 168
-                        # Prüfen ob Intervall abgelaufen
-                        if _now_ts() - last_sent < interval_h * 3600:
-                            continue
-                        # Bei wöchentlichem Report: auch Wochentag und Stunde prüfen
-                        if interval_h >= 144:  # >= 6 Tage
-                            day_target = await self.config.guild(guild).activity_report_day_of_week() or 1
-                            hour_target = await self.config.guild(guild).activity_report_hour() or 9
-                            now_berlin = _now()
-                            if now_berlin.weekday() != day_target:
-                                continue
-                            if now_berlin.hour < hour_target:
-                                continue
-                        # Report senden
-                        await self._send_activity_report(guild, manual=False)
-                    except Exception:
-                        log.exception(f"Fehler beim Activity-Report für Guild {guild.id}")
-            except Exception:
-                log.exception("Fehler in Activity-Report Loop")
-            # Stündlich prüfen
-            await asyncio.sleep(3600)
 
 
 async def setup(bot: Red):
