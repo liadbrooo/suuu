@@ -383,6 +383,13 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "watchlist_log_channel": None,  # Optional: Channel für Watchlist-Notifications
             "team_activity": {},  # {user_id: {tickets_closed, warns_issued, tasks_completed, messages_sent, last_active_ts}}
             "team_stats_channel": None,  # Optional: Channel für auto-updating Team-Stats
+            # TEAM-ABMELDUNG SYSTEM
+            "team_abmeldungen": {},  # {abmeldung_id: {user_id, name, von, bis, erreichbarkeit, notiz, ts, status}}
+            "team_abmeldungen_counter": 0,
+            "team_abmeldungen_channel": None,  # Channel wo Abmeldungen landen
+            "team_abmeldungen_panel_channel": None,  # Channel für das Panel
+            "team_abmeldungen_panel_message": None,  # Message-ID des Panels
+            "team_abmeldungen_role_mention": None,  # Rolle die gepingt wird (optional)
             # ============================================
             # MOD-DM TEMPLATES (anpassbare DM-Nachrichten für Mod-Aktionen)
             # Platzhalter: {user}, {moderator}, {reason}, {server}, {duration}, {case_id}
@@ -580,6 +587,11 @@ class SupportCog(DashboardIntegration, commands.Cog):
             pass
         try:
             self.bot.add_view(TeamApplicationPanelView(self))
+        except Exception:
+            pass
+        # Team-Abmeldung persistente View registrieren
+        try:
+            self.bot.add_view(TeamAbmeldungPanelView(self))
         except Exception:
             pass
         # EmbedBuilderStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
@@ -15557,6 +15569,250 @@ class SupportCog(DashboardIntegration, commands.Cog):
         await self.config.guild(ctx.guild).antinuke_tracker.set({})
         await ctx.send("✅ Anti-Nuke Tracker zurückgesetzt.")
 
+    # ============================================
+    # TEAM-ABMELDUNG SYSTEM
+    # ============================================
+
+    @commands.group(name="abmeldungset", aliases=["abmeldungconfig", "abmset"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def abmeldung_set(self, ctx: commands.Context):
+        """Konfiguriert das Team-Abmeldungssystem."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @abmeldung_set.command(name="channel", aliases=["ziel"])
+    async def abmeldung_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel in dem Abmeldungen landen."""
+        if channel is None:
+            await self.config.guild(ctx.guild).team_abmeldungen_channel.set(None)
+            await ctx.send("✅ Abmeldungs-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_abmeldungen_channel.set(channel.id)
+        await ctx.send(f"✅ Abmeldungs-Channel gesetzt auf {channel.mention}.")
+
+    @abmeldung_set.command(name="panel", aliases=["create", "erstellen"])
+    async def abmeldung_panel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Erstellt das Abmeldungs-Panel mit Button."""
+        if channel is None:
+            channel = ctx.channel
+        # Altes Panel löschen falls vorhanden
+        old_ch_id = await self.config.guild(ctx.guild).team_abmeldungen_panel_channel()
+        old_msg_id = await self.config.guild(ctx.guild).team_abmeldungen_panel_message()
+        if old_ch_id and old_msg_id:
+            old_ch = ctx.guild.get_channel(old_ch_id)
+            if old_ch:
+                try:
+                    old_msg = await old_ch.fetch_message(old_msg_id)
+                    await old_msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        # Panel-Embed bauen
+        embed = discord.Embed(
+            title="📋 Team-Abmeldung",
+            description=(
+                "Möchtest du dich vom Team-Dienst abmelden?\n\n"
+                "Klicke auf den Button unten um eine Abmeldung einzureichen.\n"
+                "Du wirst nach folgenden Informationen gefragt:\n"
+                "• **Name** (dein Name im Team)\n"
+                "• **Abmeldung von – bis** (Zeitraum)\n"
+                "• **Erreichbarkeit über** (wie erreichbar, z.B. Discord, Tel)\n"
+                "• **Extra-Notiz** (zusätzliche Infos)"
+            ),
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Team-Abmeldung • SupportCog")
+        view = TeamAbmeldungPanelView(self)
+        try:
+            msg = await channel.send(embed=embed, view=view)
+            await self.config.guild(ctx.guild).team_abmeldungen_panel_channel.set(channel.id)
+            await self.config.guild(ctx.guild).team_abmeldungen_panel_message.set(msg.id)
+            await ctx.send(f"✅ Abmeldungs-Panel erstellt in {channel.mention}.")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Panel nicht erstellen: `{e}`")
+
+    @abmeldung_set.command(name="role", aliases=["ping"])
+    async def abmeldung_role(self, ctx: commands.Context, role: discord.Role = None):
+        """Setzt eine Rolle die bei neuen Abmeldungen gepingt wird (optional)."""
+        if role is None:
+            await self.config.guild(ctx.guild).team_abmeldungen_role_mention.set(None)
+            await ctx.send("✅ Abmeldungs-Rollen-Ping zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_abmeldungen_role_mention.set(role.id)
+        await ctx.send(f"✅ Rolle {role.mention} wird bei neuen Abmeldungen gepingt.")
+
+    @abmeldung_set.command(name="show", aliases=["zeigen"])
+    async def abmeldung_show_config(self, ctx: commands.Context):
+        """Zeigt die aktuelle Abmeldungs-Konfiguration."""
+        ch_id = await self.config.guild(ctx.guild).team_abmeldungen_channel()
+        panel_ch_id = await self.config.guild(ctx.guild).team_abmeldungen_panel_channel()
+        panel_msg_id = await self.config.guild(ctx.guild).team_abmeldungen_panel_message()
+        role_id = await self.config.guild(ctx.guild).team_abmeldungen_role_mention()
+        embed = discord.Embed(title="📋 Team-Abmeldung Konfiguration", color=discord.Color.orange(), timestamp=_now())
+        embed.add_field(name="Abmeldungs-Channel", value=f"<#{ch_id}>" if ch_id else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Panel-Channel", value=f"<#{panel_ch_id}>" if panel_ch_id else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Panel-Message-ID", value=str(panel_msg_id) if panel_msg_id else "—", inline=True)
+        embed.add_field(name="Ping-Rolle", value=f"<@&{role_id}>" if role_id else "Keine", inline=True)
+        await ctx.send(embed=embed)
+
+    @commands.command(name="abmeldung", aliases=["abmelden"])
+    @commands.guild_only()
+    async def abmeldung_cmd(self, ctx: commands.Context):
+        """Reicht eine Team-Abmeldung ein (öffnet das Modal direkt)."""
+        if not isinstance(ctx.author, discord.Member):
+            await ctx.send("❌ Nur Server-Mitglieder können Abmeldungen einreichen.", delete_after=10)
+            return
+        modal = TeamAbmeldungModal(self)
+        # Modal kann nur als Response auf eine Interaction gesendet werden.
+        # Bei Text-Command: Wir senden erst eine Nachricht mit Button, der dann das Modal öffnet.
+        embed = discord.Embed(
+            title="📋 Team-Abmeldung",
+            description="Klicke auf den Button um das Abmeldungs-Formular zu öffnen.",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        view = TeamAbmeldungDirectView(self)
+        await ctx.send(embed=embed, view=view, delete_after=120)
+
+    @commands.command(name="abmeldungen", aliases=["abmlist", "abmeldunglist"])
+    @commands.guild_only()
+    async def abmeldung_list(self, ctx: commands.Context):
+        """Zeigt alle Team-Abmeldungen."""
+        # Permission: Staff oder Admin
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_staff or ctx.author.guild_permissions.manage_guild):
+            await ctx.send("❌ Nur Teammitglieder können Abmeldungen einsehen.")
+            return
+        abmeldungen = await self.config.guild(ctx.guild).team_abmeldungen() or {}
+        if not abmeldungen:
+            await ctx.send("ℹ️ Keine Abmeldungen vorhanden.")
+            return
+        embed = discord.Embed(
+            title=f"📋 Team-Abmeldungen ({len(abmeldungen)})",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        # Sortieren nach Datum (neueste zuerst)
+        sorted_abm = sorted(abmeldungen.items(), key=lambda x: x[1].get("ts", 0), reverse=True)
+        for abm_id, abm in sorted_abm[:15]:
+            von = abm.get("von", "?")
+            bis = abm.get("bis", "?")
+            name = abm.get("name", "?")
+            user = abm.get("user_id", "?")
+            embed.add_field(
+                name=f"#{abm_id} — {name}",
+                value=f"📅 {von} – {bis}\n👤 <@{user}>\n📞 {abm.get('erreichbarkeit', '?')[:100]}",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(abmeldungen)} Abmeldung(en) gesamt • [p]abmeldunginfo <id> für Details")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="abmeldunginfo", aliases=["abmdetails"])
+    @commands.guild_only()
+    async def abmeldung_info(self, ctx: commands.Context, abm_id: str):
+        """Zeigt Details zu einer Abmeldung."""
+        is_staff = await self._is_ticket_staff(ctx.author, ctx.channel, ctx.guild)
+        if not (is_staff or ctx.author.guild_permissions.manage_guild):
+            await ctx.send("❌ Nur Teammitglieder.")
+            return
+        abmeldungen = await self.config.guild(ctx.guild).team_abmeldungen() or {}
+        if abm_id not in abmeldungen:
+            await ctx.send(f"❌ Abmeldung #{abm_id} nicht gefunden.")
+            return
+        abm = abmeldungen[abm_id]
+        embed = discord.Embed(
+            title=f"📋 Abmeldung #{abm_id}",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Name", value=abm.get("name", "?"), inline=True)
+        embed.add_field(name="User", value=f"<@{abm.get('user_id', '?')}>", inline=True)
+        embed.add_field(name="Eingereicht am", value=_fmt_berlin_full(_from_ts(abm.get("ts", 0))) + " (MEZ/MESZ)", inline=True)
+        embed.add_field(name="📅 Abmeldung von", value=abm.get("von", "?"), inline=True)
+        embed.add_field(name="📅 Abmeldung bis", value=abm.get("bis", "?"), inline=True)
+        embed.add_field(name="📞 Erreichbarkeit", value=abm.get("erreichbarkeit", "?")[:500], inline=False)
+        if abm.get("notiz"):
+            embed.add_field(name="📝 Extra-Notiz", value=abm.get("notiz", "")[:1024], inline=False)
+        await ctx.send(embed=embed)
+
+    @commands.command(name="abmeldungremove", aliases=["abmdel", "abmeldungdelete"])
+    @checks.mod_or_permissions(manage_messages=True)
+    @commands.guild_only()
+    async def abmeldung_remove(self, ctx: commands.Context, abm_id: str):
+        """Löscht eine Abmeldung."""
+        abmeldungen = await self.config.guild(ctx.guild).team_abmeldungen() or {}
+        if abm_id not in abmeldungen:
+            await ctx.send(f"❌ Abmeldung #{abm_id} nicht gefunden.")
+            return
+        del abmeldungen[abm_id]
+        await self.config.guild(ctx.guild).team_abmeldungen.set(abmeldungen)
+        await ctx.send(f"✅ Abmeldung #{abm_id} gelöscht.")
+
+    async def _create_abmeldung(self, interaction: discord.Interaction, name: str, von: str, bis: str, erreichbarkeit: str, notiz: str):
+        """Erstellt eine Abmeldung und sendet sie in den Abmeldungs-Channel."""
+        guild = interaction.guild
+        member = interaction.user
+        # Counter erhöhen
+        counter = await self.config.guild(guild).team_abmeldungen_counter() or 0
+        counter += 1
+        abm_id = str(counter)
+        # Abmeldung speichern
+        abmeldungen = await self.config.guild(guild).team_abmeldungen() or {}
+        abmeldungen[abm_id] = {
+            "user_id": member.id,
+            "name": name,
+            "von": von,
+            "bis": bis,
+            "erreichbarkeit": erreichbarkeit,
+            "notiz": notiz,
+            "ts": _now_ts(),
+        }
+        await self.config.guild(guild).team_abmeldungen.set(abmeldungen)
+        await self.config.guild(guild).team_abmeldungen_counter.set(counter)
+        # In den Abmeldungs-Channel senden
+        ch_id = await self.config.guild(guild).team_abmeldungen_channel()
+        if ch_id:
+            channel = guild.get_channel(ch_id)
+            if channel:
+                embed = discord.Embed(
+                    title=f"📋 Neue Team-Abmeldung #{abm_id}",
+                    description=f"**Name:** {name}\n**Eingereicht von:** {member.mention}",
+                    color=discord.Color.orange(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="📅 Abmeldung von", value=von[:500], inline=True)
+                embed.add_field(name="📅 Abmeldung bis", value=bis[:500], inline=True)
+                embed.add_field(name="📞 Erreichbarkeit über", value=erreichbarkeit[:500], inline=False)
+                if notiz:
+                    embed.add_field(name="📝 Extra-Notiz", value=notiz[:1024], inline=False)
+                embed.add_field(name="📅 Eingereicht am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+                embed.set_thumbnail(url=member.display_avatar.url)
+                embed.set_footer(text=f"Abmeldung-ID: {abm_id} • User-ID: {member.id}")
+                # Ping-Rolle
+                content = None
+                role_id = await self.config.guild(guild).team_abmeldungen_role_mention()
+                if role_id:
+                    role = guild.get_role(role_id)
+                    if role:
+                        content = role.mention
+                try:
+                    await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"Konnte Abmeldung nicht in Channel senden: {e}")
+        # Bestätigung an User
+        try:
+            confirm_embed = discord.Embed(
+                title="✅ Abmeldung eingereicht",
+                description=f"Deine Abmeldung #{abm_id} wurde erfolgreich eingereicht.\nDas Team wurde benachrichtigt.",
+                color=discord.Color.green(),
+                timestamp=_now(),
+            )
+            confirm_embed.add_field(name="📅 Zeitraum", value=f"{von} – {bis}", inline=False)
+            await member.send(embed=confirm_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
 
 class DutyButtonView(discord.ui.View):
     """Button-View für Duty An-/Abmeldung mit erweiterten Funktionen"""
@@ -19331,6 +19587,146 @@ class ModlogWizardView(discord.ui.View):
             await interaction.response.send_message(embed=embed, ephemeral=True)
         except Exception:
             log.exception("Fehler im Modlog Show Config Button")
+
+
+# ============================================
+# TEAM-ABMELDUNG VIEW & MODAL KLASSEN
+# ============================================
+
+class TeamAbmeldungPanelView(discord.ui.View):
+    """Persistente View für das Abmeldungs-Panel mit Button."""
+
+    def __init__(self, cog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="Abmeldung einreichen", style=discord.ButtonStyle.danger, emoji="📋", custom_id="team_abmeldung_panel")
+    async def open_abmeldung_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder können Abmeldungen einreichen.", ephemeral=True)
+                return
+            modal = TeamAbmeldungModal(self.cog)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            log.exception("Fehler beim Öffnen des Abmeldungs-Modals")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
+
+class TeamAbmeldungDirectView(discord.ui.View):
+    """View für den direkten [p]abmeldung Command (öffnet das Modal via Button)."""
+
+    def __init__(self, cog):
+        super().__init__(timeout=120)
+        self.cog = cog
+
+    @discord.ui.button(label="Abmeldung einreichen", style=discord.ButtonStyle.danger, emoji="📋")
+    async def open_abmeldung_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            modal = TeamAbmeldungModal(self.cog)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            log.exception("Fehler beim Öffnen des Abmeldungs-Modals (direct)")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
+
+class TeamAbmeldungModal(discord.ui.Modal):
+    """Modal für die Team-Abmeldung mit 4 Feldern."""
+
+    def __init__(self, cog):
+        super().__init__(title="📋 Team-Abmeldung", timeout=600)
+        self.cog = cog
+        # Feld 1: Name
+        self.name_input = discord.ui.TextInput(
+            label="Name (dein Name im Team)",
+            placeholder="z.B. Max / dein Team-Name",
+            required=True,
+            max_length=100,
+            custom_id="abm_name",
+        )
+        self.add_item(self.name_input)
+        # Feld 2: Abmeldung von
+        self.von_input = discord.ui.TextInput(
+            label="Abmeldung von (Datum/Uhrzeit)",
+            placeholder="z.B. 15.07.2026 18:00 oder sofort",
+            required=True,
+            max_length=200,
+            custom_id="abm_von",
+        )
+        self.add_item(self.von_input)
+        # Feld 3: Abmeldung bis
+        self.bis_input = discord.ui.TextInput(
+            label="Abmeldung bis (Datum/Uhrzeit)",
+            placeholder="z.B. 22.07.2026 18:00 oder unbestimmt",
+            required=True,
+            max_length=200,
+            custom_id="abm_bis",
+        )
+        self.add_item(self.bis_input)
+        # Feld 4: Erreichbarkeit
+        self.erreichbarkeit_input = discord.ui.TextInput(
+            label="Erreichbarkeit über (wie erreichbar)",
+            placeholder="z.B. Discord (maxmust#1234), Telefon, gar nicht",
+            required=True,
+            max_length=300,
+            custom_id="abm_erreichbarkeit",
+        )
+        self.add_item(self.erreichbarkeit_input)
+        # Feld 5: Extra-Notiz (optional)
+        self.notiz_input = discord.ui.TextInput(
+            label="Extra-Notiz (optional)",
+            placeholder="Zusätzliche Infos, Grund der Abmeldung, etc.",
+            required=False,
+            max_length=1000,
+            style=discord.TextStyle.paragraph,
+            custom_id="abm_notiz",
+        )
+        self.add_item(self.notiz_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.name_input.value.strip()
+        von = self.von_input.value.strip()
+        bis = self.bis_input.value.strip()
+        erreichbarkeit = self.erreichbarkeit_input.value.strip()
+        notiz = self.notiz_input.value.strip() if self.notiz_input.value else ""
+        if not name or not von or not bis or not erreichbarkeit:
+            await interaction.response.send_message("❌ Bitte fülle alle Pflichtfelder aus.", ephemeral=True)
+            return
+        try:
+            await self.cog._create_abmeldung(interaction, name, von, bis, erreichbarkeit, notiz)
+            await interaction.response.send_message("✅ Deine Abmeldung wurde eingereicht! Du erhältst eine Bestätigung per DM.", ephemeral=True)
+        except Exception as e:
+            log.exception("Fehler beim Erstellen der Abmeldung")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler beim Einreichen: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("Fehler im TeamAbmeldungModal", exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 async def setup(bot: Red):
