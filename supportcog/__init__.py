@@ -393,6 +393,8 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "team_abmeldungen_panel_message": None,  # Message-ID des Panels
             "team_abmeldungen_role_mention": None,  # Rolle die gepingt wird (optional)
             "team_role": None,  # Rolle die alle Teammitglieder haben (für teamstatus)
+            "team_status_panel_channel": None,  # Channel für das auto-aktualisierende Team-Status-Panel
+            "team_status_panel_message": None,  # Message-ID des Panels
             # ============================================
             # MOD-DM TEMPLATES (anpassbare DM-Nachrichten für Mod-Aktionen)
             # Platzhalter: {user}, {moderator}, {reason}, {server}, {duration}, {case_id}
@@ -567,6 +569,9 @@ class SupportCog(DashboardIntegration, commands.Cog):
         # Background loop: team appointment reminders (15 Min vor Termin)
         if not hasattr(self, "_team_reminder_task") or self._team_reminder_task is None or self._team_reminder_task.done():
             self._team_reminder_task = asyncio.create_task(self._team_reminder_loop())
+        # Background loop: Team-Status-Panel (alle 60 Sekunden aktualisieren)
+        if not hasattr(self, "_team_status_panel_task") or self._team_status_panel_task is None or self._team_status_panel_task.done():
+            self._team_status_panel_task = asyncio.create_task(self._team_status_panel_loop())
         # Team-Management persistente Views registrieren
         try:
             self.bot.add_view(TeamMeetingView(self, "0"))  # Dummy für Registrierung
@@ -16302,6 +16307,190 @@ class SupportCog(DashboardIntegration, commands.Cog):
             embed.add_field(name="ℹ️ Hinweis", value="Keine Teammitglieder gefunden. Setze eine Team-Rolle mit `[p]abmeldungset teamrole @role` oder stelle sicher dass Teammitglieder die nötigen Permissions haben.", inline=False)
         await ctx.send(embed=embed)
 
+    # ============================================
+    # TEAM-STATUS PANEL (auto-aktualisierend)
+    # ============================================
+
+    @commands.group(name="teamstatuspanel", aliases=["tspanel", "statuspanel"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def team_status_panel_set(self, ctx: commands.Context):
+        """Verwaltet das auto-aktualisierende Team-Status-Panel."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_status_panel_set.command(name="create", aliases=["erstellen", "senden", "send"])
+    async def team_status_panel_create(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Erstellt das Team-Status-Panel in einem Channel.
+        Es aktualisiert sich automatisch alle 60 Sekunden und bei jeder An/Abmeldung."""
+        if channel is None:
+            channel = ctx.channel
+        # Altes Panel löschen falls vorhanden
+        old_ch_id = await self.config.guild(ctx.guild).team_status_panel_channel()
+        old_msg_id = await self.config.guild(ctx.guild).team_status_panel_message()
+        if old_ch_id and old_msg_id:
+            old_ch = ctx.guild.get_channel(old_ch_id)
+            if old_ch:
+                try:
+                    old_msg = await old_ch.fetch_message(old_msg_id)
+                    await old_msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        # Embed bauen (vorab, bevor es gespeichert wird)
+        embed = await self._build_team_status_embed(ctx.guild)
+        try:
+            msg = await channel.send(embed=embed)
+            await self.config.guild(ctx.guild).team_status_panel_channel.set(channel.id)
+            await self.config.guild(ctx.guild).team_status_panel_message.set(msg.id)
+            await ctx.send(f"✅ Team-Status-Panel erstellt in {channel.mention}.\nEs aktualisiert sich automatisch alle 60 Sekunden und sofort bei An/Abmeldungen.")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Panel nicht erstellen: `{e}`")
+
+    @team_status_panel_set.command(name="remove", aliases=["entfernen", "delete", "loeschen"])
+    async def team_status_panel_remove(self, ctx: commands.Context):
+        """Entfernt das Team-Status-Panel."""
+        ch_id = await self.config.guild(ctx.guild).team_status_panel_channel()
+        msg_id = await self.config.guild(ctx.guild).team_status_panel_message()
+        if msg_id and ch_id:
+            ch = ctx.guild.get_channel(ch_id)
+            if ch:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        await self.config.guild(ctx.guild).team_status_panel_channel.set(None)
+        await self.config.guild(ctx.guild).team_status_panel_message.set(None)
+        await ctx.send("✅ Team-Status-Panel entfernt.")
+
+    @team_status_panel_set.command(name="update", aliases=["aktualisieren", "refresh"])
+    async def team_status_panel_update_cmd(self, ctx: commands.Context):
+        """Aktualisiert das Panel manuell (falls nötig)."""
+        updated = await self.update_team_status_panel(ctx.guild)
+        if updated:
+            await ctx.send("✅ Panel aktualisiert.")
+        else:
+            await ctx.send("❌ Kein Panel konfiguriert oder Konnte nicht aktualisieren.")
+
+    @team_status_panel_set.command(name="show", aliases=["zeigen"])
+    async def team_status_panel_show(self, ctx: commands.Context):
+        """Zeigt die Panel-Konfiguration."""
+        ch_id = await self.config.guild(ctx.guild).team_status_panel_channel()
+        msg_id = await self.config.guild(ctx.guild).team_status_panel_message()
+        embed = discord.Embed(title="📊 Team-Status-Panel Konfiguration", color=discord.Color.blurple(), timestamp=_now())
+        embed.add_field(name="Panel-Channel", value=f"<#{ch_id}>" if ch_id else "❌ Nicht gesetzt", inline=True)
+        embed.add_field(name="Panel-Message-ID", value=str(msg_id) if msg_id else "—", inline=True)
+        embed.add_field(name="Update-Intervall", value="Automatisch alle 60 Sekunden + bei An/Abmeldung", inline=False)
+        await ctx.send(embed=embed)
+
+    async def _build_team_status_embed(self, guild: discord.Guild) -> discord.Embed:
+        """Baut das Team-Status-Embed (für das Panel und den teamstatus Command)."""
+        abmeldungen = await self.config.guild(guild).team_abmeldungen() or {}
+        # Abgemeldete User
+        abgemeldete_user_ids = set()
+        abgemeldete_list = {}
+        for abm_id, abm in abmeldungen.items():
+            uid = abm.get("user_id")
+            if uid:
+                abgemeldete_user_ids.add(uid)
+                abgemeldete_list.setdefault(uid, []).append((abm_id, abm))
+        # Teammitglieder ermitteln
+        team_role_id = await self.config.guild(guild).team_role()
+        team_members = []
+        team_role = None
+        if team_role_id:
+            team_role = guild.get_role(team_role_id)
+        for member in guild.members:
+            if member.bot:
+                continue
+            if team_role is not None:
+                if team_role in member.roles:
+                    team_members.append(member)
+            else:
+                is_member_staff = await self._is_ticket_staff(member, None, guild)
+                if is_member_staff or member.guild_permissions.manage_guild or member.guild_permissions.moderate_members:
+                    team_members.append(member)
+        # Status-Listen
+        abgemeldete = []
+        verfuegbar = []
+        for member in team_members:
+            if member.id in abgemeldete_user_ids:
+                abmeldungen_user = abgemeldete_list[member.id]
+                neueste = max(abmeldungen_user, key=lambda x: x[1].get("ts", 0))
+                abgemeldete.append((member, neueste))
+            else:
+                verfuegbar.append(member)
+        # Embed bauen
+        embed = discord.Embed(
+            title="📊 Team-Status (Live)",
+            description=(
+                f"🔴 **{len(abgemeldete)}** abgemeldet • 🟢 **{len(verfuegbar)}** verfügbar • "
+                f"👥 **{len(team_members)}** gesamt\n"
+                f"_Auto-Update: alle 60 Sek • Update: {_fmt_berlin_full(_now())} (MEZ/MESZ)_"
+            ),
+            color=discord.Color.orange() if abgemeldete else discord.Color.green(),
+            timestamp=_now(),
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        # Abgemeldete
+        if abgemeldete:
+            abm_text = ""
+            for member, (abm_id, abm) in sorted(abgemeldete, key=lambda x: x[0].display_name.lower()):
+                von = abm.get("von", "?")[:50]
+                bis = abm.get("bis", "?")[:50]
+                abm_text += f"🔴 **{member.display_name}** — #{abm_id}\n   📅 {von} – {bis}\n"
+                if abm.get("erreichbarkeit"):
+                    abm_text += f"   📞 {abm.get('erreichbarkeit', '')[:60]}\n"
+            embed.add_field(name=f"🔴 Abgemeldet ({len(abgemeldete)})", value=abm_text[:1024] or "—", inline=False)
+        # Verfügbare
+        if verfuegbar:
+            verf_text = ", ".join(f"🟢 {m.display_name}" for m in sorted(verfuegbar, key=lambda x: x.display_name.lower()))
+            if len(verf_text) > 1024:
+                verf_text = verf_text[:1020] + "..."
+            embed.add_field(name=f"🟢 Verfügbar ({len(verfuegbar)})", value=verf_text or "—", inline=False)
+        if not abgemeldete and not verfuegbar:
+            embed.add_field(name="ℹ️ Hinweis", value="Keine Teammitglieder gefunden. Setze eine Team-Rolle mit `[p]abmeldungset teamrole @role`.", inline=False)
+        return embed
+
+    async def update_team_status_panel(self, guild: discord.Guild) -> bool:
+        """Aktualisiert das Team-Status-Panel. Gibt True zurück bei Erfolg."""
+        ch_id = await self.config.guild(guild).team_status_panel_channel()
+        msg_id = await self.config.guild(guild).team_status_panel_message()
+        if not (ch_id and msg_id):
+            return False
+        channel = guild.get_channel(ch_id)
+        if not channel:
+            return False
+        try:
+            msg = await channel.fetch_message(msg_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return False
+        embed = await self._build_team_status_embed(guild)
+        try:
+            await msg.edit(embed=embed)
+            return True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return False
+
+    async def _team_status_panel_loop(self):
+        """Background-Loop: aktualisiert das Team-Status-Panel alle 60 Sekunden."""
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        ch_id = await self.config.guild(guild).team_status_panel_channel()
+                        msg_id = await self.config.guild(guild).team_status_panel_message()
+                        if not (ch_id and msg_id):
+                            continue
+                        await self.update_team_status_panel(guild)
+                    except Exception:
+                        pass  # stillschweigend, kein Spam im Log
+            except Exception:
+                log.exception("Fehler in Team-Status-Panel Loop")
+            await asyncio.sleep(60)
+
     async def _create_abmeldung(self, interaction: discord.Interaction, name: str, von: str, bis: str, erreichbarkeit: str, notiz: str):
         """Erstellt eine Abmeldung und sendet sie in den Abmeldungs-Channel."""
         guild = interaction.guild
@@ -16364,6 +16553,11 @@ class SupportCog(DashboardIntegration, commands.Cog):
             confirm_embed.add_field(name="📅 Zeitraum", value=f"{von} – {bis}", inline=False)
             await member.send(embed=confirm_embed)
         except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Team-Status-Panel sofort aktualisieren
+        try:
+            await self.update_team_status_panel(guild)
+        except Exception:
             pass
 
 
@@ -20291,6 +20485,11 @@ class TeamAbmeldungPanelView(discord.ui.View):
                 await interaction.response.send_message(f"✅ Du wurdest angemeldet! Deine Abmeldung(en) #{', #'.join(removed_ids)} wurde(n) als 'wieder angemeldet' markiert.", ephemeral=True)
             else:
                 await interaction.response.send_message("✅ Du bist angemeldet (warst nicht abgemeldet).", ephemeral=True)
+            # Team-Status-Panel sofort aktualisieren
+            try:
+                await self.cog.update_team_status_panel(guild)
+            except Exception:
+                pass
         except Exception as e:
             log.exception("Fehler beim Anmelden via Button")
             try:
