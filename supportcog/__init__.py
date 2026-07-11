@@ -395,6 +395,16 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "team_role": None,  # Rolle die alle Teammitglieder haben (für teamstatus)
             "team_status_panel_channel": None,  # Channel für das auto-aktualisierende Team-Status-Panel
             "team_status_panel_message": None,  # Message-ID des Panels
+            # NEUE FEATURES
+            "giveaways": {},  # {message_id: {prize, end_ts, channel_id, host_id, ended, winners}}
+            "trial_role": None,  # Trial-Rolle (Probemitglied)
+            "trial_full_role": None,  # Voll-Rolle nach Trial-Phase
+            "trial_duration_days": 7,  # Trial-Phase Dauer in Tagen
+            "trial_members": {},  # {user_id: {start_ts, end_ts, status, ...}}
+            "insights_panel_channel": None,  # Channel für Insights-Dashboard
+            "insights_panel_message": None,  # Message-ID des Dashboards
+            "member_growth_data": [],  # [{date, count, ts}] — täglich gespeichert
+            "smart_polls": {},  # {message_id: {question, options, end_ts, ended, anonymous}}
             # ============================================
             # MOD-DM TEMPLATES (anpassbare DM-Nachrichten für Mod-Aktionen)
             # Platzhalter: {user}, {moderator}, {reason}, {server}, {duration}, {case_id}
@@ -572,6 +582,18 @@ class SupportCog(DashboardIntegration, commands.Cog):
         # Background loop: Team-Status-Panel (alle 60 Sekunden aktualisieren)
         if not hasattr(self, "_team_status_panel_task") or self._team_status_panel_task is None or self._team_status_panel_task.done():
             self._team_status_panel_task = asyncio.create_task(self._team_status_panel_loop())
+        # Background loop: Giveaway check (alle 30 Sek)
+        if not hasattr(self, "_giveaway_check_task") or self._giveaway_check_task is None or self._giveaway_check_task.done():
+            self._giveaway_check_task = asyncio.create_task(self._giveaway_check_loop())
+        # Background loop: Trial check (stündlich)
+        if not hasattr(self, "_trial_check_task") or self._trial_check_task is None or self._trial_check_task is None or self._trial_check_task.done():
+            self._trial_check_task = asyncio.create_task(self._trial_check_loop())
+        # Background loop: Insights update (alle 5 Min)
+        if not hasattr(self, "_insights_update_task") or self._insights_update_task is None or self._insights_update_task.done():
+            self._insights_update_task = asyncio.create_task(self._insights_update_loop())
+        # Background loop: Poll check (jede Minute)
+        if not hasattr(self, "_poll_check_task") or self._poll_check_task is None or self._poll_check_task.done():
+            self._poll_check_task = asyncio.create_task(self._poll_check_loop())
         # Team-Management persistente Views registrieren
         try:
             self.bot.add_view(TeamMeetingView(self, "0"))  # Dummy für Registrierung
@@ -14771,17 +14793,31 @@ class SupportCog(DashboardIntegration, commands.Cog):
         """Wird gefeuert wenn ein User entbannt wird — synchronisiert + loggt."""
         # Modlog
         moderator = None
+        reason = None
         try:
             async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.unban):
                 if entry.target and entry.target.id == user.id:
-                    moderator = entry.user
-                    break
+                    if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                        moderator = entry.user
+                        reason = entry.reason
+                        break
         except (discord.Forbidden, discord.HTTPException):
             pass
-        log_embed = discord.Embed(title="🔓 Mitglied entbannt", description=f"**{user}** (`{user.id}`)", color=discord.Color.green(), timestamp=_now())
+        log_embed = discord.Embed(
+            title="🔓 Mitglied entbannt",
+            description=f"**{user}** (`{user.id}`)",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        log_embed.set_thumbnail(url=user.display_avatar.url)
         if moderator:
-            log_embed.add_field(name="Von", value=moderator.mention, inline=True)
+            log_embed.add_field(name="👮 Moderator", value=f"{moderator.mention} (`{moderator.id}`)", inline=True)
+        if reason:
+            log_embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+        log_embed.set_footer(text=f"User-ID: {user.id}")
         await self._modlog_send(guild, "member_unban", log_embed)
+        # Punishment History
+        await self._punishment_record(guild, user.id, "unban", reason or "Entbannt", moderator or None)
         # Sync
         if not await self._sync_should_propagate_from(guild):
             return
@@ -14793,11 +14829,44 @@ class SupportCog(DashboardIntegration, commands.Cog):
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         """Erkennt Timeout-Änderungen, Rollen-Änderungen, Nickname-Änderung (Sync + Modlog)."""
+        # Audit-Log-Eintrag für member_update holen (wird für Nickname, Timeout verwendet)
+        audit_mod = None
+        audit_reason = None
+        try:
+            async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.member_update):
+                if entry.target and entry.target.id == after.id:
+                    if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                        audit_mod = entry.user
+                        audit_reason = entry.reason
+                        break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Audit-Log-Eintrag für member_role_update holen (separat)
+        audit_role_mod = None
+        audit_role_reason = None
+        try:
+            async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
+                if entry.target and entry.target.id == after.id:
+                    if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                        audit_role_mod = entry.user
+                        audit_role_reason = entry.reason
+                        break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         # Modlog: Nickname-Änderung
         if before.nick != after.nick:
-            log_embed = discord.Embed(title="✏️ Nickname geändert", description=f"**{after.mention}** (`{after.id}`)", color=discord.Color.blurple(), timestamp=_now())
-            log_embed.add_field(name="Vorher", value=before.nick or "Keiner", inline=True)
-            log_embed.add_field(name="Nachher", value=after.nick or "Keiner", inline=True)
+            log_embed = discord.Embed(
+                title="✏️ Nickname geändert",
+                description=f"**{after.mention}** (`{after.id}`)\n**Von:** {before.nick or 'Keiner'} → **Nach:** {after.nick or 'Keiner'}",
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            log_embed.set_thumbnail(url=after.display_avatar.url)
+            if audit_mod:
+                log_embed.add_field(name=" Moderator", value=f"{audit_mod.mention} (`{audit_mod.id}`)", inline=True)
+            if audit_reason:
+                log_embed.add_field(name="📝 Grund", value=audit_reason[:500], inline=False)
+            log_embed.set_footer(text=f"User-ID: {after.id}")
             await self._modlog_send(after.guild, "member_nickname", log_embed)
         # Modlog: Rollen-Änderung
         before_roles_set = set(r.id for r in before.roles)
@@ -14805,23 +14874,54 @@ class SupportCog(DashboardIntegration, commands.Cog):
         added_roles = after_roles_set - before_roles_set
         removed_roles = before_roles_set - after_roles_set
         if added_roles or removed_roles:
-            log_embed = discord.Embed(title="🎭 Rollen geändert", description=f"**{after.mention}** (`{after.id}`)", color=discord.Color.blue(), timestamp=_now())
+            log_embed = discord.Embed(
+                title="🎭 Rollen geändert",
+                description=f"**{after.mention}** (`{after.id}`)",
+                color=discord.Color.blue(),
+                timestamp=_now(),
+            )
+            log_embed.set_thumbnail(url=after.display_avatar.url)
             if added_roles:
-                log_embed.add_field(name="Hinzugefügt", value="\n".join(f"+ {after.guild.get_role(r).mention}" for r in added_roles if after.guild.get_role(r)) or "Keine", inline=False)
+                added_text = "\n".join(f"➕ {after.guild.get_role(r).mention}" for r in added_roles if after.guild.get_role(r)) or "Keine"
+                log_embed.add_field(name="Hinzugefügt", value=added_text, inline=False)
             if removed_roles:
-                log_embed.add_field(name="Entfernt", value="\n".join(f"- {before.guild.get_role(r).mention}" for r in removed_roles if before.guild.get_role(r)) or "Keine", inline=False)
+                removed_text = "\n".join(f"➖ {before.guild.get_role(r).mention}" for r in removed_roles if before.guild.get_role(r)) or "Keine"
+                log_embed.add_field(name="Entfernt", value=removed_text, inline=False)
+            if audit_role_mod:
+                log_embed.add_field(name="👮 Moderator", value=f"{audit_role_mod.mention} (`{audit_role_mod.id}`)", inline=True)
+            if audit_role_reason:
+                log_embed.add_field(name="📝 Grund", value=audit_role_reason[:500], inline=False)
+            log_embed.set_footer(text=f"User-ID: {after.id}")
             await self._modlog_send(after.guild, "member_roles", log_embed)
         # Modlog: Timeout-Änderung
         before_timeout = getattr(before, "timed_out_until", None)
         after_timeout = getattr(after, "timed_out_until", None)
         if before_timeout != after_timeout:
-            log_embed = discord.Embed(title="⏱️ Timeout geändert", description=f"**{after.mention}** (`{after.id}`)", color=discord.Color.orange(), timestamp=_now())
-            log_embed.add_field(name="Vorher", value=_fmt_berlin_full(before_timeout) if before_timeout else "Kein Timeout", inline=True)
-            log_embed.add_field(name="Nachher", value=_fmt_berlin_full(after_timeout) if after_timeout else "Kein Timeout", inline=True)
+            is_new_timeout = after_timeout is not None and (after_timeout.replace(tzinfo=timezone.utc) if after_timeout.tzinfo is None else after_timeout) > _now()
+            if is_new_timeout:
+                title = "⏱️ Timeout verhängt"
+                color = discord.Color.orange()
+            else:
+                title = "✅ Timeout aufgehoben"
+                color = discord.Color.green()
+            log_embed = discord.Embed(
+                title=title,
+                description=f"**{after.mention}** (`{after.id}`)",
+                color=color,
+                timestamp=_now(),
+            )
+            log_embed.set_thumbnail(url=after.display_avatar.url)
+            log_embed.add_field(name="Vorher", value=_fmt_berlin_full(before_timeout) + " (MEZ/MESZ)" if before_timeout else "Kein Timeout", inline=True)
+            log_embed.add_field(name="Nachher", value=_fmt_berlin_full(after_timeout) + " (MEZ/MESZ)" if after_timeout else "Kein Timeout", inline=True)
+            if audit_mod:
+                log_embed.add_field(name="👮 Moderator", value=f"{audit_mod.mention} (`{audit_mod.id}`)", inline=True)
+            real_reason = audit_reason or "Kein Grund angegeben"
+            log_embed.add_field(name="📝 Grund", value=real_reason[:500], inline=False)
+            log_embed.set_footer(text=f"User-ID: {after.id}")
             await self._modlog_send(after.guild, "member_timeout", log_embed)
-            # Punishment History (nur wenn neuer Timeout, nicht aufgehoben)
-            if after_timeout:
-                await self._punishment_record(after.guild, after.id, "timeout", "Timeout verhängt", None)
+            # Punishment History (nur wenn neuer Timeout, nicht aufgehoben) — mit echtem Moderator!
+            if is_new_timeout:
+                await self._punishment_record(after.guild, after.id, "timeout", real_reason, audit_mod or None)
         # Sync: Timeout
         if before_timeout != after_timeout:
             if after_timeout is not None and (after_timeout.replace(tzinfo=timezone.utc) if after_timeout.tzinfo is None else after_timeout) > _now():
@@ -16559,6 +16659,633 @@ class SupportCog(DashboardIntegration, commands.Cog):
             await self.update_team_status_panel(guild)
         except Exception:
             pass
+
+    # ============================================
+    # NEUE FEATURES: Giveaway, Trial-Phase, Server-Insights, Activity-Heatmap, Poll-Verbesserung
+    # ============================================
+
+    @commands.group(name="giveaway", aliases=["ga", "verlosung"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def giveaway_cmd(self, ctx: commands.Context):
+        """Erstellt und verwaltet Giveaways."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @giveaway_cmd.command(name="create", aliases=["start", "neu"])
+    async def giveaway_create(self, ctx: commands.Context, duration: str, *, prize: str):
+        """Startet ein Giveaway. Dauer: 1h, 24h, 7d etc. Beispiel: [p]giveaway create 24h Premium Rolle"""
+        seconds = self._parse_duration(duration)
+        if seconds is None or seconds < 60:
+            await ctx.send("❌ Ungültige Dauer. Mindestens 60 Sekunden. Formate: 30s, 5m, 2h, 7d")
+            return
+        if len(prize) > 256:
+            await ctx.send("❌ Preis zu lang (max 256 Zeichen).")
+            return
+        from datetime import timedelta
+        end_ts = _now_ts() + seconds
+        embed = discord.Embed(
+            title="🎉 GIVEAWAY",
+            description=f"**Preis:** {prize}\n\nReagiere mit 🎉 um teilzunehmen!\n**Endet:** <t:{end_ts}:R>\n**Endet am:** <t:{end_ts}:F>",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text=f"Veranstaltet von {ctx.author.display_name} • SupportCog Giveaway")
+        try:
+            msg = await ctx.send(embed=embed)
+            await msg.add_reaction("🎉")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+            return
+        # Giveaway in Config speichern
+        giveaways = await self.config.guild(ctx.guild).giveaways() or {}
+        g_id = str(msg.id)
+        giveaways[g_id] = {
+            "prize": prize,
+            "end_ts": end_ts,
+            "channel_id": ctx.channel.id,
+            "message_id": msg.id,
+            "host_id": ctx.author.id,
+            "ended": False,
+            "winners": [],
+        }
+        await self.config.guild(ctx.guild).giveaways.set(giveaways)
+        await ctx.send(f"✅ Giveaway gestartet! Endet in {self._format_duration(seconds)}.", delete_after=10)
+
+    @giveaway_cmd.command(name="end", aliases=["beenden"])
+    async def giveaway_end(self, ctx: commands.Context, message_id: str):
+        """Beendet ein Giveaway vorzeitig und zieht Gewinner."""
+        giveaways = await self.config.guild(ctx.guild).giveaways() or {}
+        if message_id not in giveaways:
+            await ctx.send("❌ Giveaway nicht gefunden.")
+            return
+        await self._end_giveaway(ctx.guild, message_id, giveaways[message_id])
+        await ctx.send("✅ Giveaway beendet.", delete_after=10)
+
+    @giveaway_cmd.command(name="list", aliases=["liste", "show"])
+    async def giveaway_list(self, ctx: commands.Context):
+        """Zeigt alle aktiven Giveaways."""
+        giveaways = await self.config.guild(ctx.guild).giveaways() or {}
+        active = {k: v for k, v in giveaways.items() if not v.get("ended")}
+        if not active:
+            await ctx.send("ℹ️ Keine aktiven Giveaways.")
+            return
+        embed = discord.Embed(title=f"🎉 Aktive Giveaways ({len(active)})", color=discord.Color.gold(), timestamp=_now())
+        for g_id, g in list(active.items())[:10]:
+            channel = ctx.guild.get_channel(g.get("channel_id", 0))
+            ch_mention = channel.mention if channel else "Unbekannt"
+            embed.add_field(name=f"🎉 {g.get('prize', '?')[:80]}", value=f"📍 {ch_mention}\n⏰ Endet <t:{g.get('end_ts', 0)}:R>\n[👉 Zum Giveaway](https://discord.com/channels/{ctx.guild.id}/{g.get('channel_id')}/{g_id})", inline=False)
+        await ctx.send(embed=embed)
+
+    async def _end_giveaway(self, guild: discord.Guild, g_id: str, g_data: dict):
+        """Beendet ein Giveaway und zieht Gewinner."""
+        if g_data.get("ended"):
+            return
+        channel = guild.get_channel(g_data.get("channel_id", 0))
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(int(g_id))
+        except (discord.NotFound, discord.HTTPException):
+            return
+        # Teilnehmer sammeln
+        users = set()
+        for reaction in msg.reactions:
+            if str(reaction.emoji) == "🎉":
+                async for user in reaction.users():
+                    if not user.bot:
+                        users.add(user)
+        # Gewinner ziehen
+        import random
+        winner_list = list(users)
+        if winner_list:
+            num_winners = min(1, len(winner_list))
+            winners = random.sample(winner_list, num_winners)
+        else:
+            winners = []
+        # Embed aktualisieren
+        if winners:
+            winner_text = ", ".join(w.mention for w in winners)
+            result = f"🎉 **Gewinner:** {winner_text}\nHerzlichen Glückwunsch!"
+        else:
+            result = "❌ Keine Teilnehmer — Giveaway ohne Gewinner beendet."
+        embed = discord.Embed(
+            title="🎉 GIVEAWAY BEENDET",
+            description=f"**Preis:** {g_data.get('prize', '?')}\n\n{result}",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Giveaway beendet • SupportCog")
+        try:
+            await msg.edit(embed=embed)
+            if winners:
+                await channel.send(f"🎉 {winner_text} hat gewonnen: **{g_data.get('prize', '?')}**!")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Config aktualisieren
+        giveaways = await self.config.guild(guild).giveaways() or {}
+        if g_id in giveaways:
+            giveaways[g_id]["ended"] = True
+            giveaways[g_id]["winners"] = [w.id for w in winners]
+            await self.config.guild(guild).giveaways.set(giveaways)
+
+    async def _giveaway_check_loop(self):
+        """Background-Loop: prüft ob Giveaways beendet werden müssen."""
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        giveaways = await self.config.guild(guild).giveaways() or {}
+                        for g_id, g_data in giveaways.items():
+                            if g_data.get("ended"):
+                                continue
+                            if _now_ts() >= g_data.get("end_ts", 0):
+                                await self._end_giveaway(guild, g_id, g_data)
+                    except Exception:
+                        pass
+            except Exception:
+                log.exception("Fehler in Giveaway Check Loop")
+            await asyncio.sleep(30)
+
+    # --- PROBEMITGLIED-SYSTEM (Trial-Phase) ---
+
+    @commands.group(name="trial", aliases=["probemitglied", "trialphase"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def trial_cmd(self, ctx: commands.Context):
+        """Verwaltet das Probemitglied-System (Trial-Phase)."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @trial_cmd.command(name="setrole", aliases=["rolle"])
+    async def trial_set_role(self, ctx: commands.Context, trial_role: discord.Role, full_role: discord.Role):
+        """Setzt die Trial-Rolle und die volle Team-Rolle."""
+        await self.config.guild(ctx.guild).trial_role.set(trial_role.id)
+        await self.config.guild(ctx.guild).trial_full_role.set(full_role.id)
+        await ctx.send(f"✅ Trial-Rolle: {trial_role.mention}\n✅ Voll-Rolle: {full_role.mention}")
+
+    @trial_cmd.command(name="duration", aliases=["dauer"])
+    async def trial_duration(self, ctx: commands.Context, days: int):
+        """Setzt die Trial-Phase-Dauer in Tagen (Standard: 7)."""
+        if days < 1 or days > 90:
+            await ctx.send("❌ 1-90 Tage.")
+            return
+        await self.config.guild(ctx.guild).trial_duration_days.set(days)
+        await ctx.send(f"✅ Trial-Dauer: **{days} Tage**.")
+
+    @trial_cmd.command(name="add", aliases=["hinzufuegen"])
+    async def trial_add(self, ctx: commands.Context, member: discord.Member):
+        """Setzt einen User in die Trial-Phase."""
+        trial_role_id = await self.config.guild(ctx.guild).trial_role()
+        if not trial_role_id:
+            await ctx.send("❌ Keine Trial-Rolle konfiguriert. Verwende `[p]trial setrole`.")
+            return
+        trial_role = ctx.guild.get_role(trial_role_id)
+        if not trial_role:
+            await ctx.send("❌ Trial-Rolle nicht gefunden.")
+            return
+        duration = await self.config.guild(ctx.guild).trial_duration_days() or 7
+        end_ts = _now_ts() + duration * 86400
+        # Trial-Rolle vergeben
+        try:
+            await member.add_roles(trial_role, reason=f"Trial-Phase gestartet von {ctx.author}")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Rolle konnte nicht vergeben werden: `{e}`")
+            return
+        # In Config speichern
+        trials = await self.config.guild(ctx.guild).trial_members() or {}
+        trials[str(member.id)] = {
+            "user_id": member.id,
+            "username": member.display_name,
+            "start_ts": _now_ts(),
+            "end_ts": end_ts,
+            "added_by": ctx.author.id,
+            "status": "active",
+        }
+        await self.config.guild(ctx.guild).trial_members.set(trials)
+        await ctx.send(f"✅ {member.mention} ist jetzt in der Trial-Phase für **{duration} Tage**.\nAutomatische Beförderung am {_fmt_berlin_date(_from_ts(end_ts))}.")
+
+    @trial_cmd.command(name="promote", aliases=["befoerdern"])
+    async def trial_promote(self, ctx: commands.Context, member: discord.Member):
+        """Befördert einen Trial-Member manuell zur vollen Rolle."""
+        await self._promote_trial(ctx.guild, member, ctx.author)
+        await ctx.send(f"✅ {member.mention} wurde befördert!")
+
+    @trial_cmd.command(name="list", aliases=["liste"])
+    async def trial_list(self, ctx: commands.Context):
+        """Zeigt alle aktiven Trial-Mitglieder."""
+        trials = await self.config.guild(ctx.guild).trial_members() or {}
+        active = {k: v for k, v in trials.items() if v.get("status") == "active"}
+        if not active:
+            await ctx.send("ℹ️ Keine aktiven Trial-Mitglieder.")
+            return
+        embed = discord.Embed(title=f"🆕 Trial-Mitglieder ({len(active)})", color=discord.Color.blurple(), timestamp=_now())
+        for uid, data in list(active.items())[:15]:
+            member = ctx.guild.get_member(int(uid))
+            name = member.display_name if member else data.get("username", "?")
+            remaining = data.get("end_ts", 0) - _now_ts()
+            days_left = max(0, remaining // 86400)
+            embed.add_field(name=name, value=f"📅 Noch {days_left} Tage\n⏰ Endet <t:{data.get('end_ts', 0)}:R>", inline=True)
+        await ctx.send(embed=embed)
+
+    async def _promote_trial(self, guild: discord.Guild, member: discord.Member, promoter=None):
+        """Befördert einen Trial-Member zur vollen Rolle."""
+        trial_role_id = await self.config.guild(guild).trial_role()
+        full_role_id = await self.config.guild(guild).trial_full_role()
+        trial_role = guild.get_role(trial_role_id) if trial_role_id else None
+        full_role = guild.get_role(full_role_id) if full_role_id else None
+        if trial_role and trial_role in member.roles:
+            try:
+                await member.remove_roles(trial_role, reason="Trial-Phase beendet")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        if full_role:
+            try:
+                await member.add_roles(full_role, reason=f"Trial-Phase beendet{' von '+promoter.display_name if promoter else ' (automatisch)'}")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        # Config aktualisieren
+        trials = await self.config.guild(guild).trial_members() or {}
+        if str(member.id) in trials:
+            trials[str(member.id)]["status"] = "promoted"
+            trials[str(member.id)]["promoted_ts"] = _now_ts()
+            await self.config.guild(guild).trial_members.set(trials)
+        # DM an User
+        try:
+            embed = discord.Embed(
+                title=f"🎉 Beförderung auf {guild.name}!",
+                description="Herzlichen Glückwunsch! Deine Trial-Phase ist beendet und du wurdest zum vollen Teammitglied befördert!",
+                color=discord.Color.green(),
+                timestamp=_now(),
+            )
+            await member.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def _trial_check_loop(self):
+        """Background-Loop: prüft ob Trial-Phasen abgelaufen sind."""
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        trials = await self.config.guild(guild).trial_members() or {}
+                        for uid, data in trials.items():
+                            if data.get("status") != "active":
+                                continue
+                            if _now_ts() >= data.get("end_ts", 0):
+                                member = guild.get_member(int(uid))
+                                if member:
+                                    await self._promote_trial(guild, member)
+                    except Exception:
+                        pass
+            except Exception:
+                log.exception("Fehler in Trial Check Loop")
+            await asyncio.sleep(3600)
+
+    # --- SERVER-INSIGHTS DASHBOARD ---
+
+    @commands.group(name="insights", aliases=["serverinsights", "dashboard"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def insights_cmd(self, ctx: commands.Context):
+        """Verwaltet das auto-aktualisierende Server-Insights Dashboard."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @insights_cmd.command(name="create", aliases=["erstellen", "send"])
+    async def insights_create(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Erstellt das Insights-Dashboard (aktualisiert sich alle 5 Min)."""
+        if channel is None:
+            channel = ctx.channel
+        old_ch_id = await self.config.guild(ctx.guild).insights_panel_channel()
+        old_msg_id = await self.config.guild(ctx.guild).insights_panel_message()
+        if old_ch_id and old_msg_id:
+            old_ch = ctx.guild.get_channel(old_ch_id)
+            if old_ch:
+                try:
+                    old_msg = await old_ch.fetch_message(old_msg_id)
+                    await old_msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        embed = await self._build_insights_embed(ctx.guild)
+        try:
+            msg = await channel.send(embed=embed)
+            await self.config.guild(ctx.guild).insights_panel_channel.set(channel.id)
+            await self.config.guild(ctx.guild).insights_panel_message.set(msg.id)
+            await ctx.send(f"✅ Insights-Dashboard erstellt in {channel.mention}. Aktualisiert alle 5 Min.")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+
+    @insights_cmd.command(name="remove", aliases=["entfernen"])
+    async def insights_remove(self, ctx: commands.Context):
+        """Entfernt das Insights-Dashboard."""
+        ch_id = await self.config.guild(ctx.guild).insights_panel_channel()
+        msg_id = await self.config.guild(ctx.guild).insights_panel_message()
+        if ch_id and msg_id:
+            ch = ctx.guild.get_channel(ch_id)
+            if ch:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        await self.config.guild(ctx.guild).insights_panel_channel.set(None)
+        await self.config.guild(ctx.guild).insights_panel_message.set(None)
+        await ctx.send("✅ Insights-Dashboard entfernt.")
+
+    @insights_cmd.command(name="show", aliases=["anzeigen"])
+    async def insights_show(self, ctx: commands.Context):
+        """Zeigt die Insights einmalig an (ohne Panel)."""
+        embed = await self._build_insights_embed(ctx.guild)
+        await ctx.send(embed=embed)
+
+    async def _build_insights_embed(self, guild: discord.Guild) -> discord.Embed:
+        """Baut das Server-Insights Embed."""
+        from datetime import datetime, timezone
+        now_utc = datetime.now(timezone.utc)
+        member_count = guild.member_count or len(guild.members)
+        bot_count = sum(1 for m in guild.members if m.bot)
+        human_count = member_count - bot_count
+        online_count = sum(1 for m in guild.members if m.status == discord.Status.online)
+        created_days = (now_utc - guild.created_at).days
+        # SupportCog Stats
+        tickets = await self.config.guild(guild).tickets() or {}
+        apps = await self.config.guild(guild).team_applications() or {}
+        strikes = await self.config.guild(guild).warn_strikes() or {}
+        tasks = await self.config.guild(guild).team_tasks() or {}
+        snippets = await self.config.guild(guild).snippets() or {}
+        # Member-Growth Tracker
+        growth_data = await self.config.guild(guild).member_growth_data() or []
+        growth_text = "Keine Daten"
+        if growth_data:
+            recent = growth_data[-7:]  # letzte 7 Einträge
+            if len(recent) >= 2:
+                diff = recent[-1].get("count", 0) - recent[0].get("count", 0)
+                growth_text = f"{'+' if diff >= 0 else ''}{diff} in den letzten {len(recent)} Tagen"
+        embed = discord.Embed(
+            title=f"📊 Server-Insights — {guild.name}",
+            description=f"📈 Growth: {growth_text}\n_Auto-Update: alle 5 Min • {_fmt_berlin_full(_now())} (MEZ/MESZ)_",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        # Mitglieder
+        embed.add_field(name="👥 Mitglieder", value=str(member_count), inline=True)
+        embed.add_field(name="👤 Menschen", value=str(human_count), inline=True)
+        embed.add_field(name="🤖 Bots", value=str(bot_count), inline=True)
+        # Online
+        embed.add_field(name="🟢 Online", value=str(online_count), inline=True)
+        embed.add_field(name="📺 Channels", value=str(len(guild.text_channels) + len(guild.voice_channels)), inline=True)
+        embed.add_field(name="🎭 Rollen", value=str(len(guild.roles)), inline=True)
+        # Server
+        embed.add_field(name="💎 Boost", value=f"Lv{guild.premium_tier} ({guild.premium_subscription_count})", inline=True)
+        embed.add_field(name="📅 Alter", value=f"{created_days} Tage", inline=True)
+        embed.add_field(name="😀 Emojis", value=str(len(guild.emojis)), inline=True)
+        # SupportCog
+        embed.add_field(name="🎫 Tickets", value=str(len(tickets)), inline=True)
+        embed.add_field(name="📋 Bewerbungen", value=str(len(apps)), inline=True)
+        embed.add_field(name="⚠️ Verwarnt", value=str(len(strikes)), inline=True)
+        embed.add_field(name="📝 Aufgaben", value=str(len(tasks)), inline=True)
+        embed.add_field(name="💬 Snippets", value=str(len(snippets)), inline=True)
+        embed.add_field(name="🆕 Trial", value=str(len(await self.config.guild(guild).trial_members() or {})), inline=True)
+        return embed
+
+    async def _insights_update_loop(self):
+        """Background-Loop: aktualisiert Insights-Dashboard + Member-Growth alle 5 Min."""
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        # Member-Growth Daten speichern (1x pro Tag)
+                        growth_data = await self.config.guild(guild).member_growth_data() or []
+                        today = _fmt_berlin_date(_now())
+                        if not growth_data or growth_data[-1].get("date") != today:
+                            growth_data.append({"date": today, "count": guild.member_count or len(guild.members), "ts": _now_ts()})
+                            # Nur letzte 90 Tage behalten
+                            growth_data = growth_data[-90:]
+                            await self.config.guild(guild).member_growth_data.set(growth_data)
+                        # Insights Panel aktualisieren
+                        ch_id = await self.config.guild(guild).insights_panel_channel()
+                        msg_id = await self.config.guild(guild).insights_panel_message()
+                        if ch_id and msg_id:
+                            channel = guild.get_channel(ch_id)
+                            if channel:
+                                try:
+                                    msg = await channel.fetch_message(msg_id)
+                                    embed = await self._build_insights_embed(guild)
+                                    await msg.edit(embed=embed)
+                                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                                    pass
+                    except Exception:
+                        pass
+            except Exception:
+                log.exception("Fehler in Insights Update Loop")
+            await asyncio.sleep(300)  # 5 Minuten
+
+    # --- ACTIVITY HEATMAP ---
+
+    @commands.command(name="activityheatmap", aliases=["heatmap", "aktivitaetsheatmap"])
+    @commands.guild_only()
+    async def activity_heatmap_cmd(self, ctx: commands.Context):
+        """Zeigt eine Heatmap der Team-Aktivität nach Wochentag und Stunde."""
+        activity = await self.config.guild(ctx.guild).team_activity() or {}
+        if not activity:
+            await ctx.send("ℹ️ Noch keine Team-Aktivität erfasst.")
+            return
+        # Stunden-Array (0-23) und Wochentag-Array (0-6)
+        hour_counts = [0] * 24
+        weekday_counts = [0] * 7
+        total_messages = 0
+        for uid, data in activity.items():
+            msgs = data.get("messages_sent", 0)
+            total_messages += msgs
+            last_active = data.get("last_active_ts", 0)
+            if last_active:
+                dt = _from_ts(last_active)
+                hour_counts[dt.hour] += msgs
+                weekday_counts[dt.weekday()] += msgs
+        days = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+        max_hour = max(hour_counts) if max(hour_counts) > 0 else 1
+        max_weekday = max(weekday_counts) if max(weekday_counts) > 0 else 1
+        embed = discord.Embed(
+            title="🔥 Team-Aktivitäts-Heatmap",
+            description=f"Gesamte Nachrichten: **{total_messages}** von **{len(activity)}** Teammitgliedern",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        # Stunden-Heatmap
+        hour_text = ""
+        for h in range(24):
+            bar_len = int((hour_counts[h] / max_hour) * 10) if max_hour > 0 else 0
+            bar = "█" * bar_len + "░" * (10 - bar_len)
+            hour_text += f"`{h:02d}:00` {bar} ({hour_counts[h]})\n"
+        embed.add_field(name="📊 Aktivität nach Stunde", value=hour_text[:1024], inline=False)
+        # Wochentag-Heatmap
+        weekday_text = ""
+        for d in range(7):
+            bar_len = int((weekday_counts[d] / max_weekday) * 10) if max_weekday > 0 else 0
+            bar = "█" * bar_len + "░" * (10 - bar_len)
+            weekday_text += f"`{days[d]}` {bar} ({weekday_counts[d]})\n"
+        embed.add_field(name="📊 Aktivität nach Wochentag", value=weekday_text[:1024], inline=False)
+        await ctx.send(embed=embed)
+
+    # --- MEMBER GROWTH TRACKER ---
+
+    @commands.command(name="growth", aliases=["membergrowth", "wachstum"])
+    @commands.guild_only()
+    async def member_growth_cmd(self, ctx: commands.Context):
+        """Zeigt das Member-Wachstum der letzten Tage."""
+        growth_data = await self.config.guild(ctx.guild).member_growth_data() or []
+        if len(growth_data) < 2:
+            await ctx.send("ℹ️ Noch nicht genug Daten. Das System sammelt täglich Daten — schau in ein paar Tagen wieder.")
+            return
+        embed = discord.Embed(
+            title="📈 Member-Growth Tracker",
+            description=f"Aktuelle Mitglieder: **{ctx.guild.member_count}**",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        # Letzte 14 Tage
+        recent = growth_data[-14:]
+        max_count = max(d.get("count", 0) for d in recent) if recent else 1
+        min_count = min(d.get("count", 0) for d in recent) if recent else 0
+        range_val = max(1, max_count - min_count)
+        chart = ""
+        for d in recent:
+            count = d.get("count", 0)
+            bar_len = int(((count - min_count) / range_val) * 15) if range_val > 0 else 0
+            bar = "█" * bar_len + "░" * (15 - bar_len)
+            chart += f"`{d.get('date', '?')[:5]}` {bar} {count}\n"
+        embed.add_field(name="📊 Wachstum (letzte 14 Tage)", value=chart[:1024], inline=False)
+        # Gesamt-Wachstum
+        if len(recent) >= 2:
+            diff = recent[-1].get("count", 0) - recent[0].get("count", 0)
+            embed.add_field(name="📈 Wachstum im Zeitraum", value=f"{'+' if diff >= 0 else ''}{diff} Mitglieder", inline=True)
+        await ctx.send(embed=embed)
+
+    # --- POLL VERBESSERUNG ---
+
+    @commands.command(name="spoll", aliases=["smartpoll", "umfrage"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def smart_poll_cmd(self, ctx: commands.Context, question: str, *, options: str = ""):
+        """Erstellt eine erweiterte Umfrage mit anonymen Votes und Zeitlimit.
+        Format: [p]spoll "Frage?" Option1 | Option2 | Option3 | 24h
+        Das letzte | kann eine Dauer (z.B. 24h, 7d) sein — wird als Zeitlimit verwendet."""
+        # Optionen parsen
+        opts = [o.strip() for o in options.split("|") if o.strip()] if options else []
+        duration_str = None
+        # Prüfen ob letztes Element eine Dauer ist
+        if opts and self._parse_duration(opts[-1]):
+            duration_str = opts[-1]
+            opts = opts[:-1]
+        if not opts:
+            opts = ["Ja", "Nein"]
+        if len(opts) > 10:
+            await ctx.send("❌ Maximal 10 Optionen.")
+            return
+        # Zeitlimit berechnen
+        end_ts = None
+        duration_text = "Unbegrenzt"
+        if duration_str:
+            seconds = self._parse_duration(duration_str)
+            if seconds:
+                end_ts = _now_ts() + seconds
+                duration_text = f"Endet <t:{end_ts}:R>"
+        # Embed bauen
+        embed = discord.Embed(
+            title="📊 Umfrage",
+            description=f"**{question}**\n\n" + "\n".join(f"{['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'][i]} {opt}" for i, opt in enumerate(opts)),
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="⏰ Dauer", value=duration_text, inline=True)
+        embed.add_field(name="👤 Erstellt von", value=ctx.author.mention, inline=True)
+        embed.set_footer(text="Anonyme Umfrage • SupportCog")
+        # Nachricht senden
+        try:
+            msg = await ctx.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+            return
+        # Reactions hinzufügen
+        emojis = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟']
+        for i in range(len(opts)):
+            try:
+                await msg.add_reaction(emojis[i])
+            except (discord.Forbidden, discord.HTTPException):
+                break
+        # Poll in Config speichern
+        polls = await self.config.guild(ctx.guild).smart_polls() or {}
+        polls[str(msg.id)] = {
+            "question": question,
+            "options": opts,
+            "channel_id": ctx.channel.id,
+            "message_id": msg.id,
+            "author_id": ctx.author.id,
+            "end_ts": end_ts,
+            "ended": False,
+            "anonymous": True,
+        }
+        await self.config.guild(ctx.guild).smart_polls.set(polls)
+        await ctx.send("✅ Umfrage erstellt!", delete_after=10)
+
+    async def _poll_check_loop(self):
+        """Background-Loop: beendet zeitbegrenzte Polls."""
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        polls = await self.config.guild(guild).smart_polls() or {}
+                        for p_id, p_data in polls.items():
+                            if p_data.get("ended"):
+                                continue
+                            if p_data.get("end_ts") and _now_ts() >= p_data["end_ts"]:
+                                await self._end_smart_poll(guild, p_id, p_data)
+                    except Exception:
+                        pass
+            except Exception:
+                log.exception("Fehler in Poll Check Loop")
+            await asyncio.sleep(60)
+
+    async def _end_smart_poll(self, guild: discord.Guild, p_id: str, p_data: dict):
+        """Beendet eine Smart-Poll und zeigt Ergebnisse."""
+        channel = guild.get_channel(p_data.get("channel_id", 0))
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(int(p_id))
+        except (discord.NotFound, discord.HTTPException):
+            return
+        emojis = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟']
+        results = ""
+        for i, opt in enumerate(p_data.get("options", [])):
+            count = 0
+            for reaction in msg.reactions:
+                if str(reaction.emoji) == emojis[i]:
+                    count = reaction.count - 1  # Bot-Reaction abziehen
+                    break
+            results += f"{emojis[i]} **{opt}**: {count} Stimmen\n"
+        embed = discord.Embed(
+            title="📊 Umfrage beendet",
+            description=f"**{p_data.get('question', '?')}**\n\n{results}",
+            color=discord.Color.dark_grey(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Umfrage beendet • SupportCog")
+        try:
+            await msg.edit(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        polls = await self.config.guild(guild).smart_polls() or {}
+        if p_id in polls:
+            polls[p_id]["ended"] = True
+            await self.config.guild(guild).smart_polls.set(polls)
 
 
 class DutyButtonView(discord.ui.View):
