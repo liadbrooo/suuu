@@ -16946,7 +16946,7 @@ class SupportCog(DashboardIntegration, commands.Cog):
 
     # --- SERVER-INSIGHTS DASHBOARD ---
 
-    @commands.group(name="insights", aliases=["serverinsights", "dashboard"])
+    @commands.group(name="insights", aliases=["serverinsights"])
     @checks.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
     async def insights_cmd(self, ctx: commands.Context):
