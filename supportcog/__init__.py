@@ -405,6 +405,13 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "insights_panel_message": None,  # Message-ID des Dashboards
             "member_growth_data": [],  # [{date, count, ts}] — täglich gespeichert
             "smart_polls": {},  # {message_id: {question, options, end_ts, ended, anonymous}}
+            # TEAM-BEWERTUNGEN
+            "team_ratings_enabled": False,  # An/aus
+            "team_ratings": {},  # {user_id: {total_rating, count, ratings: [{from_user, ticket_id, rating, comment, ts}]}}
+            "team_ratings_channel": None,  # Channel für Bewertungs-Logs (optional)
+            "pending_ratings": {},  # {dm_message_id: {user_id, teamler_id, ticket_channel, ts}} — für Star-Reactions
+            # TEMP-ROLE SYSTEM
+            "temp_roles": {},  # {entry_id: {user_id, role_id, expires_ts, added_by, reason}}
             # ============================================
             # MOD-DM TEMPLATES (anpassbare DM-Nachrichten für Mod-Aktionen)
             # Platzhalter: {user}, {moderator}, {reason}, {server}, {duration}, {case_id}
@@ -594,6 +601,9 @@ class SupportCog(DashboardIntegration, commands.Cog):
         # Background loop: Poll check (jede Minute)
         if not hasattr(self, "_poll_check_task") or self._poll_check_task is None or self._poll_check_task.done():
             self._poll_check_task = asyncio.create_task(self._poll_check_loop())
+        # Background loop: Temp-Role check (jede Minute)
+        if not hasattr(self, "_temp_role_check_task") or self._temp_role_check_task is None or self._temp_role_check_task.done():
+            self._temp_role_check_task = asyncio.create_task(self._temp_role_check_loop())
         # Team-Management persistente Views registrieren
         try:
             self.bot.add_view(TeamMeetingView(self, "0"))  # Dummy für Registrierung
@@ -7137,22 +7147,43 @@ class SupportCog(DashboardIntegration, commands.Cog):
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
-        """Log: Nachricht gelöscht."""
+        """Log: Nachricht gelöscht — mit Audit-Log (wer hat gelöscht)."""
         if not message.guild or message.author.bot:
             return
         if await self._modlog_is_ignored(message.guild, message.channel.id):
             return
-        embed = discord.Embed(
-            title="🗑️ Nachricht gelöscht",
-            description=f"**Channel:** {message.channel.mention}\n**Autor:** {message.author.mention} (`{message.author.id}`)",
-            color=discord.Color.red(),
-            timestamp=_now(),
-        )
-        embed.add_field(name="Inhalt", value=(message.content or "(kein Text)")[:1024], inline=False)
-        if message.attachments:
-            embed.add_field(name="Anhänge", value=str(len(message.attachments)), inline=True)
-        embed.set_footer(text=f"Message-ID: {message.id}")
-        await self._modlog_send(message.guild, "message_delete", embed)
+        try:
+            # Audit Log: Wer hat die Nachricht gelöscht?
+            deleter = None
+            try:
+                async for entry in message.guild.audit_logs(limit=5, action=discord.AuditLogAction.message_delete):
+                    if entry.target and entry.target.id == message.author.id:
+                        if entry.extra and hasattr(entry.extra, 'id') and entry.extra.id == message.channel.id:
+                            if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                                deleter = entry.user
+                                break
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            embed = discord.Embed(
+                title="🗑️ Nachricht gelöscht",
+                description=f"**Channel:** {message.channel.mention}\n**Autor:** {message.author.mention} (`{message.author.id}`)",
+                color=discord.Color.red(),
+                timestamp=_now(),
+            )
+            embed.set_thumbnail(url=message.author.display_avatar.url)
+            if deleter:
+                embed.add_field(name="👮 Gelöscht von", value=f"{deleter.mention} (`{deleter.id}`)", inline=True)
+            embed.add_field(name="Inhalt", value=(message.content or "(kein Text)")[:1024], inline=False)
+            if message.attachments:
+                attach_text = ""
+                for att in message.attachments[:5]:
+                    attach_text += f"[{att.filename}]({att.proxy_url})\n"
+                embed.add_field(name=f"Anhänge ({len(message.attachments)})", value=attach_text[:1024] or str(len(message.attachments)), inline=False)
+            embed.add_field(name="📍 Channel-ID", value=f"`{message.channel.id}`", inline=True)
+            embed.set_footer(text=f"Message-ID: {message.id} • Autor-ID: {message.author.id}")
+            await self._modlog_send(message.guild, "message_delete", embed)
+        except Exception:
+            log.exception("Fehler in on_message_delete")
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
@@ -7161,70 +7192,135 @@ class SupportCog(DashboardIntegration, commands.Cog):
             return
         if await self._modlog_is_ignored(before.guild, before.channel.id):
             return
-        embed = discord.Embed(
-            title="✏️ Nachricht bearbeitet",
-            description=f"**Channel:** {before.channel.mention}\n**Autor:** {before.author.mention}",
-            color=discord.Color.orange(),
-            timestamp=_now(),
-        )
-        embed.add_field(name="Vorher", value=(before.content or "(leer)")[:1024], inline=False)
-        embed.add_field(name="Nachher", value=(after.content or "(leer)")[:1024], inline=False)
-        embed.set_footer(text=f"[Klick]({after.jump_url})")
-        await self._modlog_send(before.guild, "message_edit", embed)
+        try:
+            embed = discord.Embed(
+                title="✏️ Nachricht bearbeitet",
+                description=f"**Channel:** {before.channel.mention}\n**Autor:** {before.author.mention} (`{before.author.id}`)\n[👉 Zur Nachricht]({after.jump_url})",
+                color=discord.Color.orange(),
+                timestamp=_now(),
+            )
+            embed.set_thumbnail(url=before.author.display_avatar.url)
+            before_content = (before.content or "(leer)")
+            after_content = (after.content or "(leer)")
+            if len(before_content) + len(after_content) < 1800:
+                embed.add_field(name="Vorher", value=before_content[:1024], inline=False)
+                embed.add_field(name="Nachher", value=after_content[:1024], inline=False)
+            else:
+                embed.add_field(name="Vorher (gekürzt)", value=before_content[:500] + ("..." if len(before_content) > 500 else ""), inline=False)
+                embed.add_field(name="Nachher (gekürzt)", value=after_content[:500] + ("..." if len(after_content) > 500 else ""), inline=False)
+            embed.set_footer(text=f"Message-ID: {before.id} • Autor-ID: {before.author.id}")
+            await self._modlog_send(before.guild, "message_edit", embed)
+        except Exception:
+            log.exception("Fehler in on_message_edit")
 
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
-        """Log: Channel erstellt."""
+        """Log: Channel erstellt — mit Audit-Log."""
         moderator = None
+        reason = None
         try:
             async for entry in channel.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_create):
                 if entry.target and entry.target.id == channel.id:
-                    moderator = entry.user
-                    break
+                    if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                        moderator = entry.user
+                        reason = entry.reason
+                        break
         except (discord.Forbidden, discord.HTTPException):
             pass
-        ch_type_de = {"text": "Text-Channel", "voice": "Sprach-Channel", "category": "Kategorie"}.get(str(channel.type), str(channel.type))
+        ch_type_de = {"text": "Text-Channel", "voice": "Sprach-Channel", "category": "Kategorie", "news": "Announcement", "stage_voice": "Stage", "forum": "Forum"}.get(str(channel.type), str(channel.type))
         embed = discord.Embed(title="➕ Channel erstellt", description=f"**{ch_type_de}:** `{channel.name}`", color=discord.Color.green(), timestamp=_now())
         if moderator:
-            embed.add_field(name="Von", value=moderator.mention, inline=True)
+            embed.add_field(name="👮 Erstellt von", value=f"{moderator.mention} (`{moderator.id}`)", inline=True)
+        if reason:
+            embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+        embed.add_field(name="📍 Channel-ID", value=f"`{channel.id}`", inline=True)
+        if hasattr(channel, 'category') and channel.category:
+            embed.add_field(name="📂 Kategorie", value=channel.category.name, inline=True)
+        embed.set_footer(text=f"Channel-ID: {channel.id}")
         await self._modlog_send(channel.guild, "channel_create", embed)
 
     @commands.Cog.listener()
     async def on_guild_role_create(self, role: discord.Role):
-        """Log: Rolle erstellt."""
+        """Log: Rolle erstellt — mit Audit-Log + Details."""
         moderator = None
+        reason = None
         try:
             async for entry in role.guild.audit_logs(limit=5, action=discord.AuditLogAction.role_create):
                 if entry.target and entry.target.id == role.id:
-                    moderator = entry.user
-                    break
+                    if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                        moderator = entry.user
+                        reason = entry.reason
+                        break
         except (discord.Forbidden, discord.HTTPException):
             pass
-        embed = discord.Embed(title="➕ Rolle erstellt", description=f"**Rolle:** {role.mention}", color=discord.Color.green(), timestamp=_now())
+        embed = discord.Embed(title="➕ Rolle erstellt", description=f"**Rolle:** {role.mention}\n**Farbe:** `#{role.color.value:06x}`\n**Erwähnbar:** {'Ja' if role.mentionable else 'Nein'}", color=discord.Color.green(), timestamp=_now())
         if moderator:
-            embed.add_field(name="Von", value=moderator.mention, inline=True)
+            embed.add_field(name="👮 Erstellt von", value=f"{moderator.mention} (`{moderator.id}`)", inline=True)
+        if reason:
+            embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+        embed.add_field(name="📍 Role-ID", value=f"`{role.id}`", inline=True)
+        # Top 5 Permissions
+        perm_list = [name for name, val in role.permissions if val]
+        if perm_list:
+            embed.add_field(name="🔑 Berechtigungen", value=", ".join(perm_list[:10])[:500], inline=False)
+        embed.set_footer(text=f"Role-ID: {role.id}")
         await self._modlog_send(role.guild, "role_create", embed)
 
     @commands.Cog.listener()
     async def on_guild_role_update(self, before: discord.Role, after: discord.Role):
-        """Log: Rolle bearbeitet."""
+        """Log: Rolle bearbeitet — mit Audit-Log + detailliertem Diff."""
+        moderator = None
+        reason = None
+        try:
+            async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.role_update):
+                if entry.target and entry.target.id == after.id:
+                    if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                        moderator = entry.user
+                        reason = entry.reason
+                        break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         changes = []
         if before.name != after.name:
             changes.append(f"**Name:** `{before.name}` → `{after.name}`")
         if before.color != after.color:
-            changes.append(f"**Farbe:** `{before.color}` → `{after.color}`")
-        if before.permissions != after.permissions:
-            changes.append("**Berechtigungen** geändert")
+            changes.append(f"**Farbe:** `#{before.color.value:06x}` → `#{after.color.value:06x}`")
         if before.mentionable != after.mentionable:
             changes.append(f"**Erwähnbar:** {before.mentionable} → {after.mentionable}")
+        if before.hoist != after.hoist:
+            changes.append(f"**Getrennt angezeigt:** {before.hoist} → {after.hoist}")
+        # Permission Diff
+        before_perms = set(name for name, val in before.permissions if val)
+        after_perms = set(name for name, val in after.permissions if val)
+        added_perms = after_perms - before_perms
+        removed_perms = before_perms - after_perms
+        if added_perms:
+            changes.append(f"**Berechtigungen hinzugefügt:** {', '.join(added_perms)}")
+        if removed_perms:
+            changes.append(f"**Berechtigungen entfernt:** {', '.join(removed_perms)}")
         if not changes:
             return
         embed = discord.Embed(title="✏️ Rolle bearbeitet", description=f"**Rolle:** {after.mention}\n" + "\n".join(changes), color=discord.Color.orange(), timestamp=_now())
+        if moderator:
+            embed.add_field(name="👮 Bearbeitet von", value=f"{moderator.mention} (`{moderator.id}`)", inline=True)
+        if reason:
+            embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+        embed.set_footer(text=f"Role-ID: {after.id}")
         await self._modlog_send(after.guild, "role_update", embed)
 
     @commands.Cog.listener()
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
-        """Log: Server-Einstellungen geändert."""
+        """Log: Server-Einstellungen geändert — mit Audit-Log + erweitertem Diff."""
+        moderator = None
+        reason = None
+        try:
+            async for entry in after.audit_logs(limit=5, action=discord.AuditLogAction.guild_update):
+                if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                    moderator = entry.user
+                    reason = entry.reason
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         changes = []
         if before.name != after.name:
             changes.append(f"**Name:** `{before.name}` → `{after.name}`")
@@ -7232,40 +7328,88 @@ class SupportCog(DashboardIntegration, commands.Cog):
             changes.append(f"**Verifizierung:** `{before.verification_level}` → `{after.verification_level}`")
         if before.premium_tier != after.premium_tier:
             changes.append(f"**Boost-Level:** {before.premium_tier} → {after.premium_tier}")
+        if before.afk_channel != after.afk_channel:
+            changes.append(f"**AFK-Channel:** {before.afk_channel.name if before.afk_channel else 'Keiner'} → {after.afk_channel.name if after.afk_channel else 'Keiner'}")
+        if before.afk_timeout != after.afk_timeout:
+            changes.append(f"**AFK-Timeout:** {before.afk_timeout}s → {after.afk_timeout}s")
+        if before.system_channel != after.system_channel:
+            changes.append(f"**System-Channel:** {before.system_channel.mention if before.system_channel else 'Keiner'} → {after.system_channel.mention if after.system_channel else 'Keiner'}")
+        if before.explicit_content_filter != after.explicit_content_filter:
+            changes.append(f"**Content-Filter:** {before.explicit_content_filter} → {after.explicit_content_filter}")
+        if before.mfa_level != after.mfa_level:
+            changes.append(f"**2FA-Anforderung:** {before.mfa_level} → {after.mfa_level}")
+        if before.vanity_url_code != after.vanity_url_code:
+            changes.append(f"**Vanity URL:** `{before.vanity_url_code or 'Keine'}` → `{after.vanity_url_code or 'Keine'}`")
+        if before.preferred_locale != after.preferred_locale:
+            changes.append(f"**Sprache:** `{before.preferred_locale}` → `{after.preferred_locale}`")
         if not changes:
             return
         embed = discord.Embed(title="⚙️ Server aktualisiert", description="\n".join(changes), color=discord.Color.gold(), timestamp=_now())
+        if moderator:
+            embed.add_field(name="👮 Geändert von", value=f"{moderator.mention} (`{moderator.id}`)", inline=True)
+        if reason:
+            embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+        embed.set_footer(text=f"Server-ID: {after.id}")
         await self._modlog_send(after, "guild_update", embed)
 
     @commands.Cog.listener()
     async def on_thread_create(self, thread: discord.Thread):
-        """Log: Thread erstellt."""
+        """Log: Thread erstellt — mit Details."""
+        thread_type_de = {"public_thread": "Öffentlich", "private_thread": "Privat", "news_thread": "Announcement"}.get(str(thread.type), str(thread.type))
         embed = discord.Embed(
             title="🧵 Thread erstellt",
-            description=f"**Thread:** {thread.mention}\n**Typ:** {thread.type}\n**Parent:** {thread.parent.mention if thread.parent else 'Keiner'}",
+            description=f"**Thread:** {thread.mention}\n**Typ:** {thread_type_de}\n**Parent:** {thread.parent.mention if thread.parent else 'Keiner'}",
             color=discord.Color.green(),
             timestamp=_now(),
         )
         if thread.owner:
-            embed.add_field(name="Erstellt von", value=thread.owner.mention, inline=True)
+            embed.add_field(name="👤 Erstellt von", value=f"{thread.owner.mention} (`{thread.owner.id}`)", inline=True)
+        embed.add_field(name="📍 Thread-ID", value=f"`{thread.id}`", inline=True)
         embed.set_footer(text=f"Thread-ID: {thread.id}")
         await self._modlog_send(thread.guild, "thread_create", embed)
 
     @commands.Cog.listener()
     async def on_thread_delete(self, thread: discord.Thread):
-        """Log: Thread gelöscht."""
+        """Log: Thread gelöscht — mit Audit-Log."""
+        moderator = None
+        reason = None
+        try:
+            async for entry in thread.guild.audit_logs(limit=5, action=discord.AuditLogAction.thread_delete):
+                if entry.target and entry.target.id == thread.id:
+                    if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                        moderator = entry.user
+                        reason = entry.reason
+                        break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         embed = discord.Embed(
             title="🧵 Thread gelöscht",
             description=f"**Thread:** `{thread.name}`\n**Parent:** {thread.parent.mention if thread.parent else 'Keiner'}",
             color=discord.Color.red(),
             timestamp=_now(),
         )
+        if moderator:
+            embed.add_field(name="👮 Gelöscht von", value=f"{moderator.mention} (`{moderator.id}`)", inline=True)
+        if reason:
+            embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+        embed.add_field(name="📍 Thread-ID", value=f"`{thread.id}`", inline=True)
         embed.set_footer(text=f"Thread-ID: {thread.id}")
         await self._modlog_send(thread.guild, "thread_delete", embed)
 
     @commands.Cog.listener()
     async def on_thread_update(self, before: discord.Thread, after: discord.Thread):
-        """Log: Thread aktualisiert."""
+        """Log: Thread aktualisiert — mit Audit-Log + erweitertem Diff."""
+        moderator = None
+        reason = None
+        try:
+            async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.thread_update):
+                if entry.target and entry.target.id == after.id:
+                    if _now_ts() - int(entry.created_at.timestamp()) < 30:
+                        moderator = entry.user
+                        reason = entry.reason
+                        break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         changes = []
         if before.name != after.name:
             changes.append(f"**Name:** `{before.name}` → `{after.name}`")
@@ -7273,6 +7417,10 @@ class SupportCog(DashboardIntegration, commands.Cog):
             changes.append(f"**Archiviert:** {before.archived} → {after.archived}")
         if before.locked != after.locked:
             changes.append(f"**Gesperrt:** {before.locked} → {after.locked}")
+        if before.auto_archive_duration != after.auto_archive_duration:
+            changes.append(f"**Auto-Archiv:** {before.auto_archive_duration}min → {after.auto_archive_duration}min")
+        if before.slowmode_delay != after.slowmode_delay:
+            changes.append(f"**Slowmode:** {before.slowmode_delay}s → {after.slowmode_delay}s")
         if not changes:
             return
         embed = discord.Embed(
@@ -7281,6 +7429,11 @@ class SupportCog(DashboardIntegration, commands.Cog):
             color=discord.Color.orange(),
             timestamp=_now(),
         )
+        if moderator:
+            embed.add_field(name="👮 Bearbeitet von", value=f"{moderator.mention} (`{moderator.id}`)", inline=True)
+        if reason:
+            embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+        embed.set_footer(text=f"Thread-ID: {after.id}")
         await self._modlog_send(after.guild, "thread_update", embed)
 
     # --- PUNISHMENT TRACKING ---
@@ -15005,20 +15158,37 @@ class SupportCog(DashboardIntegration, commands.Cog):
     async def on_member_remove(self, member: discord.Member):
         """Erkennt Kicks, synchronisiert, schließt Tickets + loggt."""
         await self._antinuke_track(member.guild, "kick")
-        # Modlog: Mitglied verlassen
+        # Modlog: Mitglied verlassen — mit Thumbnail + Account-Alter + Rollen
+        from datetime import datetime, timezone
+        account_age = (datetime.now(timezone.utc) - member.created_at).days if member.created_at else 0
+        join_age = (datetime.now(timezone.utc) - member.joined_at).days if member.joined_at else 0
         log_embed = discord.Embed(title="📤 Mitglied verlassen", description=f"{member.mention} ({member})\n`{member.id}`", color=discord.Color.orange(), timestamp=_now())
+        log_embed.set_thumbnail(url=member.display_avatar.url)
         if member.joined_at:
-            log_embed.add_field(name="Beigetreten", value=_fmt_berlin_full(member.joined_at), inline=True)
-        log_embed.set_footer(text=f"Mitglieder: {member.guild.member_count}")
+            log_embed.add_field(name="📅 Beigetreten", value=_fmt_berlin_full(member.joined_at) + " (MEZ/MESZ)", inline=True)
+        log_embed.add_field(name="📊 Account-Alter", value=f"{account_age} Tage", inline=True)
+        log_embed.add_field(name="🏠 Auf Server", value=f"{join_age} Tage", inline=True)
+        # Rollen (außer @everyone)
+        roles = [r.mention for r in member.roles if r.name != "@everyone"]
+        if roles:
+            log_embed.add_field(name=f"👥 Rollen ({len(roles)})", value=", ".join(roles[:10])[:500], inline=False)
+        log_embed.set_footer(text=f"User-ID: {member.id} • Mitglieder: {member.guild.member_count}")
         await self._modlog_send(member.guild, "member_leave", log_embed)
         # Modlog: Kick-Erkennung
         try:
             async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
                 if entry.target and entry.target.id == member.id:
                     if entry.created_at and (_now() - entry.created_at.replace(tzinfo=timezone.utc)).total_seconds() < 10:
-                        kick_embed = discord.Embed(title="👢 Mitglied gekickt", description=f"**{member}** (`{member.id}`)", color=discord.Color.red(), timestamp=_now())
-                        kick_embed.add_field(name="Von", value=entry.user.mention if entry.user else "Unbekannt", inline=True)
-                        kick_embed.add_field(name="Grund", value=entry.reason or "Kein Grund", inline=False)
+                        kick_embed = discord.Embed(
+                            title="👢 Mitglied gekickt",
+                            description=f"**{member}** (`{member.id}`)",
+                            color=discord.Color.red(),
+                            timestamp=_now(),
+                        )
+                        kick_embed.set_thumbnail(url=member.display_avatar.url)
+                        kick_embed.add_field(name="👮 Gekickt von", value=f"{entry.user.mention} (`{entry.user.id}`)" if entry.user else "Unbekannt", inline=True)
+                        kick_embed.add_field(name="📝 Grund", value=entry.reason or "Kein Grund", inline=False)
+                        kick_embed.set_footer(text=f"User-ID: {member.id}")
                         await self._modlog_send(member.guild, "member_kick", kick_embed)
                         # Punishment History
                         await self._punishment_record(member.guild, member.id, "kick", entry.reason or "Kein Grund", entry.user)
@@ -17286,6 +17456,417 @@ class SupportCog(DashboardIntegration, commands.Cog):
         if p_id in polls:
             polls[p_id]["ended"] = True
             await self.config.guild(guild).smart_polls.set(polls)
+
+    # ============================================
+    # TEAM-BEWERTUNGEN
+    # ============================================
+
+    @commands.group(name="teamrating", aliases=["trating", "bewertung", "teambewertung"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def team_rating_set(self, ctx: commands.Context):
+        """Konfiguriert das Team-Bewertungssystem."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_rating_set.command(name="toggle")
+    async def tr_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert Team-Bewertungen."""
+        current = await self.config.guild(ctx.guild).team_ratings_enabled()
+        await self.config.guild(ctx.guild).team_ratings_enabled.set(not current)
+        status = "aktiviert" if not current else "deaktiviert"
+        await ctx.send(f"✅ Team-Bewertungen **{status}**. {'User erhalten nach Ticket-Close eine Bewertungs-Anfrage.' if not current else ''}")
+
+    @team_rating_set.command(name="channel")
+    async def tr_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Bewertungs-Logs (optional)."""
+        if channel is None:
+            await self.config.guild(ctx.guild).team_ratings_channel.set(None)
+            await ctx.send("✅ Bewertungs-Log-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_ratings_channel.set(channel.id)
+        await ctx.send(f"✅ Bewertungs-Log-Channel: {channel.mention}.")
+
+    @team_rating_set.command(name="show", aliases=["stats", "top"])
+    async def tr_show(self, ctx: commands.Context):
+        """Zeigt die Team-Bewertungen (Top-Liste nach Durchschnitt)."""
+        ratings = await self.config.guild(ctx.guild).team_ratings() or {}
+        if not ratings:
+            await ctx.send("ℹ️ Noch keine Bewertungen vorhanden.")
+            return
+        # Durchschnitt berechnen
+        rated = []
+        for uid_str, data in ratings.items():
+            count = data.get("count", 0)
+            total = data.get("total_rating", 0)
+            if count > 0:
+                avg = total / count
+                rated.append((int(uid_str), avg, count, total))
+        if not rated:
+            await ctx.send("ℹ️ Noch keine Bewertungen vorhanden.")
+            return
+        rated.sort(key=lambda x: x[1], reverse=True)
+        embed = discord.Embed(
+            title="⭐ Team-Bewertungen (Top 15)",
+            description=f"Insgesamt **{len(rated)}** Teammitglieder bewertet, **{sum(r[2] for r in rated)}** Bewertungen gesamt.",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        medals = ["🥇", "🥈", "🥉"]
+        text = ""
+        for i, (uid, avg, count, total) in enumerate(rated[:15]):
+            member = ctx.guild.get_member(uid)
+            name = member.display_name if member else f"User {uid}"
+            stars = "⭐" * round(avg) + "☆" * (5 - round(avg))
+            rank = medals[i] if i < 3 else f"#{i+1}"
+            text += f"{rank} **{name}** — {avg:.1f}/5 {stars} ({count} Bewertungen)\n"
+        embed.add_field(name="🏆 Ranking", value=text[:1024], inline=False)
+        # Gesamt-Durchschnitt
+        total_avg = sum(r[1] for r in rated) / len(rated) if rated else 0
+        embed.add_field(name="📊 Ø Gesamtbewertung", value=f"{total_avg:.1f}/5", inline=True)
+        embed.set_footer(text="Team-Bewertungen • SupportCog")
+        await ctx.send(embed=embed)
+
+    @team_rating_set.command(name="info", aliases=["details"])
+    async def tr_info(self, ctx: commands.Context, member: discord.Member):
+        """Zeigt Bewertungen eines bestimmten Teammitglieds."""
+        ratings = await self.config.guild(ctx.guild).team_ratings() or {}
+        data = ratings.get(str(member.id), {})
+        count = data.get("count", 0)
+        total = data.get("total_rating", 0)
+        all_ratings = data.get("ratings", [])
+        if count == 0:
+            await ctx.send(f"ℹ️ {member.mention} hat noch keine Bewertungen.")
+            return
+        avg = total / count
+        embed = discord.Embed(
+            title=f"⭐ Bewertungen — {member.display_name}",
+            description=f"**Durchschnitt:** {avg:.1f}/5 ⭐\n**Anzahl:** {count} Bewertungen",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        # Letzte 5 Bewertungen
+        recent = all_ratings[-5:]
+        for r in recent:
+            stars = "⭐" * r.get("rating", 0) + "☆" * (5 - r.get("rating", 0))
+            from_user = ctx.guild.get_member(r.get("from_user", 0))
+            from_name = from_user.display_name if from_user else "Anonym"
+            comment = r.get("comment", "Kein Kommentar")
+            embed.add_field(name=f"{stars} von {from_name}", value=f"_{comment[:200]}_\n📅 {_fmt_berlin_date(_from_ts(r.get('ts', 0)))}", inline=False)
+        await ctx.send(embed=embed)
+
+    @team_rating_set.command(name="reset", aliases=["zuruecksetzen"])
+    async def tr_reset(self, ctx: commands.Context, member: discord.Member = None):
+        """Setzt Bewertungen zurück (eines Members oder alle)."""
+        ratings = await self.config.guild(ctx.guild).team_ratings() or {}
+        if member:
+            if str(member.id) in ratings:
+                del ratings[str(member.id)]
+                await self.config.guild(ctx.guild).team_ratings.set(ratings)
+                await ctx.send(f"✅ Bewertungen von {member.mention} zurückgesetzt.")
+            else:
+                await ctx.send(f"ℹ️ {member.mention} hat keine Bewertungen.")
+        else:
+            await self.config.guild(ctx.guild).team_ratings.set({})
+            await ctx.send("✅ Alle Bewertungen zurückgesetzt.")
+
+    async def _send_ticket_rating(self, guild: discord.Guild, user: discord.Member, teamler: discord.Member, ticket_channel_name: str):
+        """Sendet eine Bewertungs-Anfrage per DM nach Ticket-Close."""
+        if not await self.config.guild(guild).team_ratings_enabled():
+            return
+        try:
+            embed = discord.Embed(
+                title=f"⭐ Ticket-Bewertung — {guild.name}",
+                description=(
+                    f"Dein Ticket **{ticket_channel_name}** wurde von **{teamler.display_name}** bearbeitet.\n\n"
+                    f"Wie würdest du die Unterstützung bewerten?\n"
+                    f"Reagiere mit 1-5 Sternen ⭐"
+                ),
+                color=discord.Color.gold(),
+                timestamp=_now(),
+            )
+            embed.set_thumbnail(url=teamler.display_avatar.url)
+            embed.set_footer(text=f"Teamler: {teamler.display_name} • Ticket: {ticket_channel_name}")
+            msg = await user.send(embed=embed)
+            # Star reactions
+            for i in range(1, 6):
+                await msg.add_reaction("⭐")
+            # In Config speichern für on_raw_reaction_add
+            pending = await self.config.guild(guild).pending_ratings() or {}
+            pending[str(msg.id)] = {
+                "user_id": user.id,
+                "teamler_id": teamler.id,
+                "ticket_channel": ticket_channel_name,
+                "ts": _now_ts(),
+            }
+            await self.config.guild(guild).pending_ratings.set(pending)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def _record_rating(self, guild: discord.Guild, teamler_id: int, from_user_id: int, rating: int, comment: str = ""):
+        """Speichert eine Bewertung."""
+        ratings = await self.config.guild(guild).team_ratings() or {}
+        key = str(teamler_id)
+        if key not in ratings:
+            ratings[key] = {"total_rating": 0, "count": 0, "ratings": []}
+        ratings[key]["total_rating"] += rating
+        ratings[key]["count"] += 1
+        ratings[key]["ratings"].append({
+            "from_user": from_user_id,
+            "rating": rating,
+            "comment": comment[:500],
+            "ts": _now_ts(),
+        })
+        # Nur letzte 50 Bewertungen behalten
+        if len(ratings[key]["ratings"]) > 50:
+            ratings[key]["ratings"] = ratings[key]["ratings"][-50:]
+        await self.config.guild(guild).team_ratings.set(ratings)
+        # Log-Channel
+        ch_id = await self.config.guild(guild).team_ratings_channel()
+        if ch_id:
+            ch = guild.get_channel(ch_id)
+            if ch:
+                teamler = guild.get_member(teamler_id)
+                from_user = guild.get_member(from_user_id)
+                log_embed = discord.Embed(
+                    title="⭐ Neue Bewertung",
+                    description=f"**Teamler:** {teamler.mention if teamler else teamler_id}\n**Von:** {from_user.mention if from_user else from_user_id}\n**Bewertung:** {'⭐' * rating}{'☆' * (5-rating)} ({rating}/5)",
+                    color=discord.Color.gold(),
+                    timestamp=_now(),
+                )
+                if comment:
+                    log_embed.add_field(name="📝 Kommentar", value=comment[:500], inline=False)
+                try:
+                    await ch.send(embed=log_embed)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+    # ============================================
+    # TEMP-ROLE SYSTEM
+    # ============================================
+
+    @commands.group(name="temprole", aliases=["temproles", "tempremprole"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_roles=True)
+    async def temp_role_cmd(self, ctx: commands.Context):
+        """Verwaltet temporäre Rollen mit automatischem Ablauf."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @temp_role_cmd.command(name="add", aliases=["geben", "assign"])
+    async def temp_role_add(self, ctx: commands.Context, member: discord.Member, role: discord.Role, duration: str, *, reason: str = ""):
+        """Gibt eine temporäre Rolle mit Ablaufzeit.
+        Format: [p]temprole add @User @Rolle 24h Grund
+        Dauer-Formate: 30s, 5m, 2h, 7d, 1h30m"""
+        seconds = self._parse_duration(duration)
+        if seconds is None or seconds < 60:
+            await ctx.send("❌ Ungültige Dauer. Mindestens 60 Sekunden. Formate: 30s, 5m, 2h, 7d, 1h30m")
+            return
+        if seconds > 86400 * 365:
+            await ctx.send("❌ Dauer darf max. 365 Tage betragen.")
+            return
+        if role >= ctx.guild.me.top_role:
+            await ctx.send("❌ Diese Rolle ist höher als meine Rolle — kann sie nicht vergeben.")
+            return
+        expires_ts = _now_ts() + seconds
+        duration_str = self._format_duration(seconds)
+        # Rolle vergeben
+        try:
+            await member.add_roles(role, reason=f"Temp-Role von {ctx.author} für {duration_str}{': ' + reason if reason else ''}")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Rolle konnte nicht vergeben werden: `{e}`")
+            return
+        # In Config speichern
+        temp_roles = await self.config.guild(ctx.guild).temp_roles() or {}
+        entry_id = f"{member.id}_{role.id}_{expires_ts}"
+        temp_roles[entry_id] = {
+            "user_id": member.id,
+            "role_id": role.id,
+            "expires_ts": expires_ts,
+            "added_by": ctx.author.id,
+            "added_by_name": ctx.author.display_name,
+            "reason": reason[:500] if reason else "",
+            "added_ts": _now_ts(),
+        }
+        await self.config.guild(ctx.guild).temp_roles.set(temp_roles)
+        # Modlog
+        log_embed = discord.Embed(
+            title="🎭 Temp-Role vergeben",
+            description=f"**User:** {member.mention}\n**Rolle:** {role.mention}\n**Dauer:** {duration_str}\n**Läuft ab:** <t:{expires_ts}:F> (<t:{expires_ts}:R>)",
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+        log_embed.add_field(name="👮 Von", value=ctx.author.mention, inline=True)
+        if reason:
+            log_embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+        log_embed.set_thumbnail(url=member.display_avatar.url)
+        log_embed.set_footer(text=f"User-ID: {member.id} • Role-ID: {role.id}")
+        await self._modlog_send(ctx.guild, "mod_action", log_embed)
+        # DM an User
+        try:
+            dm_embed = discord.Embed(
+                title=f"🎭 Temp-Role auf {ctx.guild.name}",
+                description=f"Dir wurde die Rolle **{role.name}** für **{duration_str}** vergeben.\nLäuft ab: <t:{expires_ts}:F>",
+                color=discord.Color.blue(),
+                timestamp=_now(),
+            )
+            if reason:
+                dm_embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+            await member.send(embed=dm_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await ctx.send(f"✅ {member.mention} hat {role.mention} für **{duration_str}** erhalten. Läuft ab <t:{expires_ts}:R>.")
+
+    @temp_role_cmd.command(name="list", aliases=["liste", "show"])
+    async def temp_role_list(self, ctx: commands.Context):
+        """Zeigt alle aktiven temporären Rollen."""
+        temp_roles = await self.config.guild(ctx.guild).temp_roles() or {}
+        # Abgelaufene filtern
+        active = {k: v for k, v in temp_roles.items() if v.get("expires_ts", 0) > _now_ts()}
+        if not active:
+            await ctx.send("ℹ️ Keine aktiven temporären Rollen.")
+            return
+        embed = discord.Embed(
+            title=f"🎭 Temp-Rollen ({len(active)})",
+            color=discord.Color.blue(),
+            timestamp=_now(),
+        )
+        for eid, data in list(active.items())[:15]:
+            member = ctx.guild.get_member(data.get("user_id", 0))
+            role = ctx.guild.get_role(data.get("role_id", 0))
+            member_name = member.display_name if member else f"User {data.get('user_id', '?')}"
+            role_name = role.mention if role else f"Rolle {data.get('role_id', '?')}"
+            expires_ts = data.get("expires_ts", 0)
+            remaining = expires_ts - _now_ts()
+            remaining_str = self._format_duration(remaining) if remaining > 0 else "Abgelaufen"
+            embed.add_field(
+                name=f"{member_name} — {role_name}",
+                value=f"⏰ Läuft ab <t:{expires_ts}:R>\n📝 Noch {remaining_str}\n👤 Von: {data.get('added_by_name', '?')}",
+                inline=False,
+            )
+        embed.set_footer(text=f"{len(active)} aktive Temp-Rollen")
+        await ctx.send(embed=embed)
+
+    @temp_role_cmd.command(name="remove", aliases=["entfernen", "revoke"])
+    async def temp_role_remove(self, ctx: commands.Context, member: discord.Member, role: discord.Role = None):
+        """Entfernt eine temporäre Rolle vorzeitig."""
+        temp_roles = await self.config.guild(ctx.guild).temp_roles() or {}
+        removed = False
+        for eid, data in list(temp_roles.items()):
+            if data.get("user_id") == member.id:
+                if role and data.get("role_id") != role.id:
+                    continue
+                # Rolle entfernen
+                r = ctx.guild.get_role(data.get("role_id", 0))
+                if r and r in member.roles:
+                    try:
+                        await member.remove_roles(r, reason=f"Temp-Role entfernt von {ctx.author}")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                del temp_roles[eid]
+                removed = True
+        if removed:
+            await self.config.guild(ctx.guild).temp_roles.set(temp_roles)
+            await ctx.send(f"✅ Temp-Role(n) von {member.mention} entfernt.")
+        else:
+            await ctx.send("❌ Keine passende Temp-Role gefunden.")
+
+    async def _temp_role_check_loop(self):
+        """Background-Loop: entfernt abgelaufene temporäre Rollen."""
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    try:
+                        temp_roles = await self.config.guild(guild).temp_roles() or {}
+                        changed = False
+                        for eid, data in list(temp_roles.items()):
+                            if _now_ts() >= data.get("expires_ts", 0):
+                                # Abgelaufen — Rolle entfernen
+                                member = guild.get_member(data.get("user_id", 0))
+                                role = guild.get_role(data.get("role_id", 0))
+                                if member and role and role in member.roles:
+                                    try:
+                                        await member.remove_roles(role, reason="Temp-Role abgelaufen (automatisch)")
+                                        # Modlog
+                                        log_embed = discord.Embed(
+                                            title="⏰ Temp-Role abgelaufen",
+                                            description=f"**User:** {member.mention}\n**Rolle:** {role.mention}\nDie temporäre Rolle ist abgelaufen und wurde automatisch entfernt.",
+                                            color=discord.Color.dark_grey(),
+                                            timestamp=_now(),
+                                        )
+                                        log_embed.set_thumbnail(url=member.display_avatar.url)
+                                        await self._modlog_send(guild, "mod_action", log_embed)
+                                    except (discord.Forbidden, discord.HTTPException):
+                                        pass
+                                del temp_roles[eid]
+                                changed = True
+                        if changed:
+                            await self.config.guild(guild).temp_roles.set(temp_roles)
+                    except Exception:
+                        pass
+            except Exception:
+                log.exception("Fehler in Temp-Role Check Loop")
+            await asyncio.sleep(60)  # jede Minute prüfen
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Behandelt Star-Reactions für Team-Bewertungen."""
+        if payload.user_id == self.bot.user.id:
+            return
+        if str(payload.emoji) != "⭐":
+            return
+        # Prüfen ob es eine pending_rating Nachricht ist
+        guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
+        if not guild:
+            # DM — Bewertungen sind per DM
+            pass
+        # Pending-Ratings durchsuchen (alle Guilds)
+        for g in self.bot.guilds:
+            pending = await self.config.guild(g).pending_ratings() or {}
+            if str(payload.message_id) in pending:
+                data = pending[str(payload.message_id)]
+                # Anzahl der ⭐ Reactions zählen = Bewertung
+                rating = payload.event_type  # nicht verfügbar
+                # Wir nehmen die aktuelle Reaction-Anzahl als Bewertung
+                # Da der User 1-5 Sterne geben kann (durch mehrfaches Reagieren),
+                # nutzen wir stattdessen die Position: 1. Star = 1, 2. Star = 2, etc.
+                # Einfacher: wir fragen die Nachricht ab und zählen die Reactions
+                try:
+                    user = self.bot.get_user(payload.user_id)
+                    if not user:
+                        return
+                    channel = self.bot.get_channel(payload.channel_id)
+                    if not channel:
+                        return
+                    msg = await channel.fetch_message(payload.message_id)
+                    star_count = 0
+                    for reaction in msg.reactions:
+                        if str(reaction.emoji) == "⭐":
+                            star_count = reaction.count - 1  # Bot-Reaction abziehen
+                            break
+                    rating = min(5, max(1, star_count))
+                    # Bewertung speichern
+                    await self._record_rating(g, data.get("teamler_id", 0), data.get("user_id", 0), rating, data.get("ticket_channel", ""))
+                    # DM bearbeiten
+                    embed = discord.Embed(
+                        title="⭐ Bewertung gespeichert",
+                        description=f"Danke für deine Bewertung!\n**{rating}/5 ⭐** wurde gespeichert.",
+                        color=discord.Color.green(),
+                        timestamp=_now(),
+                    )
+                    try:
+                        await msg.edit(embed=embed)
+                        await msg.clear_reactions()
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    # Pending-Eintrag entfernen
+                    del pending[str(payload.message_id)]
+                    await self.config.guild(g).pending_ratings.set(pending)
+                except Exception:
+                    log.exception("Fehler bei Star-Bewertung")
+                return
 
 
 class DutyButtonView(discord.ui.View):
