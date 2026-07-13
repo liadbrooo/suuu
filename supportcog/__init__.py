@@ -293,6 +293,10 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "ticket_survey_enabled": False,  # Auto-Survey nach Schließung
             "ticket_survey_channel": None,  # Channel für Survey-Ergebnisse
             "ticket_survey_results": {},  # {ticket_num: {user_id, rating, ts}}
+            "ticket_closed_data": {},  # {ticket_num: {user_id, category, subject, channel_name, closed_ts, closed_by, reopenable_until}} — for reopen/merge
+            "ticket_flow_data": [],  # [{date, opened, closed}] — daily flow tracking
+            "ticket_survey_panel_channel": None,  # auto-updating survey results panel
+            "ticket_survey_panel_message": None,
             # CUSTOM EMBED SYSTEM
             "custom_embeds": {},  # {embed_key: {...}}
             # EXTENDED MODLOG
@@ -7153,17 +7157,32 @@ class SupportCog(DashboardIntegration, commands.Cog):
         if await self._modlog_is_ignored(message.guild, message.channel.id):
             return
         try:
+            # Kurz warten damit Discord den Audit-Log-Eintrag erstellen kann
+            await asyncio.sleep(3)
             # Audit Log: Wer hat die Nachricht gelöscht?
             deleter = None
+            audit_entries_found = 0
             try:
-                async for entry in message.guild.audit_logs(limit=5, action=discord.AuditLogAction.message_delete):
+                async for entry in message.guild.audit_logs(limit=10, action=discord.AuditLogAction.message_delete):
+                    audit_entries_found += 1
+                    log.debug("Audit-Log message_delete entry: target=%s, user=%s, created_at=%s, extra=%s",
+                              entry.target.id if entry.target else None,
+                              entry.user.id if entry.user else None,
+                              entry.created_at,
+                              entry.extra)
                     if entry.target and entry.target.id == message.author.id:
-                        if entry.extra and hasattr(entry.extra, 'id') and entry.extra.id == message.channel.id:
-                            if _now_ts() - int(entry.created_at.timestamp()) < 30:
-                                deleter = entry.user
-                                break
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+                        if _now_ts() - int(entry.created_at.timestamp()) < 60:
+                            deleter = entry.user
+                            log.info("Modlog: Audit-Log gefunden — Nachricht von %s gelöscht durch %s",
+                                     message.author, deleter)
+                            break
+            except discord.Forbidden:
+                log.warning("Modlog: Bot hat keine Audit-Log-Berechtigung (View Audit Log) — kann Löscher nicht ermitteln")
+            except discord.HTTPException:
+                log.exception("Modlog: HTTP-Fehler beim Audit-Log-Lookup")
+            if deleter is None:
+                log.info("Modlog: Kein Audit-Log-Eintrag gefunden für gelöschte Nachricht von %s (entries_found=%d)",
+                         message.author, audit_entries_found)
             embed = discord.Embed(
                 title="🗑️ Nachricht gelöscht",
                 description=f"**Channel:** {message.channel.mention}\n**Autor:** {message.author.mention} (`{message.author.id}`)",
@@ -7173,6 +7192,8 @@ class SupportCog(DashboardIntegration, commands.Cog):
             embed.set_thumbnail(url=message.author.display_avatar.url)
             if deleter:
                 embed.add_field(name="👮 Gelöscht von", value=f"{deleter.mention} (`{deleter.id}`)", inline=True)
+            else:
+                embed.add_field(name="👮 Gelöscht von", value="Unbekannt (Author selbst gelöscht oder keine Audit-Log-Rechte)", inline=True)
             embed.add_field(name="Inhalt", value=(message.content or "(kein Text)")[:1024], inline=False)
             if message.attachments:
                 attach_text = ""
@@ -17810,6 +17831,484 @@ class SupportCog(DashboardIntegration, commands.Cog):
                 log.exception("Fehler in Temp-Role Check Loop")
             await asyncio.sleep(60)  # jede Minute prüfen
 
+    # ============================================
+    # HELP-MENU (interaktives Hilfemenü)
+    # ============================================
+
+    @commands.command(name="helpmenu", aliases=["hilfemenue", "hilfe", "helpcenter"])
+    @commands.guild_only()
+    async def help_menu_cmd(self, ctx: commands.Context):
+        """Zeigt ein interaktives Hilfemenü mit Dropdown."""
+        embed = discord.Embed(
+            title="🆘 Help-Center",
+            description="Wähle unten ein Thema aus dem Dropdown-Menü um Hilfe zu erhalten.",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        view = HelpMenuView(self, ctx.guild)
+        await ctx.send(embed=embed, view=view)
+
+    # ============================================
+    # TICKET-FLOW-DIAGRAMM
+    # ============================================
+
+    @commands.command(name="ticketflow", aliases=["ticketdiagramm", "ticketstats_flow"])
+    @commands.guild_only()
+    async def ticket_flow_cmd(self, ctx: commands.Context, days: int = 14):
+        """Zeigt ein Ticket-Flow-Diagramm (geöffnet vs geschlossen) der letzten X Tage."""
+        if days < 1 or days > 90:
+            await ctx.send("❌ 1-90 Tage.")
+            return
+        flow_data = await self.config.guild(ctx.guild).ticket_flow_data() or []
+        if len(flow_data) < 2:
+            await ctx.send("ℹ️ Noch nicht genug Daten. Das System sammelt täglich Daten.")
+            return
+        recent = flow_data[-days:]
+        max_val = max(max(d.get("opened", 0), d.get("closed", 0)) for d in recent) if recent else 1
+        max_val = max(max_val, 1)
+        embed = discord.Embed(
+            title=f"📊 Ticket-Flow (letzte {len(recent)} Tage)",
+            description=f"📈 Geöffnet: **{sum(d.get('opened', 0) for d in recent)}** • 📉 Geschlossen: **{sum(d.get('closed', 0) for d in recent)}**",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        chart = ""
+        for d in recent:
+            opened = d.get("opened", 0)
+            closed = d.get("closed", 0)
+            bar_open = "█" * int((opened / max_val) * 10) if opened > 0 else ""
+            bar_close = "█" * int((closed / max_val) * 10) if closed > 0 else ""
+            chart += f"`{d.get('date', '?')[:5]}` 🟢{bar_open}({opened}) 🔴{bar_close}({closed})\n"
+        embed.add_field(name="📊 Flow (🟢=Geöffnet / 🔴=Geschlossen)", value=chart[:1024], inline=False)
+        await ctx.send(embed=embed)
+
+    async def _ticket_flow_track(self, guild: discord.Guild, opened: int = 0, closed: int = 0):
+        """Aktualisiert die tägliche Ticket-Flow-Statistik."""
+        flow_data = await self.config.guild(guild).ticket_flow_data() or []
+        today = _fmt_berlin_date(_now())
+        if flow_data and flow_data[-1].get("date") == today:
+            flow_data[-1]["opened"] = flow_data[-1].get("opened", 0) + opened
+            flow_data[-1]["closed"] = flow_data[-1].get("closed", 0) + closed
+        else:
+            flow_data.append({"date": today, "opened": opened, "closed": closed, "ts": _now_ts()})
+        flow_data = flow_data[-90:]
+        await self.config.guild(guild).ticket_flow_data.set(flow_data)
+
+    # ============================================
+    # TICKET-SURVEY-RESULTS PANEL (auto-aktualisierend)
+    # ============================================
+
+    @commands.group(name="ticketsurvey", aliases=["tssurvey"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def ticket_survey_panel_set(self, ctx: commands.Context):
+        """Verwaltet das auto-aktualisierende Survey-Ergebnis-Panel."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @ticket_survey_panel_set.command(name="create", aliases=["erstellen"])
+    async def tsp_create(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Erstellt das auto-aktualisierende Survey-Ergebnis-Panel."""
+        if channel is None:
+            channel = ctx.channel
+        embed = await self._build_survey_results_embed(ctx.guild)
+        try:
+            msg = await channel.send(embed=embed)
+            await self.config.guild(ctx.guild).ticket_survey_panel_channel.set(channel.id)
+            await self.config.guild(ctx.guild).ticket_survey_panel_message.set(msg.id)
+            await ctx.send(f"✅ Survey-Panel erstellt in {channel.mention}.")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+
+    @ticket_survey_panel_set.command(name="remove", aliases=["entfernen"])
+    async def tsp_remove(self, ctx: commands.Context):
+        """Entfernt das Survey-Panel."""
+        ch_id = await self.config.guild(ctx.guild).ticket_survey_panel_channel()
+        msg_id = await self.config.guild(ctx.guild).ticket_survey_panel_message()
+        if ch_id and msg_id:
+            ch = ctx.guild.get_channel(ch_id)
+            if ch:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        await self.config.guild(ctx.guild).ticket_survey_panel_channel.set(None)
+        await self.config.guild(ctx.guild).ticket_survey_panel_message.set(None)
+        await ctx.send("✅ Survey-Panel entfernt.")
+
+    @ticket_survey_panel_set.command(name="show", aliases=["anzeigen"])
+    async def tsp_show(self, ctx: commands.Context):
+        """Zeigt die Survey-Ergebnisse einmalig."""
+        embed = await self._build_survey_results_embed(ctx.guild)
+        await ctx.send(embed=embed)
+
+    async def _build_survey_results_embed(self, guild: discord.Guild) -> discord.Embed:
+        """Baut das Survey-Ergebnis-Embed."""
+        results = await self.config.guild(guild).ticket_survey_results() or {}
+        if not results:
+            return discord.Embed(
+                title="⭐ Ticket-Bewertungen",
+                description="Noch keine Bewertungen vorhanden.\n_Aktiviere Surveys mit `[p]ticketset survey toggle`_",
+                color=discord.Color.dark_grey(),
+                timestamp=_now(),
+            )
+        total_ratings = len(results)
+        rating_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        total_score = 0
+        for data in results.values():
+            r = data.get("rating", 0)
+            if r in rating_counts:
+                rating_counts[r] += 1
+                total_score += r
+        avg = total_score / total_ratings if total_ratings > 0 else 0
+        embed = discord.Embed(
+            title="⭐ Ticket-Bewertungen (Live)",
+            description=f"**{total_ratings}** Bewertungen • **Ø {avg:.1f}/5 ⭐**\n_Auto-Update • {_fmt_berlin_full(_now())} (MEZ/MESZ)_",
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        # Verteilung als Balken
+        dist_text = ""
+        for star in range(5, 0, -1):
+            count = rating_counts[star]
+            pct = (count / total_ratings * 100) if total_ratings > 0 else 0
+            bar_len = int(pct / 10)
+            bar = "█" * bar_len + "░" * (10 - bar_len)
+            dist_text += f"{'⭐' * star} {bar} {count} ({pct:.0f}%)\n"
+        embed.add_field(name="📊 Verteilung", value=dist_text, inline=False)
+        # Letzte 5 Bewertungen
+        recent = sorted(results.items(), key=lambda x: x[1].get("ts", 0), reverse=True)[:5]
+        if recent:
+            recent_text = ""
+            for ticket_num, data in recent:
+                rating = data.get("rating", 0)
+                stars = "⭐" * rating + "☆" * (5 - rating)
+                recent_text += f"Ticket #{ticket_num}: {stars}\n"
+            embed.add_field(name="📅 Letzte Bewertungen", value=recent_text, inline=False)
+        embed.set_footer(text=f"{total_ratings} Bewertungen gesamt • SupportCog")
+        return embed
+
+    async def _update_survey_panel(self, guild: discord.Guild):
+        """Aktualisiert das Survey-Panel falls konfiguriert."""
+        ch_id = await self.config.guild(guild).ticket_survey_panel_channel()
+        msg_id = await self.config.guild(guild).ticket_survey_panel_message()
+        if not (ch_id and msg_id):
+            return
+        channel = guild.get_channel(ch_id)
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(msg_id)
+            embed = await self._build_survey_results_embed(guild)
+            await msg.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    # ============================================
+    # TICKET-REOPEN (geschlossene Tickets wieder öffnen)
+    # ============================================
+
+    @commands.command(name="ticketreopen", aliases=["treopen", "reopen"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def ticket_reopen_cmd(self, ctx: commands.Context, ticket_num: str):
+        """Öffnet ein geschlossenes Ticket erneut (innerhalb von 24h)."""
+        closed_data = await self.config.guild(ctx.guild).ticket_closed_data() or {}
+        if ticket_num not in closed_data:
+            await ctx.send(f"❌ Ticket #{ticket_num} nicht gefunden oder nicht mehr reopenable.")
+            return
+        data = closed_data[ticket_num]
+        # Prüfen ob noch reopenable
+        reopenable_until = data.get("reopenable_until", 0)
+        if _now_ts() > reopenable_until:
+            await ctx.send(f"❌ Ticket #{ticket_num} kann nicht mehr reopened werden (24h überschritten).")
+            return
+        user_id = data.get("user_id")
+        category_key = data.get("category")
+        subject = data.get("subject", "Reopened Ticket")
+        # User finden
+        member = ctx.guild.get_member(user_id)
+        if not member:
+            await ctx.send(f"❌ User (ID: {user_id}) ist nicht mehr auf dem Server.")
+            return
+        # Kategorie finden
+        categories = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if category_key and category_key in categories:
+            cat_config = categories[category_key]
+            cat_key = category_key
+        else:
+            cat_config = None
+            cat_key = None
+        # Neuen Channel erstellen
+        counter = await self.config.guild(ctx.guild).ticket_counter() or 0
+        counter += 1
+        username_clean = re.sub(r'[^a-zA-Z0-9-]', '', member.display_name.lower()[:20]) or "user"
+        if cat_key:
+            channel_name = f"{cat_key}-{username_clean}"[:100]
+        else:
+            channel_name = f"ticket-{username_clean}"[:100]
+        # Category bestimmen
+        if cat_config and cat_config.get("category_id"):
+            discord_cat = ctx.guild.get_channel(cat_config["category_id"])
+        else:
+            ticket_cat_id = await self.config.guild(ctx.guild).ticket_category()
+            discord_cat = ctx.guild.get_channel(ticket_cat_id) if ticket_cat_id else None
+        # Support Role
+        if cat_config and cat_config.get("support_role_id"):
+            support_role_id = cat_config["support_role_id"]
+        else:
+            support_role_id = await self.config.guild(ctx.guild).ticket_support_role()
+        support_role = ctx.guild.get_role(support_role_id) if support_role_id else None
+        # Channel erstellen
+        overwrites = {
+            ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True),
+            ctx.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True, embed_links=True, attach_files=True),
+        }
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, embed_links=True, attach_files=True)
+        try:
+            channel = await ctx.guild.create_text_channel(
+                channel_name,
+                category=discord_cat if isinstance(discord_cat, discord.CategoryChannel) else None,
+                overwrites=overwrites,
+                topic=f"Ticket #{counter} • Category: {cat_key or 'general'} • User: {member.id} • Betreff: {subject[:200]} • Created: {_now_ts()} • REOPENED from #{ticket_num}",
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Channel konnte nicht erstellt werden: `{e}`")
+            return
+        await self.config.guild(ctx.guild).ticket_counter.set(counter)
+        # Active registrieren
+        active = await self.config.guild(ctx.guild).ticket_active() or {}
+        key = str(member.id)
+        if key not in active:
+            active[key] = []
+        active[key].append(channel.id)
+        await self.config.guild(ctx.guild).ticket_active.set(active)
+        # Flow tracken
+        await self._ticket_flow_track(ctx.guild, opened=1)
+        # Welcome Embed
+        embed = discord.Embed(
+            title=f"🔄 Ticket #{counter} (Reopened from #{ticket_num})",
+            description=f"**Betreff:** {subject}\n**Ersteller:** {member.mention}\n**Kategorie:** {cat_config.get('name', cat_key) if cat_config else 'Allgemein'}\n\nDieses Ticket wurde aus Ticket #{ticket_num} wiedereröffnet.",
+            color=discord.Color.orange(),
+            timestamp=_now(),
+        )
+        embed.add_field(name="📋 Original-Ticket", value=f"Ticket #{ticket_num} wurde am {_fmt_berlin_full(_from_ts(data.get('closed_ts', 0)))} geschlossen.", inline=False)
+        embed.set_footer(text=f"Ticket #{counter} • Reopened by {ctx.author.display_name}")
+        view = TicketControlView(self, claim_enabled=await self.config.guild(ctx.guild).ticket_claim_enabled())
+        await channel.send(content=f"{member.mention} {support_role.mention if support_role else ''}", embed=embed, view=view, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        # Log
+        log_channel_id = await self.config.guild(ctx.guild).ticket_log_channel()
+        if log_channel_id:
+            log_ch = ctx.guild.get_channel(log_channel_id)
+            if log_ch:
+                log_embed = discord.Embed(
+                    title="🔄 Ticket Reopened",
+                    description=f"Ticket #{ticket_num} → #{counter}\n**User:** {member.mention}\n**Reopened by:** {ctx.author.mention}",
+                    color=discord.Color.orange(),
+                    timestamp=_now(),
+                )
+                await log_ch.send(embed=log_embed)
+        # Closed-Data Eintrag entfernen
+        del closed_data[ticket_num]
+        await self.config.guild(ctx.guild).ticket_closed_data.set(closed_data)
+        await ctx.send(f"✅ Ticket #{ticket_num} wurde als neues Ticket #{counter} reopened: {channel.mention}")
+
+    # ============================================
+    # TICKET-MERGE (zwei Tickets zusammenführen)
+    # ============================================
+
+    @commands.command(name="ticketmerge", aliases=["tmerge", "mergeticket"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def ticket_merge_cmd(self, ctx: commands.Context, source_ticket: discord.TextChannel, target_ticket: discord.TextChannel):
+        """Führt zwei Tickets zusammen. Das Source-Ticket wird geschlossen, Inhalt ins Target verschoben.
+        Beispiel: [p]ticketmerge #ticket-source #ticket-target"""
+        if source_ticket.id == target_ticket.id:
+            await ctx.send("❌ Source und Target sind dasselbe Ticket.")
+            return
+        if not (source_ticket.name.startswith("ticket-") or self._is_ticket_channel(source_ticket)):
+            await ctx.send("❌ Source-Channel ist kein Ticket.")
+            return
+        if not (target_ticket.name.startswith("ticket-") or self._is_ticket_channel(target_ticket)):
+            await ctx.send("❌ Target-Channel ist kein Ticket.")
+            return
+        # Source-Ticket Creator finden
+        source_creator_id = self._ticket_get_creator(source_ticket)
+        target_creator_id = self._ticket_get_creator(target_ticket)
+        if source_creator_id != target_creator_id:
+            await ctx.send(f"⚠️ Die Tickets gehören zu verschiedenen Usern (Source: `{source_creator_id}`, Target: `{target_creator_id}`). Merge trotzdem fortsetzen? Verwende `[p]ticketmerge --force ...` um zu bestätigen.")
+            # Für jetzt: trotzdem mergen, aber warnen
+        # Transcript vom Source-Ticket erstellen
+        try:
+            source_messages = []
+            async for msg in source_ticket.history(limit=500, oldest_first=True):
+                source_messages.append(msg)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Source-Ticket nicht lesen: `{e}`")
+            return
+        # Im Target-Ticket eine Merge-Nachricht posten
+        merge_embed = discord.Embed(
+            title="🔀 Ticket gemerged",
+            description=f"Ticket {source_ticket.mention} wurde in dieses Ticket gemerged.\n**{len(source_messages)}** Nachrichten wurden übertragen.",
+            color=discord.Color.purple(),
+            timestamp=_now(),
+        )
+        merge_embed.add_field(name="Source-Ticket", value=source_ticket.name, inline=True)
+        merge_embed.add_field(name="Merge durch", value=ctx.author.mention, inline=True)
+        await target_ticket.send(embed=merge_embed)
+        # Nachrichten als Text-Block posten
+        msg_text = ""
+        for msg in source_messages:
+            if msg.content or msg.attachments:
+                timestamp_str = msg.created_at.strftime("%d.%m.%Y %H:%M")
+                author_name = msg.author.display_name if isinstance(msg.author, discord.Member) else str(msg.author)
+                content = msg.content or "(Anhang)"
+                msg_text += f"**[{timestamp_str}] {author_name}:** {content}\n"
+                if len(msg_text) > 1800:
+                    await target_ticket.send(msg_text[:2000])
+                    msg_text = ""
+        if msg_text:
+            await target_ticket.send(msg_text[:2000])
+        # Source-Ticket schließen mit Merge-Notiz
+        close_embed = discord.Embed(
+            title="🔀 Ticket geschlossen (Merged)",
+            description=f"Dieses Ticket wurde in {target_ticket.mention} gemerged.\n**Merge durch:** {ctx.author.mention}",
+            color=discord.Color.purple(),
+            timestamp=_now(),
+        )
+        try:
+            await source_ticket.send(embed=close_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Source-Ticket State cleanup
+        active = await self.config.guild(ctx.guild).ticket_active() or {}
+        for uid, channels in active.items():
+            if source_ticket.id in channels:
+                channels.remove(source_ticket.id)
+                if not channels:
+                    del active[uid]
+                break
+        await self.config.guild(ctx.guild).ticket_active.set(active)
+        # Claims cleanup
+        claims = await self.config.guild(ctx.guild).ticket_claims() or {}
+        if str(source_ticket.id) in claims:
+            del claims[str(source_ticket.id)]
+            await self.config.guild(ctx.guild).ticket_claims.set(claims)
+        # Flow tracken
+        await self._ticket_flow_track(ctx.guild, closed=1)
+        # Source Channel löschen (nach kurzer Wartezeit)
+        await asyncio.sleep(5)
+        try:
+            await source_ticket.delete(reason=f"Ticket merged into #{target_ticket.name} by {ctx.author}")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await ctx.send(f"✅ Ticket {source_ticket.name} wurde in {target_ticket.mention} gemerged und geschlossen.")
+
+    # ============================================
+    # TICKET-OPEN-FOR (Team öffnet Ticket für eine Person)
+    # ============================================
+
+    @commands.command(name="ticketopenfor", aliases=["topenfor", "openfor", "ticketfor"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def ticket_open_for_cmd(self, ctx: commands.Context, member: discord.Member, *, category_or_subject: str = ""):
+        """Öffnet ein Ticket für eine andere Person.
+        Beispiel: [p]ticketopenfor @User support
+        oder: [p]ticketopenfor @User support Das ist ein Test-Ticket"""
+        # Versuchen: erstes Wort = Kategorie, Rest = Subject
+        parts = category_or_subject.strip().split(" ", 1) if category_or_subject else []
+        cat_key = parts[0].lower() if parts else None
+        subject = parts[1] if len(parts) > 1 else "Von Team geöffnet"
+        # Prüfen ob Kategorie existiert
+        categories = await self.config.guild(ctx.guild).ticket_categories() or {}
+        if cat_key and cat_key in categories:
+            cat_config = categories[cat_key]
+        elif categories and len(categories) == 1:
+            # Wenn nur eine Kategorie: diese verwenden
+            cat_key = list(categories.keys())[0]
+            cat_config = categories[cat_key]
+        else:
+            cat_key = None
+            cat_config = None
+            subject = category_or_subject or "Von Team geöffnet"
+        # Max-Open-Check überspringen (Team öffnet)
+        counter = await self.config.guild(ctx.guild).ticket_counter() or 0
+        counter += 1
+        username_clean = re.sub(r'[^a-zA-Z0-9-]', '', member.display_name.lower()[:20]) or "user"
+        if cat_key:
+            channel_name = f"{cat_key}-{username_clean}"[:100]
+        else:
+            channel_name = f"ticket-{username_clean}"[:100]
+        # Category
+        if cat_config and cat_config.get("category_id"):
+            discord_cat = ctx.guild.get_channel(cat_config["category_id"])
+        else:
+            ticket_cat_id = await self.config.guild(ctx.guild).ticket_category()
+            discord_cat = ctx.guild.get_channel(ticket_cat_id) if ticket_cat_id else None
+        # Support Role
+        if cat_config and cat_config.get("support_role_id"):
+            support_role_id = cat_config["support_role_id"]
+        else:
+            support_role_id = await self.config.guild(ctx.guild).ticket_support_role()
+        support_role = ctx.guild.get_role(support_role_id) if support_role_id else None
+        # Overwrites
+        overwrites = {
+            ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True),
+            ctx.author: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
+            ctx.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True, embed_links=True, attach_files=True),
+        }
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, embed_links=True, attach_files=True)
+        try:
+            channel = await ctx.guild.create_text_channel(
+                channel_name,
+                category=discord_cat if isinstance(discord_cat, discord.CategoryChannel) else None,
+                overwrites=overwrites,
+                topic=f"Ticket #{counter} • Category: {cat_key or 'general'} • User: {member.id} • Betreff: {subject[:200]} • Created: {_now_ts()} • Opened by: {ctx.author.id}",
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Channel konnte nicht erstellt werden: `{e}`")
+            return
+        await self.config.guild(ctx.guild).ticket_counter.set(counter)
+        # Active registrieren
+        active = await self.config.guild(ctx.guild).ticket_active() or {}
+        key = str(member.id)
+        if key not in active:
+            active[key] = []
+        active[key].append(channel.id)
+        await self.config.guild(ctx.guild).ticket_active.set(active)
+        # Flow tracken
+        await self._ticket_flow_track(ctx.guild, opened=1)
+        # Welcome Embed
+        cat_name = cat_config.get("name", cat_key) if cat_config else "Allgemein"
+        cat_emoji = cat_config.get("emoji", "🎫") if cat_config else "🎫"
+        embed = discord.Embed(
+            title=f"{cat_emoji} Ticket #{counter} — {cat_name}",
+            description=f"**Betreff:** {subject}\n**Ersteller:** {member.mention}\n**Geöffnet von:** {ctx.author.mention}\n\n{cat_config.get('welcome_message', 'Ein Teammitglied wird sich gleich um dein Anliegen kümmern.') if cat_config else 'Ein Teammitglied wird sich gleich um dein Anliegen kümmern.'}",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text=f"Ticket #{counter} • Opened by Team")
+        view = TicketControlView(self, claim_enabled=await self.config.guild(ctx.guild).ticket_claim_enabled())
+        await channel.send(content=f"{member.mention} {support_role.mention if support_role else ''}", embed=embed, view=view, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        # Log
+        log_channel_id = await self.config.guild(ctx.guild).ticket_log_channel()
+        if log_channel_id:
+            log_ch = ctx.guild.get_channel(log_channel_id)
+            if log_ch:
+                log_embed = discord.Embed(
+                    title="🎫 Ticket für User geöffnet",
+                    description=f"**Ticket:** {channel.mention}\n**Für:** {member.mention}\n**Geöffnet von:** {ctx.author.mention}\n**Kategorie:** {cat_name}\n**Betreff:** {subject}",
+                    color=discord.Color.green(),
+                    timestamp=_now(),
+                )
+                await log_ch.send(embed=log_embed)
+        await ctx.send(f"✅ Ticket für {member.mention} geöffnet: {channel.mention}")
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         """Behandelt Star-Reactions für Team-Bewertungen."""
@@ -21917,6 +22416,130 @@ class TeamAbmeldungModal(discord.ui.Modal):
                 await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
         except discord.HTTPException:
             pass
+
+
+# ============================================
+# HELP-MENU VIEW (Dropdown für interaktives Help-Center)
+# ============================================
+
+class HelpMenuView(discord.ui.View):
+    """Dropdown-Menü für das Help-Center."""
+
+    def __init__(self, cog, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+
+        options = [
+            discord.SelectOption(label="🎫 Tickets", value="tickets", description="Wie erstelle/schließe ich ein Ticket?", emoji="🎫"),
+            discord.SelectOption(label="🔨 Moderation", value="moderation", description="Ban/Kick/Timeout/Warn Befehle", emoji="🔨"),
+            discord.SelectOption(label="👥 Team-Management", value="team", description="Duty, Bewerbungen, Abmeldungen", emoji="👥"),
+            discord.SelectOption(label="📋 Support & Whitelist", value="support", description="Support-Warteraum & Whitelist-System", emoji="📋"),
+            discord.SelectOption(label="📊 Stats & Insights", value="stats", description="Server-Statistiken & Insights", emoji="📊"),
+            discord.SelectOption(label="🎮 Fun & Utility", value="fun", description="Giveaways, Polls, Snippets", emoji="🎮"),
+        ]
+        self.select = discord.ui.Select(placeholder="Wähle ein Thema...", options=options, min_values=1, max_values=1)
+        self.add_item(self.select)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.select.values[0]
+        embed = None
+        if value == "tickets":
+            embed = discord.Embed(title="🎫 Ticket-System Hilfe", color=discord.Color.blurple(), timestamp=_now())
+            embed.description = (
+                "**Ticket erstellen:** Klicke auf den 'Ticket erstellen' Button im Panel-Channel\n\n"
+                "**Ticket schließen:** Klicke auf 🔒 im Ticket-Channel\n\n"
+                "**Ticket übernehmen:** `[p]sclaim` — zeigt anderen Teamlern dass du zuständig bist\n"
+                "**Ticket abgeben:** `[p]sunclaim`\n\n"
+                "**Priorität setzen:** `[p]ticketpriority <low|normal|high|urgent>`\n"
+                "**Notiz hinzufügen:** `[p]ticketnote <Text>`\n"
+                "**Teammitglied zuweisen:** `[p]ticketassign @User`\n"
+                "**Ticket-Verlauf:** `[p]tickethistory [@User]`\n"
+                "**Auslastung:** `[p]ticketworkload`\n\n"
+                "**Für Team — Ticket öffnen:** `[p]ticketopenfor @User <Kategorie>`\n"
+                "**Ticket reopen:** `[p]ticketreopen <Ticket-Nr>` (innerhalb 24h)\n"
+                "**Ticket merge:** `[p]ticketmerge #source #target`"
+            )
+        elif value == "moderation":
+            embed = discord.Embed(title="🔨 Moderation Hilfe", color=discord.Color.red(), timestamp=_now())
+            embed.description = (
+                "**Ban:** `[p]sban @User [Grund]`\n"
+                "**Kick:** `[p]skick @User [Grund]`\n"
+                "**Timeout:** `[p]stimeout @User <Dauer> [Grund]`\n"
+                "**Untimeout:** `[p]suntimeout @User [Grund]`\n"
+                "**Warn:** `[p]swarn @User <Grund>`\n\n"
+                "**Anonym (DM zeigt 'Server-Team'):**\n"
+                "`[p]ab @User [Grund]` — Fake-Ban\n"
+                "`[p]ak @User [Grund]` — Fake-Kick\n"
+                "`[p]at @User <Dauer> [Grund]` — Fake-Timeout\n"
+                "`[p]aw @User <Grund]` — Fake-Warn\n\n"
+                "**Warns:** `[p]swarns [@User]` • `[p]sunwarn @User <ID>` • `[p]sclearwarns @User`\n"
+                "**Warn-Config:** `[p]swarnset threshold/action/expiry/dm/show`\n\n"
+                "**Clear:** `[p]clearmsgs <Anzahl>` • `[p]clearuser @User <Anzahl>`\n"
+                "**Temp-Role:** `[p]temprole add @User @Rolle <Dauer> [Grund]`\n"
+                "**User-Info:** `[p]memberinfo @User`"
+            )
+        elif value == "team":
+            embed = discord.Embed(title="👥 Team-Management Hilfe", color=discord.Color.green(), timestamp=_now())
+            embed.description = (
+                "**Duty:** Button im Duty-Panel oder `[p]duty start/stop/pause/resume/busy/away`\n"
+                "**Duty-Status:** `[p]duty status`\n\n"
+                "**Bewerbungen:** `[p]teamapp submit` — bewerben\n"
+                "**Abmeldungen:** Button im Abmeldungs-Panel oder `[p]abmeldung`\n\n"
+                "**Team-Status:** `[p]teamstatus` — wer ist abgemeldet, wer nicht\n"
+                "**Wer ist im Duty:** `[p]whosonduty`\n\n"
+                "**Aufgaben:** `[p]aufgabe create/list/done/assign`\n"
+                "**Snippets:** `[p]snippet add/get/list`\n"
+                "**Watchlist:** `[p]watchlist add/remove/list/info`\n"
+                "**Team-Stats:** `[p]teamstats` • `[p]teamactivity`\n\n"
+                "**Trial-Phase:** `[p]trial add/list/promote`\n"
+                "**Team-Bewertungen:** `[p]teamrating show/info`"
+            )
+        elif value == "support":
+            embed = discord.Embed(title="📋 Support & Whitelist Hilfe", color=discord.Color.orange(), timestamp=_now())
+            embed.description = (
+                "**Support-System:**\n"
+                "• Betrete den Support-Warteraum → Team wird benachrichtigt\n"
+                "• 'Support rufen' Button im Panel ruft das Duty-Team\n"
+                "• 'User zu mir holen' Button holt den User in deinen Voice-Channel\n\n"
+                "**Duty-Mode:** `[p]supportset dutymode on/off` — ob Duty-Pflicht besteht\n"
+                "**Warteraum:** `[p]warteraum` — wer wartet gerade\n\n"
+                "**Whitelist-System:**\n"
+                "• Betrete den WL-Warteraum → Handler wird benachrichtigt\n"
+                "• `[p]wlstats` — Whitelist-Statistiken\n"
+                "• `[p]wlwarteraum` — wer wartet in der WL\n"
+                "• `[p]wlwhosonduty` — welche Handler im Duty sind\n\n"
+                "**Anti-Link:** `[p]antilink toggle/mode/action/channel/show`"
+            )
+        elif value == "stats":
+            embed = discord.Embed(title="📊 Stats & Insights Hilfe", color=discord.Color.blurple(), timestamp=_now())
+            embed.description = (
+                "**Server-Stats:** `[p]serverstats` — detaillierte Server-Statistiken\n"
+                "**Insights-Dashboard:** `[p]insights create` — auto-aktualisierendes Panel\n"
+                "**Member-Growth:** `[p]growth` — Wachstum der letzten 14 Tage\n"
+                "**Activity-Heatmap:** `[p]heatmap` — Team-Aktivität nach Stunde/Tag\n"
+                "**Team-Stats:** `[p]teamstats` — Team-Leaderboard\n"
+                "**Ticket-Flow:** `[p]ticketflow [Tage]` — geöffnet vs geschlossen\n"
+                "**Survey-Results:** `[p]ticketsurvey show` — Ticket-Bewertungen\n"
+                "**Activity-Report:** `[p]activityreport` — generiert einen Report\n"
+                "**Cog-Features:** `[p]cogfeatures` — Übersicht aller Funktionen"
+            )
+        elif value == "fun":
+            embed = discord.Embed(title="🎮 Fun & Utility Hilfe", color=discord.Color.gold(), timestamp=_now())
+            embed.description = (
+                "**Giveaway:** `[p]giveaway create <Dauer> <Preis>` • `[p]giveaway list`\n"
+                "**Poll:** `[p]spoll \"Frage?\" Option1 | Option2 | 24h`\n"
+                "**Snippets:** `[p]snippet add <Name> <Text>` • `[p]snippet get <Name>`\n"
+                "**Embed Builder:** `[p]embedbuilder` — Custom Embeds erstellen\n"
+                "**Temp-Role:** `[p]temprole add @User @Rolle <Dauer> [Grund]`\n"
+                "**Abmeldung:** Button im Panel oder `[p]abmeldung`\n\n"
+                "**BanSync:** `[p]syncset` — Cross-Server Sync\n"
+                "**Modlog:** `[p]extmodlog setup` — Setup-Wizard\n"
+                "**Mod-DM:** `[p]moddm show/ban/kick/timeout/warn` — DM-Templates"
+            )
+        if embed:
+            embed.set_footer(text="Help-Center • SupportCog")
+            await interaction.response.edit_message(embed=embed)
 
 
 async def setup(bot: Red):
