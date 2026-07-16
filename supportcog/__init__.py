@@ -22469,116 +22469,368 @@ class HelpMenuView(discord.ui.View):
         self.guild = guild
 
     @discord.ui.select(
-        placeholder="Wähle ein Thema...",
+        placeholder="Wähle ein Thema aus der Liste...",
         min_values=1,
         max_values=1,
         options=[
-            discord.SelectOption(label="Tickets", value="tickets", description="Wie erstelle/schließe ich ein Ticket?", emoji="🎫"),
-            discord.SelectOption(label="Moderation", value="moderation", description="Ban/Kick/Timeout/Warn Befehle", emoji="🔨"),
-            discord.SelectOption(label="Team-Management", value="team", description="Duty, Bewerbungen, Abmeldungen", emoji="👥"),
-            discord.SelectOption(label="Support & Whitelist", value="support", description="Support-Warteraum & Whitelist-System", emoji="📋"),
-            discord.SelectOption(label="Stats & Insights", value="stats", description="Server-Statistiken & Insights", emoji="📊"),
-            discord.SelectOption(label="Fun & Utility", value="fun", description="Giveaways, Polls, Snippets", emoji="🎮"),
+            discord.SelectOption(label="Ticket-System", value="tickets", description="Tickets erstellen, schließen, claimen, mergen", emoji="🎫"),
+            discord.SelectOption(label="Moderation", value="moderation", description="Ban, Kick, Timeout, Warn, Clear, Temp-Role", emoji="🔨"),
+            discord.SelectOption(label="Team-Management", value="team", description="Duty, Bewerbungen, Abmeldungen, Aufgaben", emoji="👥"),
+            discord.SelectOption(label="Support & Whitelist", value="support", description="Warteraum, Duty-Mode, Whitelist-Handler", emoji="📋"),
+            discord.SelectOption(label="BanSync & Anti-Nuke", value="sync", description="Cross-Server Sync, Anti-Link, Anti-Nuke", emoji="🔄"),
+            discord.SelectOption(label="Stats & Insights", value="stats", description="Server-Stats, Growth, Heatmap, Dashboard", emoji="📊"),
+            discord.SelectOption(label="Fun & Utility", value="fun", description="Giveaways, Polls, Embed Builder, Snippets", emoji="🎮"),
+            discord.SelectOption(label="Modlog & Mod-DM", value="modlog", description="Extended Modlog, Mod-DM Templates, Setup", emoji="📜"),
+            discord.SelectOption(label="Server-Verwaltung", value="admin", description="Server-Info, Rollen, Slowmode, Lock", emoji="⚙️"),
+            discord.SelectOption(label="Alle Commands", value="all", description="Übersicht aller Funktionen", emoji="📖"),
         ],
     )
     async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
         value = select.values[0]
-        embed = None
+
         if value == "tickets":
-            embed = discord.Embed(title="🎫 Ticket-System Hilfe", color=discord.Color.blurple(), timestamp=_now())
-            embed.description = (
-                "**Ticket erstellen:** Klicke auf den 'Ticket erstellen' Button im Panel-Channel\n\n"
-                "**Ticket schließen:** Klicke auf 🔒 im Ticket-Channel\n\n"
-                "**Ticket übernehmen:** `[p]sclaim` — zeigt anderen Teamlern dass du zuständig bist\n"
-                "**Ticket abgeben:** `[p]sunclaim`\n\n"
-                "**Priorität setzen:** `[p]ticketpriority <low|normal|high|urgent>`\n"
-                "**Notiz hinzufügen:** `[p]ticketnote <Text>`\n"
-                "**Teammitglied zuweisen:** `[p]ticketassign @User`\n"
-                "**Ticket-Verlauf:** `[p]tickethistory [@User]`\n"
-                "**Auslastung:** `[p]ticketworkload`\n\n"
-                "**Für Team — Ticket öffnen:** `[p]ticketopenfor @User <Kategorie>`\n"
-                "**Ticket reopen:** `[p]ticketreopen <Ticket-Nr>` (innerhalb 24h)\n"
-                "**Ticket merge:** `[p]ticketmerge #source #target`"
-            )
+            embed = discord.Embed(title="🎫 Ticket-System", description="Alles rund um Tickets — erstellen, verwalten, schließen", color=discord.Color.blurple(), timestamp=_now())
+            embed.add_field(name="📝 Ticket erstellen", value=(
+                "• Klicke auf den **'Ticket erstellen'** Button im Panel-Channel\n"
+                "• Wähle eine Kategorie (falls Multi-Panel aktiv)\n"
+                "• Fülle das Formular aus (Betreff + Beschreibung)"
+            ), inline=False)
+            embed.add_field(name="🔒 Ticket schließen", value=(
+                "• Klicke auf **🔒** im Ticket-Channel\n"
+                "• Optional: Grund angeben\n"
+                "• Transcript wird automatisch erstellt"
+            ), inline=False)
+            embed.add_field(name="✋ Ticket übernehmen", value=(
+                "• `[p]sclaim` — Ticket übernehmen (Claim)\n"
+                "• `[p]sunclaim` — Ticket wieder abgeben\n"
+                "• Andere Teamler sehen wer zuständig ist"
+            ), inline=False)
+            embed.add_field(name="📋 Ticket-Verwaltung", value=(
+                "• `[p]ticketpriority <low|normal|high|urgent>` — Priorität setzen\n"
+                "• `[p]ticketnote <Text>` — interne Notiz hinzufügen\n"
+                "• `[p]ticketassign @User` — Teammitglied zuweisen\n"
+                "• `[p]tickethistory [@User]` — Ticket-Verlauf anzeigen\n"
+                "• `[p]ticketworkload` — Team-Auslastung"
+            ), inline=False)
+            embed.add_field(name="🔧 Erweiterte Ticket-Funktionen", value=(
+                "• `[p]ticketopenfor @User <Kategorie>` — Ticket für jemanden öffnen\n"
+                "• `[p]ticketreopen <Ticket-Nr>` — geschlossenes Ticket wieder öffnen (24h)\n"
+                "• `[p]ticketmerge #source #target` — zwei Tickets zusammenführen\n"
+                "• `[p]ticketflow [Tage]` — Ticket-Flow-Diagramm (geöffnet vs geschlossen)\n"
+                "• `[p]ticketsurvey show` — Survey-Ergebnisse anzeigen"
+            ), inline=False)
+            embed.set_footer(text="Ticket-System • SupportCog")
+
         elif value == "moderation":
-            embed = discord.Embed(title="🔨 Moderation Hilfe", color=discord.Color.red(), timestamp=_now())
-            embed.description = (
-                "**Ban:** `[p]sban @User [Grund]`\n"
-                "**Kick:** `[p]skick @User [Grund]`\n"
-                "**Timeout:** `[p]stimeout @User <Dauer> [Grund]`\n"
-                "**Untimeout:** `[p]suntimeout @User [Grund]`\n"
-                "**Warn:** `[p]swarn @User <Grund>`\n\n"
-                "**Anonym (DM zeigt 'Server-Team'):**\n"
-                "`[p]ab @User [Grund]` — Fake-Ban\n"
-                "`[p]ak @User [Grund]` — Fake-Kick\n"
-                "`[p]at @User <Dauer> [Grund]` — Fake-Timeout\n"
-                "`[p]aw @User <Grund]` — Fake-Warn\n\n"
-                "**Warns:** `[p]swarns [@User]` • `[p]sunwarn @User <ID>` • `[p]sclearwarns @User`\n"
-                "**Warn-Config:** `[p]swarnset threshold/action/expiry/dm/show`\n\n"
-                "**Clear:** `[p]clearmsgs <Anzahl>` • `[p]clearuser @User <Anzahl>`\n"
-                "**Temp-Role:** `[p]temprole add @User @Rolle <Dauer> [Grund]`\n"
-                "**User-Info:** `[p]memberinfo @User`"
-            )
+            embed = discord.Embed(title="🔨 Moderation", description="Ban, Kick, Timeout, Warn und mehr", color=discord.Color.red(), timestamp=_now())
+            embed.add_field(name="🔨 Bestrafungen", value=(
+                "• `[p]sban @User [Grund]` — Bannen (+ DM vorher)\n"
+                "• `[p]sunban <User-ID> [Grund]` — Entbannen (+ DM)\n"
+                "• `[p]skick @User [Grund]` — Kicken (+ DM vorher)\n"
+                "• `[p]stimeout @User <Dauer> [Grund]` — Timeout (z.B. 1h, 30m, 2d)\n"
+                "• `[p]suntimeout @User [Grund]` — Timeout aufheben"
+            ), inline=False)
+            embed.add_field(name="⚠️ Warn-System", value=(
+                "• `[p]swarn @User <Grund>` — Verwarnung (+ Auto-Action bei X Warns)\n"
+                "• `[p]swarns [@User]` — Verwarnungen anzeigen\n"
+                "• `[p]sunwarn @User <Warn-ID>` — einzelne Verwarnung entfernen\n"
+                "• `[p]sclearwarns @User` — alle Verwarnungen entfernen\n"
+                "• `[p]swarnset threshold/action/expiry/dm/show` — Konfiguration"
+            ), inline=False)
+            embed.add_field(name="🕵️ Anonyme Mod-Aktionen", value=(
+                "• `[p]ab @User [Grund]` — Fake-Ban (DM zeigt 'Server-Team')\n"
+                "• `[p]ak @User [Grund]` — Fake-Kick\n"
+                "• `[p]at @User <Dauer> [Grund]` — Fake-Timeout\n"
+                "• `[p]aw @User <Grund]` — Fake-Warn"
+            ), inline=False)
+            embed.add_field(name="🧹 Nachrichten & Rollen", value=(
+                "• `[p]clearmsgs <Anzahl>` — Nachrichten löschen (2-100)\n"
+                "• `[p]clearuser @User <Anzahl>` — User-spezifische Nachrichten löschen\n"
+                "• `[p]temprole add @User @Rolle <Dauer> [Grund]` — temporäre Rolle\n"
+                "• `[p]temprole list` — alle aktiven Temp-Rollen\n"
+                "• `[p]temprole remove @User [@Rolle]` — Temp-Rolle entfernen"
+            ), inline=False)
+            embed.add_field(name="👤 User-Info", value=(
+                "• `[p]memberinfo @User` — detaillierte User-Info mit Bestrafungs-Historie\n"
+                "• `[p]cogfeatures` — Übersicht aller Cog-Funktionen"
+            ), inline=False)
+            embed.set_footer(text="Moderation • SupportCog")
+
         elif value == "team":
-            embed = discord.Embed(title="👥 Team-Management Hilfe", color=discord.Color.green(), timestamp=_now())
-            embed.description = (
-                "**Duty:** Button im Duty-Panel oder `[p]duty start/stop/pause/resume/busy/away`\n"
-                "**Duty-Status:** `[p]duty status`\n\n"
-                "**Bewerbungen:** `[p]teamapp submit` — bewerben\n"
-                "**Abmeldungen:** Button im Abmeldungs-Panel oder `[p]abmeldung`\n\n"
-                "**Team-Status:** `[p]teamstatus` — wer ist abgemeldet, wer nicht\n"
-                "**Wer ist im Duty:** `[p]whosonduty`\n\n"
-                "**Aufgaben:** `[p]aufgabe create/list/done/assign`\n"
-                "**Snippets:** `[p]snippet add/get/list`\n"
-                "**Watchlist:** `[p]watchlist add/remove/list/info`\n"
-                "**Team-Stats:** `[p]teamstats` • `[p]teamactivity`\n\n"
-                "**Trial-Phase:** `[p]trial add/list/promote`\n"
-                "**Team-Bewertungen:** `[p]teamrating show/info`"
-            )
+            embed = discord.Embed(title="👥 Team-Management", description="Duty, Bewerbungen, Abmeldungen, Aufgaben und mehr", color=discord.Color.green(), timestamp=_now())
+            embed.add_field(name="🎧 Duty-System", value=(
+                "• Button im Duty-Panel oder:\n"
+                "• `[p]duty start` — Duty beginnen\n"
+                "• `[p]duty stop` — Duty beenden\n"
+                "• `[p]duty pause` / `[p]duty resume` — Pause/Weiter\n"
+                "• `[p]duty busy` / `[p]duty away` — Status setzen\n"
+                "• `[p]duty status` — eigener Duty-Status\n"
+                "• `[p]whosonduty` — alle im Duty anzeigen"
+            ), inline=False)
+            embed.add_field(name="📋 Bewerbungen", value=(
+                "• `[p]teamapp submit` — bewerben (öffnet Modal)\n"
+                "• `[p]teamapp list [pending|accepted|rejected]` — Bewerbungen anzeigen\n"
+                "• `[p]teamapp info <ID>` — Details zu einer Bewerbung\n"
+                "• `[p]teamapp decide <ID> <accept|reject>` — entscheiden\n"
+                "• Buttons im Review-Channel: Annehmen/Ablehnen/Vote/Notiz/Interview"
+            ), inline=False)
+            embed.add_field(name="📝 Abmeldungen", value=(
+                "• Button im Abmeldungs-Panel oder `[p]abmeldung`\n"
+                "• `[p]abmeldungen` — alle Abmeldungen anzeigen\n"
+                "• `[p]abmeldunginfo <ID>` — Details zu einer Abmeldung\n"
+                "• `[p]abmeldungremove <ID>` — Abmeldung löschen\n"
+                "• `[p]teamstatus` — wer ist abgemeldet, wer verfügbar\n"
+                "• `[p]abmeldungset teamrole @Rolle` — Team-Rolle setzen"
+            ), inline=False)
+            embed.add_field(name="📊 Team-Stats", value=(
+                "• `[p]teamstats [all|tickets|warns|tasks|messages]` — Leaderboard\n"
+                "• `[p]teamactivity [@User]` — eigene/andere Aktivität\n"
+                "• `[p]teamactivityreset [@User]` — Aktivität zurücksetzen"
+            ), inline=False)
+            embed.add_field(name="📝 Aufgaben & Snippets", value=(
+                "• `[p]aufgabe create/list/done/assign/priority/due/info` — Aufgaben\n"
+                "• `[p]snippet add/get/list/info/raw/remove` — Text-Snippets"
+            ), inline=False)
+            embed.add_field(name="👁️ Watchlist & Trial", value=(
+                "• `[p]watchlist add/remove/list/info/channel/clear` — User beobachten\n"
+                "• `[p]trial setrole/duration/add/promote/list` — Probemitglied-System"
+            ), inline=False)
+            embed.add_field(name="⭐ Bewertungen", value=(
+                "• `[p]teamrating toggle/channel/show/info/reset` — Team-Bewertungen\n"
+                "• Automatisch nach Ticket-Close (falls aktiviert)"
+            ), inline=False)
+            embed.set_footer(text="Team-Management • SupportCog")
+
         elif value == "support":
-            embed = discord.Embed(title="📋 Support & Whitelist Hilfe", color=discord.Color.orange(), timestamp=_now())
-            embed.description = (
-                "**Support-System:**\n"
+            embed = discord.Embed(title="📋 Support & Whitelist", description="Support-Warteraum und Whitelist-System", color=discord.Color.orange(), timestamp=_now())
+            embed.add_field(name="🎧 Support-System", value=(
                 "• Betrete den Support-Warteraum -> Team wird benachrichtigt\n"
-                "• 'Support rufen' Button im Panel ruft das Duty-Team\n"
-                "• 'User zu mir holen' Button holt den User in deinen Voice-Channel\n\n"
-                "**Duty-Mode:** `[p]supportset dutymode on/off`\n"
-                "**Warteraum:** `[p]warteraum` — wer wartet gerade\n\n"
-                "**Whitelist-System:**\n"
+                "• 'Support rufen' Button ruft das Duty-Team (60s Cooldown)\n"
+                "• 'User zu mir holen' Button holt den User zu dir\n"
+                "• `[p]warteraum` — wer wartet gerade?\n"
+                "• `[p]supportstats` — Support-Statistiken"
+            ), inline=False)
+            embed.add_field(name="⚙️ Support-Konfiguration", value=(
+                "• `[p]supportset channel/room/role/panelchannel` — Basis-Setup\n"
+                "• `[p]supportset dutymode on/off` — Duty-Pflicht an/aus\n"
+                "• `[p]supportset createpanel` — Duty-Panel erstellen\n"
+                "• `[p]supportset escalation <Minuten>` — Auto-Eskalation\n"
+                "• `[p]supportset createcallpanel` — Support-Rufen Panel\n"
+                "• `[p]supportset createfeedbackpanel` — Feedback-Panel"
+            ), inline=False)
+            embed.add_field(name="📋 Whitelist-System", value=(
                 "• Betrete den WL-Warteraum -> Handler wird benachrichtigt\n"
+                "• `[p]whitelistuser @User` — User whitelisten\n"
+                "• `[p]removewhitelist @User` — Whitelist entfernen\n"
                 "• `[p]wlstats` — Whitelist-Statistiken\n"
                 "• `[p]wlwarteraum` — wer wartet in der WL\n"
-                "• `[p]wlwhosonduty` — welche Handler im Duty sind\n\n"
-                "**Anti-Link:** `[p]antilink toggle/mode/action/channel/show`"
-            )
+                "• `[p]wlwhosonduty` — welche Handler im Duty sind\n"
+                "• `[p]wlcheck @User` — Whitelist-Status prüfen"
+            ), inline=False)
+            embed.add_field(name="⚙️ Whitelist-Konfiguration", value=(
+                "• `[p]whitelistset channel/room/role/panelchannel` — Setup\n"
+                "• `[p]whitelistset dutymode on/off` — Duty-Pflicht an/aus\n"
+                "• `[p]whitelistset createpanel` — WL-Duty-Panel\n"
+                "• `[p]whitelistset approvedrole @Rolle` — Rolle für Gewhitelistete\n"
+                "• `[p]whitelistset welcomemessage <Text>` — Willkommensnachricht"
+            ), inline=False)
+            embed.set_footer(text="Support & Whitelist • SupportCog")
+
+        elif value == "sync":
+            embed = discord.Embed(title="🔄 BanSync & Security", description="Cross-Server Synchronisation und Schutz", color=discord.Color.purple(), timestamp=_now())
+            embed.add_field(name="🔄 BanSync (Cross-Server)", value=(
+                "• `[p]syncset` — Sync-Konfiguration\n"
+                "• Synchronisiert: Bans, Unbans, Timeouts, Kicks, Rollen\n"
+                "• `[p]syncset syncnow` — manuell synchronisieren\n"
+                "• `[p]syncset addslave/remove` — Ziel-Server verwalten\n"
+                "• `[p]syncset toggle bans/unbans/timeouts/kicks/roles`"
+            ), inline=False)
+            embed.add_field(name="🔗 Anti-Link System", value=(
+                "• `[p]antilink toggle` — an/aus\n"
+                "• `[p]antilink mode <all|discord|off>` — was blocken?\n"
+                "• `[p]antilink action <delete|warn|timeout>` — Aktion\n"
+                "• `[p]antilink channel add/remove #channel` — Whitelist-Channels\n"
+                "• `[p]antilink role add/remove @Rolle` — Whitelist-Rollen\n"
+                "• `[p]antilink message <Text>` — Warnungs-Nachricht\n"
+                "• `[p]antilink show` — Konfiguration anzeigen"
+            ), inline=False)
+            embed.add_field(name="🛡️ Anti-Nuke", value=(
+                "• Automatische Erkennung von Mass-Bans/Kicks\n"
+                "• `[p]antinukeset threshold/show/reset` — Konfiguration\n"
+                "• Schützt vor kompromittierten Admin-Accounts"
+            ), inline=False)
+            embed.set_footer(text="BanSync & Security • SupportCog")
+
         elif value == "stats":
-            embed = discord.Embed(title="📊 Stats & Insights Hilfe", color=discord.Color.blurple(), timestamp=_now())
-            embed.description = (
-                "**Server-Stats:** `[p]serverstats`\n"
-                "**Insights-Dashboard:** `[p]insights create`\n"
-                "**Member-Growth:** `[p]growth`\n"
-                "**Activity-Heatmap:** `[p]heatmap`\n"
-                "**Team-Stats:** `[p]teamstats`\n"
-                "**Ticket-Flow:** `[p]ticketflow [Tage]`\n"
-                "**Survey-Results:** `[p]ticketsurvey show`\n"
-                "**Activity-Report:** `[p]activityreport`\n"
-                "**Cog-Features:** `[p]cogfeatures`"
-            )
+            embed = discord.Embed(title="📊 Stats & Insights", description="Server-Statistiken, Dashboards und Analytics", color=discord.Color.blurple(), timestamp=_now())
+            embed.add_field(name="📈 Server-Statistiken", value=(
+                "• `[p]serverstats` — detaillierte Server-Stats (Mitglieder, Channels, etc.)\n"
+                "• `[p]growth` — Member-Wachstum der letzten 14 Tage\n"
+                "• `[p]insights create` — auto-aktualisierendes Dashboard (alle 5 Min)\n"
+                "• `[p]insights show` — einmalige Insights-Anzeige\n"
+                "• `[p]insights remove` — Dashboard entfernen"
+            ), inline=False)
+            embed.add_field(name="🔥 Team-Analytics", value=(
+                "• `[p]heatmap` — Activity-Heatmap nach Stunde & Wochentag\n"
+                "• `[p]teamstats` — Team-Leaderboard mit Score\n"
+                "• `[p]teamactivity [@User]` — eigene/andere Aktivität\n"
+                "• `[p]activityreport` — Activity-Report generieren\n"
+                "• `[p]activityreportset toggle/channel/interval/day/hour` — Auto-Report"
+            ), inline=False)
+            embed.add_field(name="🎫 Ticket-Analytics", value=(
+                "• `[p]ticketflow [Tage]` — Ticket-Flow-Diagramm (geöffnet vs geschlossen)\n"
+                "• `[p]ticketsurvey show` — Survey-Ergebnisse\n"
+                "• `[p]ticketsurvey create` — auto-aktualisierendes Survey-Panel\n"
+                "• `[p]ticketworkload` — Team-Auslastung\n"
+                "• `[p]tickethistory [@User]` — Ticket-Verlauf"
+            ), inline=False)
+            embed.add_field(name="📋 WL & Support Stats", value=(
+                "• `[p]wlstats` — Whitelist-Statistiken\n"
+                "• `[p]supportstats` — Support-Statistiken"
+            ), inline=False)
+            embed.set_footer(text="Stats & Insights • SupportCog")
+
         elif value == "fun":
-            embed = discord.Embed(title="🎮 Fun & Utility Hilfe", color=discord.Color.gold(), timestamp=_now())
-            embed.description = (
-                "**Giveaway:** `[p]giveaway create <Dauer> <Preis>` • `[p]giveaway list`\n"
-                "**Poll:** `[p]spoll \"Frage?\" Option1 | Option2 | 24h`\n"
-                "**Snippets:** `[p]snippet add <Name> <Text>` • `[p]snippet get <Name>`\n"
-                "**Embed Builder:** `[p]embedbuilder`\n"
-                "**Temp-Role:** `[p]temprole add @User @Rolle <Dauer> [Grund]`\n"
-                "**Abmeldung:** Button im Panel oder `[p]abmeldung`\n\n"
-                "**BanSync:** `[p]syncset`\n"
-                "**Modlog:** `[p]extmodlog setup`\n"
-                "**Mod-DM:** `[p]moddm show/ban/kick/timeout/warn`"
-            )
+            embed = discord.Embed(title="🎮 Fun & Utility", description="Giveaways, Umfragen, Embeds und mehr", color=discord.Color.gold(), timestamp=_now())
+            embed.add_field(name="🎉 Giveaways", value=(
+                "• `[p]giveaway create <Dauer> <Preis>` — Giveaway starten\n"
+                "• `[p]giveaway list` — alle aktiven Giveaways\n"
+                "• `[p]giveaway end <Message-ID>` — vorzeitig beenden\n"
+                "• Reagiere mit 🎉 um teilzunehmen\n"
+                "• Automatische Gewinnerziehung bei Ablauf"
+            ), inline=False)
+            embed.add_field(name="📊 Umfragen", value=(
+                "• `[p]spoll \"Frage?\" Option1 | Option2 | Option3 | 24h`\n"
+                "• Bis zu 10 Optionen mit Zahlen-Emojis\n"
+                "• Zeitlimit optional (z.B. 24h, 7d)\n"
+                "• Automatische Auswertung mit farbigem Balken-Diagramm\n"
+                "• Gewinner wird verkündet"
+            ), inline=False)
+            embed.add_field(name="📝 Embed Builder", value=(
+                "• `[p]embedbuilder` — interaktiver Embed-Editor\n"
+                "• 3-stufiges Modal: Titel, Beschreibung, Felder\n"
+                "• Farbe, Footer, Thumbnail, Image einstellbar\n"
+                "• Embeds bearbeiten und senden"
+            ), inline=False)
+            embed.add_field(name="💬 Snippets", value=(
+                "• `[p]snippet add <Name> <Text>` — Snippet erstellen\n"
+                "• `[p]snippet get <Name> [@User]` — Snippet abrufen\n"
+                "• `[p]snippet list` — alle Snippets\n"
+                "• `[p]snippet info <Name>` — Details\n"
+                "• `[p]snippet raw <Name>` — Rohtext zum Kopieren\n"
+                "• `[p]snippet edit/remove` — bearbeiten/löschen"
+            ), inline=False)
+            embed.add_field(name="🎭 Temp-Roles", value=(
+                "• `[p]temprole add @User @Rolle <Dauer> [Grund]`\n"
+                "• `[p]temprole list` — alle aktiven Temp-Rollen\n"
+                "• `[p]temprole remove @User [@Rolle]` — vorzeitig entfernen\n"
+                "• Automatische Entfernung bei Ablauf + Modlog"
+            ), inline=False)
+            embed.add_field(name="🆘 Help & Übersicht", value=(
+                "• `[p]helpmenu` — dieses Hilfemenü\n"
+                "• `[p]cogfeatures` — Übersicht aller Funktionen\n"
+                "• `[p]serverstats` — Server-Statistiken"
+            ), inline=False)
+            embed.set_footer(text="Fun & Utility • SupportCog")
+
+        elif value == "modlog":
+            embed = discord.Embed(title="📜 Modlog & Mod-DM", description="Extended Modlog und Mod-DM Templates", color=discord.Color.dark_grey(), timestamp=_now())
+            embed.add_field(name="📜 Extended Modlog", value=(
+                "• `[p]extmodlog toggle` — an/aus\n"
+                "• `[p]extmodlog setup` — interaktiver Setup-Wizard\n"
+                "• `[p]extmodlog channel` — Haupt-Log-Channel\n"
+                "• Separate Channels pro Kategorie:\n"
+                "  `memberchannel` / `punishmentchannel` / `messagechannel`\n"
+                "  `voicechannel` / `rolechannel` / `channelchannel`"
+            ), inline=False)
+            embed.add_field(name="📋 Event-Typen (33+)", value=(
+                "• Member: join, leave, ban, unban, kick, roles, nickname, timeout\n"
+                "• Messages: delete, edit (mit Audit-Log Attribution)\n"
+                "• Channels: create, delete\n"
+                "• Roles: create, delete, update (mit Permission-Diff)\n"
+                "• Voice: join, leave, move, mute, deafen, stream, video\n"
+                "• Guild: update (mit erweitertem Diff)\n"
+                "• Threads: create, delete, update\n"
+                "• Emojis, Invites, Mod-Aktionen, Anti-Link\n"
+                "• `[p]extmodlog event <name>` — einzelnen Event an/aus"
+            ), inline=False)
+            embed.add_field(name="📧 Mod-DM Templates", value=(
+                "• `[p]moddm toggle` — Mod-DMs an/aus\n"
+                "• `[p]moddm ban/kick/timeout/warn <Template>` — Template setzen\n"
+                "• Platzhalter: {user}, {moderator}, {reason}, {server}, {duration}, {date}\n"
+                "• `[p]moddm show` — alle Templates anzeigen\n"
+                "• `[p]moddm reset <action|all>` — auf Standard zurücksetzen"
+            ), inline=False)
+            embed.set_footer(text="Modlog & Mod-DM • SupportCog")
+
+        elif value == "admin":
+            embed = discord.Embed(title="⚙️ Server-Verwaltung", description="Server-Info, Channels, Rollen, Slowmode", color=discord.Color.dark_blue(), timestamp=_now())
+            embed.add_field(name="📊 Server-Info", value=(
+                "• `[p]serverstats` — detaillierte Server-Statistiken\n"
+                "• `[p]insights create` — auto-aktualisierendes Dashboard\n"
+                "• `[p]growth` — Member-Wachstum\n"
+                "• `[p]cogfeatures` — alle Cog-Funktionen"
+            ), inline=False)
+            embed.add_field(name="🔊 Channel-Verwaltung", value=(
+                "• `[p]clearmsgs <Anzahl>` — Nachrichten löschen\n"
+                "• `[p]clearuser @User <Anzahl>` — User-Nachrichten löschen\n"
+                "• Slowmode & Lock (über Dashboard verfügbar)"
+            ), inline=False)
+            embed.add_field(name="🎭 Rollen-Verwaltung", value=(
+                "• `[p]temprole add @User @Rolle <Dauer> [Grund]` — temporäre Rolle\n"
+                "• `[p]temprole list` — alle Temp-Rollen\n"
+                "• `[p]temprole remove @User [@Rolle]` — Temp-Rolle entfernen\n"
+                "• `[p]abmeldungset teamrole @Rolle` — Team-Rolle setzen"
+            ), inline=False)
+            embed.add_field(name="🔧 Cog-Verwaltung", value=(
+                "• `[p]supportset show` — Support-Konfiguration\n"
+                "• `[p]whitelistset show` — Whitelist-Konfiguration\n"
+                "• `[p]extmodlog show` — Modlog-Konfiguration\n"
+                "• `[p]syncset show` — BanSync-Konfiguration\n"
+                "• `[p]moddm show` — Mod-DM Templates\n"
+                "• `[p]activityreportset show` — Report-Konfiguration"
+            ), inline=False)
+            embed.set_footer(text="Server-Verwaltung • SupportCog")
+
+        elif value == "all":
+            embed = discord.Embed(title="📖 Alle Commands", description="Komplette Übersicht aller SupportCog Funktionen", color=discord.Color.blurple(), timestamp=_now())
+            embed.add_field(name="🎫 Tickets", value=(
+                "ticketset • sclaim • sunclaim • ticketpriority • ticketnote\n"
+                "ticketassign • tickethistory • ticketworkload • ticketopenfor\n"
+                "ticketreopen • ticketmerge • ticketflow • ticketsurvey"
+            ), inline=False)
+            embed.add_field(name="🔨 Moderation", value=(
+                "sban • sunban • skick • stimeout • suntimeout • swarn\n"
+                "swarns • sunwarn • sclearwarns • swarnset\n"
+                "ab • ak • at • aw (anonym) • clearmsgs • clearuser\n"
+                "temprole • memberinfo"
+            ), inline=False)
+            embed.add_field(name="👥 Team", value=(
+                "duty • teamapp • abmeldung • abmeldungen • teamstatus\n"
+                "aufgabe • snippet • watchlist • teamstats • teamactivity\n"
+                "trial • teamrating • teamstatuspanel"
+            ), inline=False)
+            embed.add_field(name="📋 Support & WL", value=(
+                "supportset • warteraum • whosonduty • supportstats\n"
+                "whitelistset • whitelistuser • wlstats • wlwarteraum\n"
+                "wlwhosonduty • wlcheck • antilink"
+            ), inline=False)
+            embed.add_field(name="🔄 Sync & Security", value=(
+                "syncset • antinukeset"
+            ), inline=False)
+            embed.add_field(name="📊 Stats", value=(
+                "serverstats • insights • growth • heatmap • activityreport\n"
+                "activityreportset • cogfeatures • helpmenu"
+            ), inline=False)
+            embed.add_field(name="🎮 Fun & Utility", value=(
+                "giveaway • spoll • embedbuilder"
+            ), inline=False)
+            embed.add_field(name="📜 Modlog & DM", value=(
+                "extmodlog • moddm"
+            ), inline=False)
+            embed.set_footer(text="Alle Commands • SupportCog • Verwende [p]help <command> für Details")
+
         if embed:
-            embed.set_footer(text="Help-Center • SupportCog")
             await interaction.response.edit_message(embed=embed)
 
 
