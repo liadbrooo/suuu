@@ -17381,22 +17381,29 @@ class SupportCog(DashboardIntegration, commands.Cog):
             return
         # Zeitlimit berechnen
         end_ts = None
-        duration_text = "Unbegrenzt"
+        duration_text = "∞ Unbegrenzt"
         if duration_str:
             seconds = self._parse_duration(duration_str)
             if seconds:
                 end_ts = _now_ts() + seconds
-                duration_text = f"Endet <t:{end_ts}:R>"
-        # Embed bauen
+                duration_text = f"<t:{end_ts}:R>"
+        # Farben für Optionen
+        bar_colors = ["🟥", "🟧", "🟨", "🟩", "🟦", "🟪", "🟫", "⬛", "⬜", "🔴"]
+        option_emojis = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟']
+        # Embed bauen — modernes Design
+        options_text = ""
+        for i, opt in enumerate(opts):
+            options_text += f"{option_emojis[i]} **{opt}**\n"
         embed = discord.Embed(
-            title="📊 Umfrage",
-            description=f"**{question}**\n\n" + "\n".join(f"{['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'][i]} {opt}" for i, opt in enumerate(opts)),
+            title="📊 UMFRAGE",
+            description=f"## ❓ {question}\n\n{options_text}\n──────────────\n💬 **Reagiere mit den Zahlen-Emojis unten um abzustimmen**",
             color=discord.Color.blurple(),
             timestamp=_now(),
         )
-        embed.add_field(name="⏰ Dauer", value=duration_text, inline=True)
+        embed.add_field(name="⏰ Endet", value=duration_text, inline=True)
         embed.add_field(name="👤 Erstellt von", value=ctx.author.mention, inline=True)
-        embed.set_footer(text="Anonyme Umfrage • SupportCog")
+        embed.add_field(name="🗳️ Status", value="🔴 **Aktiv** — stimme ab!", inline=True)
+        embed.set_footer(text="📊 Anonyme Umfrage • SupportCog • Live-Ergebnisse beim Beenden")
         # Nachricht senden
         try:
             msg = await ctx.send(embed=embed)
@@ -17404,10 +17411,9 @@ class SupportCog(DashboardIntegration, commands.Cog):
             await ctx.send(f"❌ Fehler: `{e}`")
             return
         # Reactions hinzufügen
-        emojis = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟']
         for i in range(len(opts)):
             try:
-                await msg.add_reaction(emojis[i])
+                await msg.add_reaction(option_emojis[i])
             except (discord.Forbidden, discord.HTTPException):
                 break
         # Poll in Config speichern
@@ -17423,7 +17429,7 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "anonymous": True,
         }
         await self.config.guild(ctx.guild).smart_polls.set(polls)
-        await ctx.send("✅ Umfrage erstellt!", delete_after=10)
+        await ctx.send("✅ Umfrage erstellt! Reagiere mit den Zahlen-Emojis um abzustimmen.", delete_after=10)
 
     async def _poll_check_loop(self):
         """Background-Loop: beendet zeitbegrenzte Polls."""
@@ -17445,7 +17451,7 @@ class SupportCog(DashboardIntegration, commands.Cog):
             await asyncio.sleep(60)
 
     async def _end_smart_poll(self, guild: discord.Guild, p_id: str, p_data: dict):
-        """Beendet eine Smart-Poll und zeigt Ergebnisse."""
+        """Beendet eine Smart-Poll und zeigt Ergebnisse mit modernem Diagramm."""
         channel = guild.get_channel(p_data.get("channel_id", 0))
         if not channel:
             return
@@ -17454,23 +17460,55 @@ class SupportCog(DashboardIntegration, commands.Cog):
         except (discord.NotFound, discord.HTTPException):
             return
         emojis = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟']
-        results = ""
+        bar_blocks = ["🟥", "🟧", "🟨", "🟩", "🟦", "🟪", "🟫", "⬛", "⬜", "🔴"]
+        # Stimmen sammeln
+        counts = []
         for i, opt in enumerate(p_data.get("options", [])):
             count = 0
             for reaction in msg.reactions:
                 if str(reaction.emoji) == emojis[i]:
                     count = reaction.count - 1  # Bot-Reaction abziehen
                     break
-            results += f"{emojis[i]} **{opt}**: {count} Stimmen\n"
+            counts.append(count)
+        total_votes = sum(counts)
+        max_count = max(counts) if counts else 0
+        # Gewinner finden
+        if total_votes > 0 and max_count > 0:
+            winners = [i for i, c in enumerate(counts) if c == max_count]
+            if len(winners) == 1:
+                winner_text = f"🏆 **Gewinner:** {p_data['options'][winners[0]]} ({max_count} Stimmen)"
+            else:
+                winner_names = ", ".join(p_data['options'][w] for w in winners)
+                winner_text = f"🏆 **Gleichstand:** {winner_names} (je {max_count} Stimmen)"
+        else:
+            winner_text = "❌ Keine Stimmen abgegeben"
+        # Modernes Balken-Diagramm bauen
+        results_text = ""
+        for i, opt in enumerate(p_data.get("options", [])):
+            count = counts[i]
+            pct = (count / total_votes * 100) if total_votes > 0 else 0
+            # Balken-Länge (max 20 Blöcke)
+            bar_len = int((count / max_count) * 20) if max_count > 0 else 0
+            bar = bar_blocks[i % len(bar_blocks)] * bar_len + "⚫" * (20 - bar_len)
+            results_text += f"{emojis[i]} **{opt}**\n"
+            results_text += f"{bar} `{count}` ({pct:.0f}%)\n\n"
+        # Embed bauen — modernes Ergebnis-Design
         embed = discord.Embed(
-            title="📊 Umfrage beendet",
-            description=f"**{p_data.get('question', '?')}**\n\n{results}",
-            color=discord.Color.dark_grey(),
+            title="📊 UMFRAGE BEENDET",
+            description=f"## ❓ {p_data.get('question', '?')}\n\n{winner_text}\n\n──────────────",
+            color=discord.Color.dark_gold(),
             timestamp=_now(),
         )
-        embed.set_footer(text="Umfrage beendet • SupportCog")
+        embed.add_field(name="📈 Ergebnisse", value=results_text[:1024], inline=False)
+        embed.add_field(name="🗳️ Gesamtstimmen", value=f"**{total_votes}**", inline=True)
+        embed.add_field(name="👤 Erstellt von", value=f"<@{p_data.get('author_id', '?')}>", inline=True)
+        embed.add_field(name="⏰ Beendet am", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+        embed.set_footer(text="📊 Umfrage beendet • SupportCog")
         try:
             await msg.edit(embed=embed)
+            # Gewinner im Channel verkünden
+            if total_votes > 0:
+                await channel.send(f"📊 **Umfrage beendet!**\n{winner_text}\n🗳️ Insgesamt **{total_votes}** Stimmen abgegeben.")
         except (discord.Forbidden, discord.HTTPException):
             pass
         polls = await self.config.guild(guild).smart_polls() or {}
@@ -22430,19 +22468,21 @@ class HelpMenuView(discord.ui.View):
         self.cog = cog
         self.guild = guild
 
-        options = [
-            discord.SelectOption(label="🎫 Tickets", value="tickets", description="Wie erstelle/schließe ich ein Ticket?", emoji="🎫"),
-            discord.SelectOption(label="🔨 Moderation", value="moderation", description="Ban/Kick/Timeout/Warn Befehle", emoji="🔨"),
-            discord.SelectOption(label="👥 Team-Management", value="team", description="Duty, Bewerbungen, Abmeldungen", emoji="👥"),
-            discord.SelectOption(label="📋 Support & Whitelist", value="support", description="Support-Warteraum & Whitelist-System", emoji="📋"),
-            discord.SelectOption(label="📊 Stats & Insights", value="stats", description="Server-Statistiken & Insights", emoji="📊"),
-            discord.SelectOption(label="🎮 Fun & Utility", value="fun", description="Giveaways, Polls, Snippets", emoji="🎮"),
-        ]
-        self.select = discord.ui.Select(placeholder="Wähle ein Thema...", options=options, min_values=1, max_values=1)
-        self.add_item(self.select)
-
-    async def callback(self, interaction: discord.Interaction):
-        value = self.select.values[0]
+    @discord.ui.select(
+        placeholder="Wähle ein Thema...",
+        min_values=1,
+        max_values=1,
+        options=[
+            discord.SelectOption(label="Tickets", value="tickets", description="Wie erstelle/schließe ich ein Ticket?", emoji="🎫"),
+            discord.SelectOption(label="Moderation", value="moderation", description="Ban/Kick/Timeout/Warn Befehle", emoji="🔨"),
+            discord.SelectOption(label="Team-Management", value="team", description="Duty, Bewerbungen, Abmeldungen", emoji="👥"),
+            discord.SelectOption(label="Support & Whitelist", value="support", description="Support-Warteraum & Whitelist-System", emoji="📋"),
+            discord.SelectOption(label="Stats & Insights", value="stats", description="Server-Statistiken & Insights", emoji="📊"),
+            discord.SelectOption(label="Fun & Utility", value="fun", description="Giveaways, Polls, Snippets", emoji="🎮"),
+        ],
+    )
+    async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+        value = select.values[0]
         embed = None
         if value == "tickets":
             embed = discord.Embed(title="🎫 Ticket-System Hilfe", color=discord.Color.blurple(), timestamp=_now())
@@ -22499,13 +22539,13 @@ class HelpMenuView(discord.ui.View):
             embed = discord.Embed(title="📋 Support & Whitelist Hilfe", color=discord.Color.orange(), timestamp=_now())
             embed.description = (
                 "**Support-System:**\n"
-                "• Betrete den Support-Warteraum → Team wird benachrichtigt\n"
+                "• Betrete den Support-Warteraum -> Team wird benachrichtigt\n"
                 "• 'Support rufen' Button im Panel ruft das Duty-Team\n"
                 "• 'User zu mir holen' Button holt den User in deinen Voice-Channel\n\n"
-                "**Duty-Mode:** `[p]supportset dutymode on/off` — ob Duty-Pflicht besteht\n"
+                "**Duty-Mode:** `[p]supportset dutymode on/off`\n"
                 "**Warteraum:** `[p]warteraum` — wer wartet gerade\n\n"
                 "**Whitelist-System:**\n"
-                "• Betrete den WL-Warteraum → Handler wird benachrichtigt\n"
+                "• Betrete den WL-Warteraum -> Handler wird benachrichtigt\n"
                 "• `[p]wlstats` — Whitelist-Statistiken\n"
                 "• `[p]wlwarteraum` — wer wartet in der WL\n"
                 "• `[p]wlwhosonduty` — welche Handler im Duty sind\n\n"
@@ -22514,15 +22554,15 @@ class HelpMenuView(discord.ui.View):
         elif value == "stats":
             embed = discord.Embed(title="📊 Stats & Insights Hilfe", color=discord.Color.blurple(), timestamp=_now())
             embed.description = (
-                "**Server-Stats:** `[p]serverstats` — detaillierte Server-Statistiken\n"
-                "**Insights-Dashboard:** `[p]insights create` — auto-aktualisierendes Panel\n"
-                "**Member-Growth:** `[p]growth` — Wachstum der letzten 14 Tage\n"
-                "**Activity-Heatmap:** `[p]heatmap` — Team-Aktivität nach Stunde/Tag\n"
-                "**Team-Stats:** `[p]teamstats` — Team-Leaderboard\n"
-                "**Ticket-Flow:** `[p]ticketflow [Tage]` — geöffnet vs geschlossen\n"
-                "**Survey-Results:** `[p]ticketsurvey show` — Ticket-Bewertungen\n"
-                "**Activity-Report:** `[p]activityreport` — generiert einen Report\n"
-                "**Cog-Features:** `[p]cogfeatures` — Übersicht aller Funktionen"
+                "**Server-Stats:** `[p]serverstats`\n"
+                "**Insights-Dashboard:** `[p]insights create`\n"
+                "**Member-Growth:** `[p]growth`\n"
+                "**Activity-Heatmap:** `[p]heatmap`\n"
+                "**Team-Stats:** `[p]teamstats`\n"
+                "**Ticket-Flow:** `[p]ticketflow [Tage]`\n"
+                "**Survey-Results:** `[p]ticketsurvey show`\n"
+                "**Activity-Report:** `[p]activityreport`\n"
+                "**Cog-Features:** `[p]cogfeatures`"
             )
         elif value == "fun":
             embed = discord.Embed(title="🎮 Fun & Utility Hilfe", color=discord.Color.gold(), timestamp=_now())
@@ -22530,12 +22570,12 @@ class HelpMenuView(discord.ui.View):
                 "**Giveaway:** `[p]giveaway create <Dauer> <Preis>` • `[p]giveaway list`\n"
                 "**Poll:** `[p]spoll \"Frage?\" Option1 | Option2 | 24h`\n"
                 "**Snippets:** `[p]snippet add <Name> <Text>` • `[p]snippet get <Name>`\n"
-                "**Embed Builder:** `[p]embedbuilder` — Custom Embeds erstellen\n"
+                "**Embed Builder:** `[p]embedbuilder`\n"
                 "**Temp-Role:** `[p]temprole add @User @Rolle <Dauer> [Grund]`\n"
                 "**Abmeldung:** Button im Panel oder `[p]abmeldung`\n\n"
-                "**BanSync:** `[p]syncset` — Cross-Server Sync\n"
-                "**Modlog:** `[p]extmodlog setup` — Setup-Wizard\n"
-                "**Mod-DM:** `[p]moddm show/ban/kick/timeout/warn` — DM-Templates"
+                "**BanSync:** `[p]syncset`\n"
+                "**Modlog:** `[p]extmodlog setup`\n"
+                "**Mod-DM:** `[p]moddm show/ban/kick/timeout/warn`"
             )
         if embed:
             embed.set_footer(text="Help-Center • SupportCog")
