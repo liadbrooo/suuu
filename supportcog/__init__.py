@@ -399,6 +399,9 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "team_role": None,  # Rolle die alle Teammitglieder haben (für teamstatus)
             "team_status_panel_channel": None,  # Channel für das auto-aktualisierende Team-Status-Panel
             "team_status_panel_message": None,  # Message-ID des Panels
+            # TEAM-BLACKLIST SYSTEM
+            "team_blacklist": {},  # {user_id: {added_by, added_by_name, reason, ts, type: "team"|"direct"}}
+            "team_blacklist_channel": None,  # Channel wo Blacklist-Einträge gesendet werden
             # NEUE FEATURES
             "giveaways": {},  # {message_id: {prize, end_ts, channel_id, host_id, ended, winners}}
             "trial_role": None,  # Trial-Rolle (Probemitglied)
@@ -17887,6 +17890,137 @@ class SupportCog(DashboardIntegration, commands.Cog):
         await ctx.send(embed=embed, view=view)
 
     # ============================================
+    # TEAM-BLACKLIST SYSTEM
+    # ============================================
+
+    @commands.group(name="teamblacklistset", aliases=["tbset", "blacklistset"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def team_blacklist_set(self, ctx: commands.Context):
+        """Konfiguriert das Team-Blacklist-System."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @team_blacklist_set.command(name="channel")
+    async def tbl_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel in den Blacklist-Einträge gesendet werden."""
+        if channel is None:
+            await self.config.guild(ctx.guild).team_blacklist_channel.set(None)
+            await ctx.send("✅ Blacklist-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).team_blacklist_channel.set(channel.id)
+        await ctx.send(f"✅ Blacklist-Channel gesetzt auf {channel.mention}.")
+
+    @team_blacklist_set.command(name="show")
+    async def tbl_show(self, ctx: commands.Context):
+        """Zeigt alle Blacklist-Einträge."""
+        blacklist = await self.config.guild(ctx.guild).team_blacklist() or {}
+        if not blacklist:
+            await ctx.send("ℹ️ Keine Blacklist-Einträge vorhanden.")
+            return
+        embed = discord.Embed(
+            title=f"🚫 Team-Blacklist ({len(blacklist)} Einträge)",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        for uid, data in list(blacklist.items())[:25]:
+            member = ctx.guild.get_member(int(uid))
+            name = member.display_name if member else data.get("username", f"User {uid}")
+            bl_type = "👥 Team" if data.get("type") == "team" else "👤 Direkt"
+            embed.add_field(
+                name=f"🚫 {name} ({bl_type})",
+                value=f"📝 {data.get('reason', '?')[:200]}\n👤 Von: {data.get('added_by_name', '?')}\n📅 {_fmt_berlin_date(_from_ts(data.get('ts', 0)))}",
+                inline=False,
+            )
+        await ctx.send(embed=embed)
+
+    @team_blacklist_set.command(name="remove", aliases=["entfernen"])
+    async def tbl_remove(self, ctx: commands.Context, member: discord.Member):
+        """Entfernt einen User von der Blacklist."""
+        blacklist = await self.config.guild(ctx.guild).team_blacklist() or {}
+        if str(member.id) not in blacklist:
+            await ctx.send(f"ℹ️ {member.mention} ist nicht auf der Blacklist.")
+            return
+        del blacklist[str(member.id)]
+        await self.config.guild(ctx.guild).team_blacklist.set(blacklist)
+        await ctx.send(f"✅ {member.mention} von der Blacklist entfernt.")
+
+    @team_blacklist_set.command(name="clear")
+    async def tbl_clear(self, ctx: commands.Context):
+        """Leert die gesamte Blacklist."""
+        await self.config.guild(ctx.guild).team_blacklist.set({})
+        await ctx.send("✅ Blacklist geleert.")
+
+    @commands.command(name="teamblacklist", aliases=["teambl", "tbl"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def team_blacklist_cmd(self, ctx: commands.Context):
+        """Öffnet ein Modal um einen User zur Team-Blacklist hinzuzufügen."""
+        if not isinstance(ctx.author, discord.Member):
+            return
+        view = TeamBlacklistOpenView(self, blacklist_type="team")
+        await ctx.send("Klicke auf den Button um einen User zur Team-Blacklist hinzuzufügen:", view=view, delete_after=60)
+
+    @commands.command(name="directblacklist", aliases=["dbl", "directbl"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def direct_blacklist_cmd(self, ctx: commands.Context):
+        """Öffnet ein Modal um einen User zur direkten Blacklist hinzuzufügen."""
+        if not isinstance(ctx.author, discord.Member):
+            return
+        view = TeamBlacklistOpenView(self, blacklist_type="direct")
+        await ctx.send("Klicke auf den Button um einen User zur direkten Blacklist hinzuzufügen:", view=view, delete_after=60)
+
+    async def _add_to_blacklist(self, interaction: discord.Interaction, user_id: int, user_name: str, reason: str, blacklist_type: str):
+        """Fügt einen User zur Blacklist hinzu und sendet eine Nachricht in den konfigurierten Channel."""
+        guild = interaction.guild
+        moderator = interaction.user
+        # In Config speichern
+        blacklist = await self.config.guild(guild).team_blacklist() or {}
+        blacklist[str(user_id)] = {
+            "added_by": moderator.id,
+            "added_by_name": moderator.display_name,
+            "username": user_name,
+            "reason": reason[:500],
+            "ts": _now_ts(),
+            "type": blacklist_type,
+        }
+        await self.config.guild(guild).team_blacklist.set(blacklist)
+        # In den konfigurierten Channel senden
+        ch_id = await self.config.guild(guild).team_blacklist_channel()
+        if ch_id:
+            channel = guild.get_channel(ch_id)
+            if channel:
+                type_label = "👥 Team-Blacklist" if blacklist_type == "team" else "👤 Direkte Blacklist"
+                embed = discord.Embed(
+                    title=f"🚫 {type_label}",
+                    description=f"**User:** <@{user_id}> (`{user_id}`)\n**Name:** {user_name}\n**Hinzugefügt von:** {moderator.mention}",
+                    color=discord.Color.red(),
+                    timestamp=_now(),
+                )
+                embed.add_field(name="📝 Grund", value=reason[:1024], inline=False)
+                embed.add_field(name="📅 Datum", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
+                embed.add_field(name="🏷️ Typ", value=blacklist_type, inline=True)
+                embed.set_thumbnail(url=moderator.display_avatar.url)
+                embed.set_footer(text=f"User-ID: {user_id} • Moderator-ID: {moderator.id}")
+                try:
+                    await channel.send(embed=embed)
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"Konnte Blacklist-Eintrag nicht in Channel senden: {e}")
+        # Bestätigung an Moderator
+        try:
+            confirm_embed = discord.Embed(
+                title="✅ Zur Blacklist hinzugefügt",
+                description=f"**{user_name}** (`{user_id}`) wurde zur {'Team' if blacklist_type == 'team' else 'direkten'}-Blacklist hinzugefügt.",
+                color=discord.Color.green(),
+                timestamp=_now(),
+            )
+            confirm_embed.add_field(name="📝 Grund", value=reason[:500], inline=False)
+            await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    # ============================================
     # TICKET-FLOW-DIAGRAMM
     # ============================================
 
@@ -22447,6 +22581,107 @@ class TeamAbmeldungModal(discord.ui.Modal):
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.exception("Fehler im TeamAbmeldungModal", exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Fehler: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+# ============================================
+# TEAM-BLACKLIST VIEW & MODAL
+# ============================================
+
+class TeamBlacklistOpenView(discord.ui.View):
+    """View die den Button zum Öffnen des Blacklist-Modals enthält."""
+
+    def __init__(self, cog, blacklist_type: str = "team"):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.blacklist_type = blacklist_type
+
+    @discord.ui.button(label="Zur Blacklist hinzufügen", style=discord.ButtonStyle.danger, emoji="🚫")
+    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+            return
+        modal = TeamBlacklistModal(self.cog, self.blacklist_type)
+        await interaction.response.send_modal(modal)
+
+
+class TeamBlacklistModal(discord.ui.Modal):
+    """Modal für die Team/Direct Blacklist mit User-ID, Name und Grund."""
+
+    def __init__(self, cog, blacklist_type: str = "team"):
+        title = "🚫 Team-Blacklist" if blacklist_type == "team" else "🚫 Direkte Blacklist"
+        super().__init__(title=title, timeout=300)
+        self.cog = cog
+        self.blacklist_type = blacklist_type
+        # Feld 1: User-ID
+        self.user_id_input = discord.ui.TextInput(
+            label="User-ID (Discord ID)",
+            placeholder="z.B. 123456789012345678",
+            required=True,
+            min_length=17,
+            max_length=20,
+            custom_id="bl_user_id",
+        )
+        self.add_item(self.user_id_input)
+        # Feld 2: Name (zur Sicherheit, falls User nicht auf dem Server)
+        self.name_input = discord.ui.TextInput(
+            label="Name des Users",
+            placeholder="z.B. MaxMustermann",
+            required=True,
+            max_length=100,
+            custom_id="bl_name",
+        )
+        self.add_item(self.name_input)
+        # Feld 3: Grund
+        self.reason_input = discord.ui.TextInput(
+            label="Grund der Blacklist",
+            placeholder="Warum wird dieser User geblacklistet?",
+            required=True,
+            max_length=1000,
+            style=discord.TextStyle.paragraph,
+            custom_id="bl_reason",
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user_id_str = self.user_id_input.value.strip()
+        user_name = self.name_input.value.strip()
+        reason = self.reason_input.value.strip()
+        # User-ID validieren
+        try:
+            user_id = int(user_id_str)
+        except ValueError:
+            await interaction.response.send_message("❌ Ungültige User-ID. Muss eine Zahl sein.", ephemeral=True)
+            return
+        if not user_name or not reason:
+            await interaction.response.send_message("❌ Bitte fülle alle Felder aus.", ephemeral=True)
+            return
+        # Prüfen ob User schon auf der Blacklist steht
+        blacklist = await self.cog.config.guild(interaction.guild).team_blacklist() or {}
+        if str(user_id) in blacklist:
+            await interaction.response.send_message(f"⚠️ User `{user_id}` ist bereits auf der Blacklist.\nGrund: {blacklist[str(user_id)].get('reason', '?')[:200]}\nVerwende `[p]teamblacklistset remove` um ihn zuerst zu entfernen.", ephemeral=True)
+            return
+        # Zur Blacklist hinzufügen
+        try:
+            await self.cog._add_to_blacklist(interaction, user_id, user_name, reason, self.blacklist_type)
+        except Exception as e:
+            log.exception("Fehler beim Hinzufügen zur Blacklist")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("Fehler im TeamBlacklistModal", exc_info=error)
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(f"❌ Fehler: {error}", ephemeral=True)
