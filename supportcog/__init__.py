@@ -402,6 +402,8 @@ class SupportCog(DashboardIntegration, commands.Cog):
             # TEAM-BLACKLIST SYSTEM
             "team_blacklist": {},  # {user_id: {added_by, added_by_name, reason, ts, type: "team"|"direct"}}
             "team_blacklist_channel": None,  # Channel wo Blacklist-Einträge gesendet werden
+            "team_blacklist_panel_channel": None,  # Channel für das Blacklist-Panel
+            "team_blacklist_panel_message": None,  # Message-ID des Panels
             # NEUE FEATURES
             "giveaways": {},  # {message_id: {prize, end_ts, channel_id, host_id, ended, winners}}
             "trial_role": None,  # Trial-Rolle (Probemitglied)
@@ -639,6 +641,11 @@ class SupportCog(DashboardIntegration, commands.Cog):
         # Team-Abmeldung persistente View registrieren
         try:
             self.bot.add_view(TeamAbmeldungPanelView(self))
+        except Exception:
+            pass
+        # Team-Blacklist persistente View registrieren
+        try:
+            self.bot.add_view(TeamBlacklistPanelView(self))
         except Exception:
             pass
         # EmbedBuilderStartView ist nicht persistent (timeout=300) — keine Registrierung nötig
@@ -17971,6 +17978,60 @@ class SupportCog(DashboardIntegration, commands.Cog):
         view = TeamBlacklistOpenView(self, blacklist_type="direct")
         await ctx.send("Klicke auf den Button um einen User zur direkten Blacklist hinzuzufügen:", view=view, delete_after=60)
 
+    @team_blacklist_set.command(name="createpanel", aliases=["panel", "create"])
+    async def tbl_create_panel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Erstellt ein persistentes Blacklist-Panel mit zwei Buttons (Team + Direkt)."""
+        if channel is None:
+            channel = ctx.channel
+        # Altes Panel löschen falls vorhanden
+        old_ch_id = await self.config.guild(ctx.guild).team_blacklist_panel_channel()
+        old_msg_id = await self.config.guild(ctx.guild).team_blacklist_panel_message()
+        if old_ch_id and old_msg_id:
+            old_ch = ctx.guild.get_channel(old_ch_id)
+            if old_ch:
+                try:
+                    old_msg = await old_ch.fetch_message(old_msg_id)
+                    await old_msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        embed = discord.Embed(
+            title="🚫 Blacklist-Panel",
+            description=(
+                "Hier kannst du User auf die Blacklist setzen.\n\n"
+                "**🚫 Team-Blacklist** — User die vom Team ausgeschlossen werden sollen\n"
+                "**⛔ Direkte Blacklist** — Direkte User-Blacklist\n\n"
+                "Klicke auf einen Button um ein Formular zu öffnen."
+            ),
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        embed.set_footer(text="Blacklist-System • SupportCog")
+        view = TeamBlacklistPanelView(self)
+        try:
+            msg = await channel.send(embed=embed, view=view)
+            await self.config.guild(ctx.guild).team_blacklist_panel_channel.set(channel.id)
+            await self.config.guild(ctx.guild).team_blacklist_panel_message.set(msg.id)
+            await ctx.send(f"✅ Blacklist-Panel erstellt in {channel.mention}.")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await ctx.send(f"❌ Konnte Panel nicht erstellen: `{e}`")
+
+    @team_blacklist_set.command(name="removepanel", aliases=["paneldel"])
+    async def tbl_remove_panel(self, ctx: commands.Context):
+        """Entfernt das Blacklist-Panel."""
+        ch_id = await self.config.guild(ctx.guild).team_blacklist_panel_channel()
+        msg_id = await self.config.guild(ctx.guild).team_blacklist_panel_message()
+        if ch_id and msg_id:
+            ch = ctx.guild.get_channel(ch_id)
+            if ch:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        await self.config.guild(ctx.guild).team_blacklist_panel_channel.set(None)
+        await self.config.guild(ctx.guild).team_blacklist_panel_message.set(None)
+        await ctx.send("✅ Blacklist-Panel entfernt.")
+
     async def _add_to_blacklist(self, interaction: discord.Interaction, user_id: int, user_name: str, reason: str, blacklist_type: str):
         """Fügt einen User zur Blacklist hinzu und sendet eine Nachricht in den konfigurierten Channel."""
         guild = interaction.guild
@@ -18001,7 +18062,6 @@ class SupportCog(DashboardIntegration, commands.Cog):
                 embed.add_field(name="📝 Grund", value=reason[:1024], inline=False)
                 embed.add_field(name="📅 Datum", value=_fmt_berlin_full(_now()) + " (MEZ/MESZ)", inline=True)
                 embed.add_field(name="🏷️ Typ", value=blacklist_type, inline=True)
-                embed.set_thumbnail(url=moderator.display_avatar.url)
                 embed.set_footer(text=f"User-ID: {user_id} • Moderator-ID: {moderator.id}")
                 try:
                     await channel.send(embed=embed)
@@ -22593,6 +22653,46 @@ class TeamAbmeldungModal(discord.ui.Modal):
 # ============================================
 # TEAM-BLACKLIST VIEW & MODAL
 # ============================================
+
+class TeamBlacklistPanelView(discord.ui.View):
+    """Persistente View für das Blacklist-Panel mit zwei Buttons."""
+
+    def __init__(self, cog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="Team-Blacklist", style=discord.ButtonStyle.danger, emoji="🚫", custom_id="blacklist_team_panel")
+    async def open_team_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            modal = TeamBlacklistModal(self.cog, blacklist_type="team")
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            log.exception("Fehler beim Öffnen des Team-Blacklist-Modals")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Direkte Blacklist", style=discord.ButtonStyle.secondary, emoji="⛔", custom_id="blacklist_direct_panel")
+    async def open_direct_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("❌ Nur Server-Mitglieder.", ephemeral=True)
+                return
+            modal = TeamBlacklistModal(self.cog, blacklist_type="direct")
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            log.exception("Fehler beim Öffnen des Direkt-Blacklist-Modals")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"❌ Fehler: `{type(e).__name__}: {e}`", ephemeral=True)
+            except Exception:
+                pass
+
 
 class TeamBlacklistOpenView(discord.ui.View):
     """View die den Button zum Öffnen des Blacklist-Modals enthält."""
