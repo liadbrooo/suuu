@@ -9904,6 +9904,307 @@ class SupportCog(DashboardIntegration, commands.Cog):
         await ctx.send(f"✅ Timeout von {member.mention} (`{member.id}`) aufgehoben{dm_status}.", delete_after=6)
 
     # ============================================
+    # MASS MOVE & VOICE MANAGEMENT
+    # ============================================
+
+    @commands.command(name="massmove", aliases=["mmove", "moveall", "movall"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(move_members=True)
+    @commands.bot_has_permissions(move_members=True)
+    async def mass_move_cmd(self, ctx: commands.Context, source: discord.VoiceChannel, target: discord.VoiceChannel):
+        """Bewegt alle User von einem Voice-Channel in einen anderen.
+        Beispiel: [p]massmove #Warteraum #Support-1"""
+        if source.id == target.id:
+            await ctx.send("❌ Source und Target sind derselbe Channel.")
+            return
+        members = [m for m in source.members if not m.bot]
+        if not members:
+            await ctx.send(f"❌ Keine User in {source.mention}.")
+            return
+        moved = 0
+        failed = 0
+        for member in members:
+            try:
+                await member.move_to(target, reason=f"Mass-Move von {ctx.author}")
+                moved += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+        msg = f"✅ **{moved}** User von {source.mention} nach {target.mention} verschoben."
+        if failed:
+            msg += f" ❌ {failed} fehlgeschlagen."
+        await ctx.send(msg, delete_after=10)
+        # Modlog
+        log_embed = discord.Embed(
+            title="🔊 Mass-Move (Alle)",
+            description=f"**Von:** {source.mention}\n**Nach:** {target.mention}\n**Moderator:** {ctx.author.mention}\n**Verschoben:** {moved} User",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        await self._modlog_send(ctx.guild, "voice_move", log_embed)
+
+    @commands.command(name="moverole", aliases=["moveroles", "rolemove"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(move_members=True)
+    @commands.bot_has_permissions(move_members=True)
+    async def move_role_cmd(self, ctx: commands.Context, role: discord.Role, source: discord.VoiceChannel, target: discord.VoiceChannel):
+        """Bewegt alle User mit einer bestimmten Rolle von einem Voice-Channel in einen anderen.
+        Beispiel: [p]moverole @Support #Warteraum #Support-1"""
+        if source.id == target.id:
+            await ctx.send("❌ Source und Target sind derselbe Channel.")
+            return
+        members = [m for m in source.members if not m.bot and role in m.roles]
+        if not members:
+            await ctx.send(f"❌ Keine User mit Rolle {role.mention} in {source.mention}.")
+            return
+        moved = 0
+        failed = 0
+        for member in members:
+            try:
+                await member.move_to(target, reason=f"Role-Move ({role.name}) von {ctx.author}")
+                moved += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+        msg = f"✅ **{moved}** User mit Rolle {role.mention} von {source.mention} nach {target.mention} verschoben."
+        if failed:
+            msg += f" ❌ {failed} fehlgeschlagen."
+        await ctx.send(msg, delete_after=10)
+        log_embed = discord.Embed(
+            title=f"🔊 Role-Move ({role.name})",
+            description=f"**Rolle:** {role.mention}\n**Von:** {source.mention}\n**Nach:** {target.mention}\n**Moderator:** {ctx.author.mention}\n**Verschoben:** {moved} User",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        await self._modlog_send(ctx.guild, "voice_move", log_embed)
+
+    @commands.command(name="moveuser", aliases=["mvuser", "move"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(move_members=True)
+    @commands.bot_has_permissions(move_members=True)
+    async def move_user_cmd(self, ctx: commands.Context, member: discord.Member, target: discord.VoiceChannel):
+        """Bewegt einen einzelnen User in einen anderen Voice-Channel.
+        Beispiel: [p]moveuser @User #Support-1"""
+        if member.voice is None or member.voice.channel is None:
+            await ctx.send(f"❌ {member.mention} ist nicht in einem Voice-Channel.")
+            return
+        source = member.voice.channel
+        try:
+            await member.move_to(target, reason=f"Move von {ctx.author}")
+            await ctx.send(f"✅ {member.mention} von {source.mention} nach {target.mention} verschoben.", delete_after=10)
+            log_embed = discord.Embed(
+                title="🔊 User verschoben",
+                description=f"**User:** {member.mention}\n**Von:** {source.mention}\n**Nach:** {target.mention}\n**Moderator:** {ctx.author.mention}",
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            await self._modlog_send(ctx.guild, "voice_move", log_embed)
+        except discord.Forbidden:
+            await ctx.send("❌ Keine Berechtigung um diesen User zu bewegen.")
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+
+    @commands.command(name="movetome", aliases=["mvtome", "tome"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(move_members=True)
+    @commands.bot_has_permissions(move_members=True)
+    async def move_to_me_cmd(self, ctx: commands.Context, member: discord.Member):
+        """Bewegt einen User in deinen aktuellen Voice-Channel.
+        Beispiel: [p]movetome @User"""
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            await ctx.send("❌ Du bist nicht in einem Voice-Channel!")
+            return
+        target = ctx.author.voice.channel
+        if member.voice is None or member.voice.channel is None:
+            await ctx.send(f"❌ {member.mention} ist nicht in einem Voice-Channel.")
+            return
+        source = member.voice.channel
+        if source.id == target.id:
+            await ctx.send(f"ℹ️ {member.mention} ist bereits in deinem Channel.")
+            return
+        try:
+            await member.move_to(target, reason=f"Move-to-me von {ctx.author}")
+            await ctx.send(f"✅ {member.mention} zu dir in {target.mention} geholt.", delete_after=10)
+            log_embed = discord.Embed(
+                title="🔊 User zu Moderator geholt",
+                description=f"**User:** {member.mention}\n**Von:** {source.mention}\n**Nach:** {target.mention}\n**Moderator:** {ctx.author.mention}",
+                color=discord.Color.blurple(),
+                timestamp=_now(),
+            )
+            await self._modlog_send(ctx.guild, "voice_move", log_embed)
+        except discord.Forbidden:
+            await ctx.send("❌ Keine Berechtigung um diesen User zu bewegen.")
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`")
+
+    @commands.command(name="movealltome", aliases=["malltome", "alltome"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(move_members=True)
+    @commands.bot_has_permissions(move_members=True)
+    async def move_all_to_me_cmd(self, ctx: commands.Context, source: discord.VoiceChannel = None):
+        """Bewegt alle User aus einem Channel in deinen aktuellen Voice-Channel.
+        Ohne Source-Angabe: nimmt den Channel in dem du gerade NICHT bist (wenn nur 2 Voice-Channels existieren).
+        Beispiel: [p]movealltome #Warteraum"""
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            await ctx.send("❌ Du bist nicht in einem Voice-Channel!")
+            return
+        target = ctx.author.voice.channel
+        if source is None:
+            # Versuche: alle Voice Channels außer dem eigenen nehmen
+            voice_channels = [c for c in ctx.guild.voice_channels if c.id != target.id and c.members]
+            if len(voice_channels) == 1:
+                source = voice_channels[0]
+            else:
+                await ctx.send(f"❌ Bitte gib einen Source-Channel an. Beispiel: `[p]movealltome #Warteraum`")
+                return
+        if source.id == target.id:
+            await ctx.send("❌ Source und Target sind derselbe Channel.")
+            return
+        members = [m for m in source.members if not m.bot]
+        if not members:
+            await ctx.send(f"❌ Keine User in {source.mention}.")
+            return
+        moved = 0
+        failed = 0
+        for member in members:
+            try:
+                await member.move_to(target, reason=f"Move-all-to-me von {ctx.author}")
+                moved += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+        msg = f"✅ **{moved}** User von {source.mention} zu dir in {target.mention} geholt."
+        if failed:
+            msg += f" ❌ {failed} fehlgeschlagen."
+        await ctx.send(msg, delete_after=10)
+        log_embed = discord.Embed(
+            title="🔊 Mass-Move zu Moderator",
+            description=f"**Von:** {source.mention}\n**Nach:** {target.mention}\n**Moderator:** {ctx.author.mention}\n**Verschoben:** {moved} User",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        await self._modlog_send(ctx.guild, "voice_move", log_embed)
+
+    @commands.command(name="roletovc", aliases=["rolevoice", "movetrolevc"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(move_members=True)
+    @commands.bot_has_permissions(move_members=True)
+    async def role_to_vc_cmd(self, ctx: commands.Context, role: discord.Role, target: discord.VoiceChannel):
+        """Bewegt alle User mit einer Rolle (die in einem Voice-Channel sind) in einen Ziel-Channel.
+        Durchsucht ALLE Voice-Channels. Beispiel: [p]roletovc @Support #Meeting"""
+        members = []
+        for vc in ctx.guild.voice_channels:
+            for m in vc.members:
+                if not m.bot and role in m.roles:
+                    members.append((m, vc))
+        if not members:
+            await ctx.send(f"❌ Keine User mit Rolle {role.mention} in Voice-Channels gefunden.")
+            return
+        moved = 0
+        failed = 0
+        for member, source_vc in members:
+            if source_vc.id == target.id:
+                continue
+            try:
+                await member.move_to(target, reason=f"Role-to-VC ({role.name}) von {ctx.author}")
+                moved += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+        msg = f"✅ **{moved}** User mit Rolle {role.mention} nach {target.mention} verschoben."
+        if failed:
+            msg += f" ❌ {failed} fehlgeschlagen."
+        await ctx.send(msg, delete_after=10)
+        log_embed = discord.Embed(
+            title=f"🔊 Role-to-VC ({role.name})",
+            description=f"**Rolle:** {role.mention}\n**Nach:** {target.mention}\n**Moderator:** {ctx.author.mention}\n**Verschoben:** {moved} User (aus allen Voice-Channels)",
+            color=discord.Color.blurple(),
+            timestamp=_now(),
+        )
+        await self._modlog_send(ctx.guild, "voice_move", log_embed)
+
+    # ============================================
+    # CLEAR MESSAGES (wiederhergestellt)
+    # ============================================
+
+    @commands.command(name="clearmsgs", aliases=["clearmessages", "clearmsg", "massclear", "mc"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True)
+    async def clear_messages(self, ctx: commands.Context, count: int):
+        """Löscht eine Anzahl von Nachrichten im aktuellen Channel (2-100)."""
+        if count < 2:
+            await ctx.send("❌ Mindestens 2 Nachrichten.", delete_after=10)
+            return
+        if count > 100:
+            await ctx.send("❌ Maximal 100 Nachrichten.", delete_after=10)
+            return
+        try:
+            deleted = await ctx.channel.purge(limit=count + 1, bulk=True)
+            await ctx.send(f"🧹 **{len(deleted) - 1}** Nachrichten gelöscht.", delete_after=6)
+        except discord.Forbidden:
+            await ctx.send("❌ Keine Berechtigung.", delete_after=10)
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
+
+    @commands.command(name="clearuser", aliases=["clearu", "userpurge"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True)
+    async def clear_user_messages(self, ctx: commands.Context, member: discord.Member, count: int = 100):
+        """Löscht Nachrichten eines bestimmten Users im aktuellen Channel."""
+        if count < 1 or count > 500:
+            await ctx.send("❌ Anzahl muss 1-500 sein.", delete_after=10)
+            return
+        try:
+            def check(m):
+                return m.author.id == member.id
+            deleted = await ctx.channel.purge(limit=count + 5, check=check, bulk=True)
+            await ctx.send(f"🧹 **{len(deleted)}** Nachrichten von {member.mention} gelöscht.", delete_after=6)
+        except discord.Forbidden:
+            await ctx.send("❌ Keine Berechtigung.", delete_after=10)
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
+
+    # ============================================
+    # FAKE MOD-AKTIONEN (DM nur, keine echte Aktion)
+    # ============================================
+
+    @commands.command(name="ben", aliases=["fakeban", "fban"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(ban_members=True)
+    async def fake_ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Sendet eine FAKE BAN-DM an einen User. Der User wird NICHT gebannt."""
+        if member.bot:
+            await ctx.send("❌ Bots können keine DMs erhalten.", delete_after=10)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Nicht sich selbst.", delete_after=10)
+            return
+        if len(reason) > 500:
+            reason = reason[:500]
+        dm_sent = await self._send_mod_dm(member, ctx.guild, "ban", moderator=ctx.author, reason=reason)
+        if dm_sent:
+            await ctx.send(f"🎭 **Fake-Ban.** {member.mention} hat eine BAN-DM erhalten, wurde aber NICHT gebannt.\n**Grund:** {reason}", delete_after=15)
+        else:
+            await ctx.send(f"⚠️ Fake-Ban: DM nicht zustellbar. {member.mention} wurde NICHT gebannt.", delete_after=15)
+
+    @commands.command(name="kik", aliases=["fakekick", "fkick"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(kick_members=True)
+    async def fake_kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Sendet eine FAKE KICK-DM an einen User. Der User wird NICHT gekickt."""
+        if member.bot:
+            await ctx.send("❌ Bots können keine DMs erhalten.", delete_after=10)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Nicht sich selbst.", delete_after=10)
+            return
+        if len(reason) > 500:
+            reason = reason[:500]
+        dm_sent = await self._send_mod_dm(member, ctx.guild, "kick", moderator=ctx.author, reason=reason)
+        if dm_sent:
+            await ctx.send(f"🎭 **Fake-Kick.** {member.mention} hat eine KICK-DM erhalten, wurde aber NICHT gekickt.\n**Grund:** {reason}", delete_after=15)
+        else:
+            await ctx.send(f"⚠️ Fake-Kick: DM nicht zustellbar. {member.mention} wurde NICHT gekickt.", delete_after=15)
+
+    # ============================================
     # ANONYME MOD-AKTIONEN (Moderator wird in DM nicht genannt)
     # ============================================
 
