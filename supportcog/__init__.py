@@ -18403,7 +18403,7 @@ class SupportCog(DashboardIntegration, commands.Cog):
     # WILLKOMMENS-SYSTEM
     # ============================================
 
-    @commands.group(name="willkommensset", aliases=["wset", "welcome", "welcomeset"])
+    @commands.group(name="willkommensset", aliases=["wset", "willkommen"])
     @checks.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
     async def welcome_set(self, ctx: commands.Context):
