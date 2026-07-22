@@ -417,6 +417,7 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "welcome_text_after": None,  # Text nach dem Embed
             "welcome_dm_enabled": False,
             "welcome_dm_text": None,
+            "locked_channels": {},  # {channel_id: {locked_by, locked_by_name, reason, ts, channel_name}}
             # NEUE FEATURES
             "giveaways": {},  # {message_id: {prize, end_ts, channel_id, host_id, ended, winners}}
             "trial_role": None,  # Trial-Rolle (Probemitglied)
@@ -1622,6 +1623,47 @@ class SupportCog(DashboardIntegration, commands.Cog):
             log_embed.add_field(name="Von", value=before.channel.mention, inline=True)
             log_embed.add_field(name="Nach", value=after.channel.mention, inline=True)
             await self._modlog_send(guild, "voice_move", log_embed)
+
+        # Channel-Lock Check: User aus gesperrten Channels werfen (außer Admins und allowed_users)
+        # Wenn ein Admin einen User reinzieht, wird der User automatisch zur allowed_users Liste hinzugefügt
+        if after.channel is not None and (before.channel is None or before.channel != after.channel):
+            try:
+                locked = await self.config.guild(guild).locked_channels() or {}
+                if str(after.channel.id) in locked:
+                    if not member.bot:
+                        lock_data = locked[str(after.channel.id)]
+                        # Admins dürfen immer
+                        if member.guild_permissions.administrator:
+                            pass
+                        else:
+                            allowed_users = lock_data.get("allowed_users", [])
+                            if member.id in allowed_users:
+                                pass  # User ist erlaubt
+                            else:
+                                # Prüfen ob ein Admin den User reingezogen hat (Audit-Log)
+                                moved_by_admin = False
+                                try:
+                                    async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_move):
+                                        if entry.target and entry.target.id == member.id:
+                                            if _now_ts() - int(entry.created_at.timestamp()) < 10:
+                                                moved_by_admin = True
+                                                break
+                                except (discord.Forbidden, discord.HTTPException):
+                                    pass
+                                if moved_by_admin:
+                                    # Admin hat den User reingezogen → automatisch erlauben
+                                    allowed_users.append(member.id)
+                                    lock_data["allowed_users"] = allowed_users
+                                    locked[str(after.channel.id)] = lock_data
+                                    await self.config.guild(guild).locked_channels.set(locked)
+                                else:
+                                    # Nicht erlaubt und nicht von Admin gezogen → rauswerfen
+                                    try:
+                                        await member.move_to(None, reason=f"Channel gesperrt: {lock_data.get('reason', '?')}")
+                                    except (discord.Forbidden, discord.HTTPException):
+                                        pass
+            except Exception:
+                pass
 
         # Watchlist Voice-Notify (nur bei JOIN in einen Voice-Channel)
         if before.channel is None and after.channel is not None:
@@ -10221,6 +10263,190 @@ class SupportCog(DashboardIntegration, commands.Cog):
             await ctx.send(f"🎭 **Fake-Kick.** {member.mention} hat eine KICK-DM erhalten, wurde aber NICHT gekickt.\n**Grund:** {reason}", delete_after=15)
         else:
             await ctx.send(f"⚠️ Fake-Kick: DM nicht zustellbar. {member.mention} wurde NICHT gekickt.", delete_after=15)
+
+    # ============================================
+    # VOICE MUTE / UNMUTE (Server-Mute, nur Admin)
+    # ============================================
+
+    @commands.command(name="vmute", aliases=["voicemute", "servermute"])
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    @commands.bot_has_permissions(mute_members=True)
+    async def voice_mute_cmd(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Schaltet einen User serverweit stumm (Server-Mute). Nur für Admins.
+        Kann nur mit [p]vunmute aufgehoben werden (nicht durch Selbst-Unmute im Voice)."""
+        if member.bot:
+            await ctx.send("❌ Bots können nicht stummgeschaltet werden.", delete_after=10)
+            return
+        if member == ctx.author:
+            await ctx.send("❌ Du kannst dich nicht selbst stummschalten.", delete_after=10)
+            return
+        try:
+            await member.edit(mute=True, reason=f"Server-Mute von Admin {ctx.author}: {reason}")
+            await ctx.send(f"🔇 {member.mention} wurde serverweit stummgeschaltet.\n**Grund:** {reason}\n⚠️ Kann nur mit `[p]vunmute` aufgehoben werden.", delete_after=15)
+            # Modlog
+            log_embed = discord.Embed(
+                title="🔇 Server-Mute (Voice)",
+                description=f"**User:** {member.mention} (`{member.id}`)\n**Admin:** {ctx.author.mention}\n**Grund:** {reason}",
+                color=discord.Color.dark_red(),
+                timestamp=_now(),
+            )
+            log_embed.set_thumbnail(url=member.display_avatar.url)
+            await self._modlog_send(ctx.guild, "voice_mute", log_embed)
+        except discord.Forbidden:
+            await ctx.send("❌ Keine Berechtigung.", delete_after=10)
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
+
+    @commands.command(name="vunmute", aliases=["voiceunmute", "serverunmute"])
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    @commands.bot_has_permissions(mute_members=True)
+    async def voice_unmute_cmd(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Kein Grund angegeben"):
+        """Hebt den Server-Mute auf. Nur für Admins."""
+        try:
+            await member.edit(mute=False, reason=f"Server-Unmute von Admin {ctx.author}: {reason}")
+            await ctx.send(f"🔊 {member.mention} ist nicht mehr stummgeschaltet.\n**Grund:** {reason}", delete_after=15)
+            log_embed = discord.Embed(
+                title="🔊 Server-Unmute (Voice)",
+                description=f"**User:** {member.mention} (`{member.id}`)\n**Admin:** {ctx.author.mention}\n**Grund:** {reason}",
+                color=discord.Color.green(),
+                timestamp=_now(),
+            )
+            log_embed.set_thumbnail(url=member.display_avatar.url)
+            await self._modlog_send(ctx.guild, "voice_mute", log_embed)
+        except discord.Forbidden:
+            await ctx.send("❌ Keine Berechtigung.", delete_after=10)
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
+
+    # ============================================
+    # CHANNEL LOCK (Auto-Kick bei Join)
+    # ============================================
+
+    @commands.command(name="chlock", aliases=["channellock", "lockchannel"])
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def channel_lock_cmd(self, ctx: commands.Context, channel: discord.VoiceChannel = None, *, reason: str = "Gesperrt"):
+        """Sperrt einen Voice-Channel: neue User können nicht mehr joinen.
+        Aktuelle User bleiben drin. Admins dürfen immer joinen und andere reinziehen.
+        Ohne Channel-Angabe: sperrt deinen aktuellen Voice-Channel."""
+        if channel is None:
+            if ctx.author.voice and ctx.author.voice.channel:
+                channel = ctx.author.voice.channel
+            else:
+                await ctx.send("❌ Bitte gib einen Voice-Channel an oder sei in einem.", delete_after=10)
+                return
+        locked = await self.config.guild(ctx.guild).locked_channels() or {}
+        if str(channel.id) in locked:
+            await ctx.send(f"❌ {channel.mention} ist bereits gesperrt.", delete_after=10)
+            return
+        locked[str(channel.id)] = {
+            "locked_by": ctx.author.id,
+            "locked_by_name": ctx.author.display_name,
+            "reason": reason[:500],
+            "ts": _now_ts(),
+            "channel_name": channel.name,
+            "allowed_users": [],  # User die von Admins reingezogen wurden
+        }
+        await self.config.guild(ctx.guild).locked_channels.set(locked)
+        current_count = len([m for m in channel.members if not m.bot])
+        await ctx.send(f"🔒 {channel.mention} wurde gesperrt!\n**Grund:** {reason}\n**{current_count}** User sind aktuell im Channel und bleiben drin.\n\nNeue User können nicht mehr joinen.\nAdmins dürfen jederzeit joinen und andere reinziehen.", delete_after=20)
+        log_embed = discord.Embed(
+            title="🔒 Channel gesperrt",
+            description=f"**Channel:** {channel.mention}\n**Admin:** {ctx.author.mention}\n**Grund:** {reason}\n**User im Channel:** {current_count} (bleiben drin)",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+        await self._modlog_send(ctx.guild, "mod_action", log_embed)
+
+    @commands.command(name="challow", aliases=["channelallow", "allowchannel"])
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def channel_allow_cmd(self, ctx: commands.Context, channel: discord.VoiceChannel, member: discord.Member):
+        """Erlaubt einen bestimmten User in einem gesperrten Channel zu bleiben.
+        Nützlich nachdem ein Admin den User in den Channel reingezogen hat.
+        Beispiel: [p]challow #Support-1 @User"""
+        locked = await self.config.guild(ctx.guild).locked_channels() or {}
+        if str(channel.id) not in locked:
+            await ctx.send(f"❌ {channel.mention} ist nicht gesperrt.", delete_after=10)
+            return
+        allowed = locked[str(channel.id)].get("allowed_users", [])
+        if member.id not in allowed:
+            allowed.append(member.id)
+            locked[str(channel.id)]["allowed_users"] = allowed
+            await self.config.guild(ctx.guild).locked_channels.set(locked)
+        await ctx.send(f"✅ {member.mention} darf nun in {channel.mention} bleiben (trotz Sperre).", delete_after=15)
+
+    @commands.command(name="chdisallow", aliases=["channeldisallow", "disallowchannel"])
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def channel_disallow_cmd(self, ctx: commands.Context, channel: discord.VoiceChannel, member: discord.Member):
+        """Widerruft die Erlaubnis für einen User in einem gesperrten Channel.
+        Wirft den User auch sofort raus falls er im Channel ist.
+        Beispiel: [p]chdisallow #Support-1 @User"""
+        locked = await self.config.guild(ctx.guild).locked_channels() or {}
+        if str(channel.id) not in locked:
+            await ctx.send(f"❌ {channel.mention} ist nicht gesperrt.", delete_after=10)
+            return
+        allowed = locked[str(channel.id)].get("allowed_users", [])
+        if member.id in allowed:
+            allowed.remove(member.id)
+            locked[str(channel.id)]["allowed_users"] = allowed
+            await self.config.guild(ctx.guild).locked_channels.set(locked)
+        # User sofort rausschmeißen falls im Channel
+        if member.voice and member.voice.channel and member.voice.channel.id == channel.id:
+            try:
+                await member.move_to(None, reason=f"Erlaubnis widerrufen durch {ctx.author}")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        await ctx.send(f"✅ {member.mention} darf nicht mehr in {channel.mention} bleiben.", delete_after=15)
+
+    @commands.command(name="chunlock", aliases=["channelunlock", "unlockchannel"])
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def channel_unlock_cmd(self, ctx: commands.Context, channel: discord.VoiceChannel = None):
+        """Entsperrt einen zuvor gesperrten Voice-Channel."""
+        if channel is None:
+            if ctx.author.voice and ctx.author.voice.channel:
+                channel = ctx.author.voice.channel
+            else:
+                await ctx.send("❌ Bitte gib einen Voice-Channel an.", delete_after=10)
+                return
+        locked = await self.config.guild(ctx.guild).locked_channels() or {}
+        if str(channel.id) not in locked:
+            await ctx.send(f"ℹ️ {channel.mention} ist nicht gesperrt.", delete_after=10)
+            return
+        del locked[str(channel.id)]
+        await self.config.guild(ctx.guild).locked_channels.set(locked)
+        await ctx.send(f"🔓 {channel.mention} wurde entsperrt. User können wieder joinen.", delete_after=15)
+        log_embed = discord.Embed(
+            title="🔓 Channel entsperrt",
+            description=f"**Channel:** {channel.mention}\n**Admin:** {ctx.author.mention}",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        await self._modlog_send(ctx.guild, "mod_action", log_embed)
+
+    @commands.command(name="chlocklist", aliases=["lockedchannels", "lockedlist"])
+    @commands.guild_only()
+    @checks.mod_or_permissions(manage_messages=True)
+    async def channel_lock_list_cmd(self, ctx: commands.Context):
+        """Zeigt alle gesperrten Channels."""
+        locked = await self.config.guild(ctx.guild).locked_channels() or {}
+        if not locked:
+            await ctx.send("✅ Keine Channels gesperrt.")
+            return
+        embed = discord.Embed(title=f"🔒 Gesperrte Channels ({len(locked)})", color=discord.Color.red(), timestamp=_now())
+        for ch_id_str, data in locked.items():
+            ch = ctx.guild.get_channel(int(ch_id_str))
+            ch_name = ch.mention if ch else f"Channel {ch_id_str} (gelöscht)"
+            embed.add_field(
+                name=f"🔒 {ch_name}",
+                value=f"📝 {data.get('reason', '?')[:100]}\n👤 Von: {data.get('locked_by_name', '?')}\n📅 {_fmt_berlin_date(_from_ts(data.get('ts', 0)))}",
+                inline=False,
+            )
+        await ctx.send(embed=embed)
 
     # ============================================
     # ANONYME MOD-AKTIONEN (Moderator wird in DM nicht genannt)
