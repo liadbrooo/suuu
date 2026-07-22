@@ -404,6 +404,19 @@ class SupportCog(DashboardIntegration, commands.Cog):
             "team_blacklist_channel": None,  # Channel wo Blacklist-Einträge gesendet werden
             "team_blacklist_panel_channel": None,  # Channel für das Blacklist-Panel
             "team_blacklist_panel_message": None,  # Message-ID des Panels
+            # WILLKOMMENS-SYSTEM
+            "welcome_enabled": False,
+            "welcome_channel": None,
+            "welcome_title": "👋 Willkommen auf {server}!",
+            "welcome_description": "Hallo {user}!\n\nWillkommen auf **{server}**! Du bist unser **{member_count}**. Mitglied.\n\nSchau dich ruhig um und bei Fragen kannst du dich gerne an das Team wenden.",
+            "welcome_color": "blurple",
+            "welcome_image_url": None,  # Banner-Image URL
+            "welcome_thumbnail_url": None,  # Thumbnail URL (kleines Bild)
+            "welcome_footer": "Wir freuen uns, dass du da bist! 🎉",
+            "welcome_text_before": None,  # Text vor dem Embed (für @mentions)
+            "welcome_text_after": None,  # Text nach dem Embed
+            "welcome_dm_enabled": False,
+            "welcome_dm_text": None,
             # NEUE FEATURES
             "giveaways": {},  # {message_id: {prize, end_ts, channel_id, host_id, ended, winners}}
             "trial_role": None,  # Trial-Rolle (Probemitglied)
@@ -7158,6 +7171,11 @@ class SupportCog(DashboardIntegration, commands.Cog):
                         await self._modlog_send(member.guild, "mod_action", notif_embed)
         except Exception:
             log.exception("Fehler im Watchlist Rejoin-Check")
+        # Willkommensnachricht senden
+        try:
+            await self._send_welcome(member)
+        except Exception:
+            log.exception("Fehler beim Senden der Willkommensnachricht")
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
@@ -18380,6 +18398,301 @@ class SupportCog(DashboardIntegration, commands.Cog):
             await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
         except discord.HTTPException:
             pass
+
+    # ============================================
+    # WILLKOMMENS-SYSTEM
+    # ============================================
+
+    @commands.group(name="willkommensset", aliases=["wset", "welcome", "welcomeset"])
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def welcome_set(self, ctx: commands.Context):
+        """Konfiguriert das Willkommens-System.
+        Variablen: {user} {server} {member_count} {user_name} {user_id}"""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @welcome_set.command(name="toggle")
+    async def ws_toggle(self, ctx: commands.Context):
+        """Aktiviert/deaktiviert Willkommensnachrichten."""
+        current = await self.config.guild(ctx.guild).welcome_enabled()
+        await self.config.guild(ctx.guild).welcome_enabled.set(not current)
+        await ctx.send(f"✅ Willkommensnachrichten **{'aktiviert' if not current else 'deaktiviert'}**.")
+
+    @welcome_set.command(name="channel")
+    async def ws_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Setzt den Channel für Willkommensnachrichten."""
+        if channel is None:
+            await self.config.guild(ctx.guild).welcome_channel.set(None)
+            await ctx.send("✅ Willkommens-Channel zurückgesetzt.")
+            return
+        await self.config.guild(ctx.guild).welcome_channel.set(channel.id)
+        await ctx.send(f"✅ Willkommens-Channel: {channel.mention}.")
+
+    @welcome_set.command(name="title")
+    async def ws_title(self, ctx: commands.Context, *, title: str = None):
+        """Setzt den Embed-Titel. Variablen: {user} {server} {member_count}"""
+        if title is None:
+            current = await self.config.guild(ctx.guild).welcome_title()
+            await ctx.send(f"📋 Aktueller Titel:\n```\n{current}\n```")
+            return
+        if len(title) > 256:
+            await ctx.send("❌ Titel zu lang (max 256 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).welcome_title.set(title)
+        await ctx.send(f"✅ Titel gesetzt:\n```\n{title}\n```")
+
+    @welcome_set.command(name="description", aliases=["desc", "text"])
+    async def ws_description(self, ctx: commands.Context, *, description: str = None):
+        """Setzt die Embed-Beschreibung. Variablen: {user} {server} {member_count} {user_name}"""
+        if description is None:
+            current = await self.config.guild(ctx.guild).welcome_description()
+            await ctx.send(f"📋 Aktuelle Beschreibung:\n```\n{current}\n```")
+            return
+        if len(description) > 4096:
+            await ctx.send("❌ Beschreibung zu lang (max 4096 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).welcome_description.set(description)
+        await ctx.send(f"✅ Beschreibung gesetzt:\n```\n{description[:500]}\n```")
+
+    @welcome_set.command(name="color", aliases=["farbe"])
+    async def ws_color(self, ctx: commands.Context, color: str = None):
+        """Setzt die Embed-Farbe. Optionen: blurple, green, red, orange, gold, purple, dark_blue, random"""
+        valid = ["blurple", "green", "red", "orange", "gold", "purple", "dark_blue", "dark_grey", "random"]
+        if color is None:
+            current = await self.config.guild(ctx.guild).welcome_color()
+            await ctx.send(f"📋 Aktuelle Farbe: **{current}**\nVerfügbare Farben: {', '.join(valid)}")
+            return
+        if color.lower() not in valid:
+            await ctx.send(f"❌ Ungültige Farbe. Optionen: {', '.join(valid)}")
+            return
+        await self.config.guild(ctx.guild).welcome_color.set(color.lower())
+        await ctx.send(f"✅ Farbe gesetzt auf **{color.lower()}**.")
+
+    @welcome_set.command(name="image", aliases=["bild"])
+    async def ws_image(self, ctx: commands.Context, url: str = None):
+        """Setzt das Banner-Image (großes Bild unten im Embed). URL oder 'none' zum entfernen."""
+        if url is None:
+            current = await self.config.guild(ctx.guild).welcome_image_url()
+            await ctx.send(f"📋 Aktuelles Image: {current or 'Keines'}")
+            return
+        if url.lower() in ("none", "off", "remove", "entfernen"):
+            await self.config.guild(ctx.guild).welcome_image_url.set(None)
+            await ctx.send("✅ Banner-Image entfernt.")
+            return
+        if not url.startswith("http"):
+            await ctx.send("❌ URL muss mit http:// oder https:// beginnen.")
+            return
+        await self.config.guild(ctx.guild).welcome_image_url.set(url)
+        await ctx.send(f"✅ Banner-Image gesetzt.")
+
+    @welcome_set.command(name="thumbnail", aliases=["thumb"])
+    async def ws_thumbnail(self, ctx: commands.Context, url: str = None):
+        """Setzt das Thumbnail (kleines Bild oben rechts). URL oder 'none' zum entfernen."""
+        if url is None:
+            current = await self.config.guild(ctx.guild).welcome_thumbnail_url()
+            await ctx.send(f"📋 Aktuelles Thumbnail: {current or 'Keines'}")
+            return
+        if url.lower() in ("none", "off", "remove", "entfernen"):
+            await self.config.guild(ctx.guild).welcome_thumbnail_url.set(None)
+            await ctx.send("✅ Thumbnail entfernt.")
+            return
+        if not url.startswith("http"):
+            await ctx.send("❌ URL muss mit http:// oder https:// beginnen.")
+            return
+        await self.config.guild(ctx.guild).welcome_thumbnail_url.set(url)
+        await ctx.send(f"✅ Thumbnail gesetzt.")
+
+    @welcome_set.command(name="footer")
+    async def ws_footer(self, ctx: commands.Context, *, footer: str = None):
+        """Setzt den Embed-Footer. Variablen: {user} {server} {member_count}"""
+        if footer is None:
+            current = await self.config.guild(ctx.guild).welcome_footer()
+            await ctx.send(f"📋 Aktueller Footer:\n```\n{current}\n```")
+            return
+        if len(footer) > 2048:
+            await ctx.send("❌ Footer zu lang (max 2048 Zeichen).")
+            return
+        await self.config.guild(ctx.guild).welcome_footer.set(footer)
+        await ctx.send(f"✅ Footer gesetzt:\n```\n{footer}\n```")
+
+    @welcome_set.command(name="textbefore", aliases=["vor", "before"])
+    async def ws_text_before(self, ctx: commands.Context, *, text: str = None):
+        """Setzt Text der VOR dem Embed gesendet wird (z.B. für @mentions). Variablen: {user} {server}"""
+        if text is None:
+            current = await self.config.guild(ctx.guild).welcome_text_before()
+            await ctx.send(f"📋 Aktueller Text vor Embed: {current or 'Keiner'}")
+            return
+        if text.lower() in ("none", "off", "remove", "entfernen"):
+            await self.config.guild(ctx.guild).welcome_text_before.set(None)
+            await ctx.send("✅ Text vor Embed entfernt.")
+            return
+        await self.config.guild(ctx.guild).welcome_text_before.set(text[:2000])
+        await ctx.send(f"✅ Text vor Embed gesetzt:\n```\n{text[:500]}\n```")
+
+    @welcome_set.command(name="textafter", aliases=["nach", "after"])
+    async def ws_text_after(self, ctx: commands.Context, *, text: str = None):
+        """Setzt Text der NACH dem Embed gesendet wird. Variablen: {user} {server}"""
+        if text is None:
+            current = await self.config.guild(ctx.guild).welcome_text_after()
+            await ctx.send(f"📋 Aktueller Text nach Embed: {current or 'Keiner'}")
+            return
+        if text.lower() in ("none", "off", "remove", "entfernen"):
+            await self.config.guild(ctx.guild).welcome_text_after.set(None)
+            await ctx.send("✅ Text nach Embed entfernt.")
+            return
+        await self.config.guild(ctx.guild).welcome_text_after.set(text[:2000])
+        await ctx.send(f"✅ Text nach Embed gesetzt:\n```\n{text[:500]}\n```")
+
+    @welcome_set.command(name="dm")
+    async def ws_dm(self, ctx: commands.Context, on_off: str = None):
+        """Aktiviert/deaktiviert eine zusätzliche Willkommens-DM an den neuen User."""
+        if on_off is None:
+            current = await self.config.guild(ctx.guild).welcome_dm_enabled()
+            await ctx.send(f"📋 Willkommens-DM: **{'an' if current else 'aus'}**")
+            return
+        val = on_off.lower() in ("on", "an", "true", "1", "yes", "ja")
+        await self.config.guild(ctx.guild).welcome_dm_enabled.set(val)
+        await ctx.send(f"✅ Willkommens-DM **{'aktiviert' if val else 'deaktiviert'}**.")
+
+    @welcome_set.command(name="dmtext")
+    async def ws_dm_text(self, ctx: commands.Context, *, text: str = None):
+        """Setzt den Text für die Willkommens-DM. Variablen: {user} {server} {member_count}"""
+        if text is None:
+            current = await self.config.guild(ctx.guild).welcome_dm_text()
+            await ctx.send(f"📋 Aktueller DM-Text: {current or 'Keiner'}")
+            return
+        if text.lower() in ("none", "off", "remove", "entfernen"):
+            await self.config.guild(ctx.guild).welcome_dm_text.set(None)
+            await ctx.send("✅ DM-Text entfernt.")
+            return
+        await self.config.guild(ctx.guild).welcome_dm_text.set(text[:2000])
+        await ctx.send(f"✅ DM-Text gesetzt:\n```\n{text[:500]}\n```")
+
+    @welcome_set.command(name="show", aliases=["anzeigen", "preview"])
+    async def ws_show(self, ctx: commands.Context):
+        """Zeigt eine Vorschau der Willkommensnachricht."""
+        embed = await self._build_welcome_embed(ctx.guild, ctx.author)
+        text_before = await self.config.guild(ctx.guild).welcome_text_before()
+        text_after = await self.config.guild(ctx.guild).welcome_text_after()
+        # Variablen ersetzen für Preview
+        if text_before:
+            text_before = self._replace_welcome_vars(text_before, ctx.guild, ctx.author)
+        if text_after:
+            text_after = self._replace_welcome_vars(text_after, ctx.guild, ctx.author)
+        content_parts = []
+        if text_before:
+            content_parts.append(text_before)
+        content_parts.append("*[Embed-Vorschau]*")
+        if text_after:
+            content_parts.append(text_after)
+        content = "\n".join(content_parts)
+        await ctx.send(content=content[:2000], embed=embed)
+
+    @welcome_set.command(name="reset")
+    async def ws_reset(self, ctx: commands.Context):
+        """Setzt alle Willkommens-Einstellungen zurück."""
+        await self.config.guild(ctx.guild).welcome_enabled.set(False)
+        await self.config.guild(ctx.guild).welcome_channel.set(None)
+        await self.config.guild(ctx.guild).welcome_title.set("👋 Willkommen auf {server}!")
+        await self.config.guild(ctx.guild).welcome_description.set("Hallo {user}!\n\nWillkommen auf **{server}**! Du bist unser **{member_count}**. Mitglied.\n\nSchau dich ruhig um und bei Fragen kannst du dich gerne an das Team wenden.")
+        await self.config.guild(ctx.guild).welcome_color.set("blurple")
+        await self.config.guild(ctx.guild).welcome_image_url.set(None)
+        await self.config.guild(ctx.guild).welcome_thumbnail_url.set(None)
+        await self.config.guild(ctx.guild).welcome_footer.set("Wir freuen uns, dass du da bist! 🎉")
+        await self.config.guild(ctx.guild).welcome_text_before.set(None)
+        await self.config.guild(ctx.guild).welcome_text_after.set(None)
+        await self.config.guild(ctx.guild).welcome_dm_enabled.set(False)
+        await self.config.guild(ctx.guild).welcome_dm_text.set(None)
+        await ctx.send("✅ Alle Willkommens-Einstellungen zurückgesetzt.")
+
+    def _replace_welcome_vars(self, text: str, guild: discord.Guild, member: discord.Member) -> str:
+        """Ersetzt alle Variablen im Text."""
+        return text.format(
+            user=member.mention,
+            user_name=member.display_name,
+            user_id=member.id,
+            server=guild.name,
+            member_count=guild.member_count or len(guild.members),
+        )
+
+    async def _build_welcome_embed(self, guild: discord.Guild, member: discord.Member) -> discord.Embed:
+        """Baut das Willkommens-Embed."""
+        title = await self.config.guild(guild).welcome_title()
+        description = await self.config.guild(guild).welcome_description()
+        color_str = await self.config.guild(guild).welcome_color() or "blurple"
+        image_url = await self.config.guild(guild).welcome_image_url()
+        thumbnail_url = await self.config.guild(guild).welcome_thumbnail_url()
+        footer = await self.config.guild(guild).welcome_footer()
+        # Farben mappen
+        color_map = {
+            "blurple": discord.Color.blurple(),
+            "green": discord.Color.green(),
+            "red": discord.Color.red(),
+            "orange": discord.Color.orange(),
+            "gold": discord.Color.gold(),
+            "purple": discord.Color.purple(),
+            "dark_blue": discord.Color.dark_blue(),
+            "dark_grey": discord.Color.dark_grey(),
+            "random": discord.Color.random(),
+        }
+        color = color_map.get(color_str, discord.Color.blurple())
+        # Variablen ersetzen
+        member_count = guild.member_count or len(guild.members)
+        title = title.replace("{user}", member.mention).replace("{server}", guild.name).replace("{member_count}", str(member_count)).replace("{user_name}", member.display_name).replace("{user_id}", str(member.id))
+        description = description.replace("{user}", member.mention).replace("{server}", guild.name).replace("{member_count}", str(member_count)).replace("{user_name}", member.display_name).replace("{user_id}", str(member.id))
+        footer = footer.replace("{user}", member.display_name).replace("{server}", guild.name).replace("{member_count}", str(member_count)).replace("{user_name}", member.display_name).replace("{user_id}", str(member.id))
+        embed = discord.Embed(
+            title=title[:256],
+            description=description[:4096],
+            color=color,
+            timestamp=_now(),
+        )
+        # Thumbnail: falls nicht gesetzt, User-Avatar verwenden
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
+        else:
+            embed.set_thumbnail(url=member.display_avatar.url)
+        if image_url:
+            embed.set_image(url=image_url)
+        embed.set_footer(text=footer[:2048])
+        return embed
+
+    async def _send_welcome(self, member: discord.Member):
+        """Sendet die Willkommensnachricht für einen neuen Member."""
+        guild = member.guild
+        if not await self.config.guild(guild).welcome_enabled():
+            return
+        ch_id = await self.config.guild(guild).welcome_channel()
+        if not ch_id:
+            return
+        channel = guild.get_channel(ch_id)
+        if not channel:
+            return
+        # Embed bauen
+        embed = await self._build_welcome_embed(guild, member)
+        # Text vor/nach Embed
+        text_before = await self.config.guild(guild).welcome_text_before()
+        text_after = await self.config.guild(guild).welcome_text_after()
+        content = ""
+        if text_before:
+            content += self._replace_welcome_vars(text_before, guild, member) + "\n"
+        if text_after:
+            content += "\n" + self._replace_welcome_vars(text_after, guild, member)
+        content = content.strip()[:2000] if content.strip() else None
+        try:
+            await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"Konnte Willkommensnachricht nicht senden: {e}")
+        # DM senden falls aktiviert
+        if await self.config.guild(guild).welcome_dm_enabled():
+            dm_text = await self.config.guild(guild).welcome_dm_text()
+            if dm_text:
+                try:
+                    dm_content = self._replace_welcome_vars(dm_text, guild, member)
+                    await member.send(dm_content[:2000])
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
 
     # ============================================
     # TICKET-FLOW-DIAGRAMM
