@@ -10268,7 +10268,7 @@ class SupportCog(DashboardIntegration, commands.Cog):
     # VOICE MUTE / UNMUTE (Server-Mute, nur Admin)
     # ============================================
 
-    @commands.command(name="vmute", aliases=["voicemute", "servermute"])
+    @commands.command(name="svmute", aliases=["svm", "servermute"])
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
     @commands.bot_has_permissions(mute_members=True)
@@ -10298,7 +10298,7 @@ class SupportCog(DashboardIntegration, commands.Cog):
         except discord.HTTPException as e:
             await ctx.send(f"❌ Fehler: `{e}`", delete_after=10)
 
-    @commands.command(name="vunmute", aliases=["voiceunmute", "serverunmute"])
+    @commands.command(name="svunmute", aliases=["svum", "serverunmute"])
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
     @commands.bot_has_permissions(mute_members=True)
