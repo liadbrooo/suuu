@@ -440,7 +440,8 @@ class SupportCog(DashboardIntegration, commands.Cog):
             # Platzhalter: {user}, {moderator}, {reason}, {server}, {duration}, {case_id}
             # ============================================
             "mod_dm_enabled": True,  # Global an/aus
-            "mod_dm_ban_template": "🔨 Du wurdest auf **{server}** gebannt.\n\n**Gebannt von:** {moderator}\n**Grund:** {reason}\n**Datum:** {date}",
+            "mod_dm_unban_link": None,  # Link für Entbannungs-Antrag (wird in Ban-DM als {unban_link} eingebaut)
+            "mod_dm_ban_template": "🔨 Du wurdest auf **{server}** gebannt.\n\n**Gebannt von:** {moderator}\n**Grund:** {reason}\n**Datum:** {date}\n\n📋 **Entbannung beantragen:** {unban_link}",
             "mod_dm_kick_template": "👢 Du wurdest von **{server}** gekickt.\n\n**Gekickt von:** {moderator}\n**Grund:** {reason}\n**Datum:** {date}\n\nDu kannst mit einem Invite-Link wieder joinen.",
             "mod_dm_timeout_template": "⏰ Du wurdest auf **{server}** getimeoutet.\n\n**Getimeoutet von:** {moderator}\n**Grund:** {reason}\n**Dauer:** {duration}\n**Datum:** {date}",
             "mod_dm_warn_template": "⚠️ Du wurdest auf **{server}** verwarnt.\n\n**Verwarnt von:** {moderator}\n**Grund:** {reason}\n**Datum:** {date}\n\nBitte halte dich an die Server-Regeln.",
@@ -9678,15 +9679,22 @@ class SupportCog(DashboardIntegration, commands.Cog):
             return False
         # Moderator-Anzeige: anonym → "Server-Team", sonst Mention
         moderator_display = "Server-Team" if anonymous else (moderator.mention if hasattr(moderator, 'mention') else str(moderator))
-        # Platzhalter ersetzen
-        msg = template.format(
-            user=user.display_name if hasattr(user, 'display_name') else str(user),
-            moderator=moderator_display,
-            reason=reason or "Kein Grund angegeben",
-            server=guild.name,
-            duration=duration or "—",
-            date=_fmt_berlin_full(_now()),
-        )
+        # Unban-Link holen (nur für ban relevant, wird aber immer sicher ersetzt)
+        unban_link = await self.config.guild(guild).mod_dm_unban_link() or "Kein Link verfügbar"
+        # Platzhalter ersetzen (sicher — fehlende Platzhalter werden ignoriert)
+        try:
+            msg = template.format(
+                user=user.display_name if hasattr(user, 'display_name') else str(user),
+                moderator=moderator_display,
+                reason=reason or "Kein Grund angegeben",
+                server=guild.name,
+                duration=duration or "—",
+                date=_fmt_berlin_full(_now()),
+                unban_link=unban_link,
+            )
+        except KeyError:
+            # Falls das Template unbekannte Platzhalter enthält
+            msg = template.replace("{user}", user.display_name if hasattr(user, 'display_name') else str(user)).replace("{moderator}", moderator_display).replace("{reason}", reason or "Kein Grund angegeben").replace("{server}", guild.name).replace("{duration}", duration or "—").replace("{date}", _fmt_berlin_full(_now())).replace("{unban_link}", unban_link)
         # Titel: anonym → kein "von", zeigt nur Aktion
         action_emoji = '🔨' if action == 'ban' else '👢' if action == 'kick' else '⏰' if action == 'timeout' else '⚠️' if action == 'warn' else '✅'
         embed = discord.Embed(
@@ -10751,9 +10759,29 @@ class SupportCog(DashboardIntegration, commands.Cog):
         await self.config.guild(ctx.guild).mod_dm_enabled.set(not current)
         await ctx.send(f"✅ Mod-DMs: **{'an' if not current else 'aus'}**.")
 
+    @mod_dm_config.command(name="unbanlink", aliases=["entbannlink", "appeallink"])
+    async def mod_dm_unban_link(self, ctx: commands.Context, url: str = None):
+        """Setzt den Link für Entbannungs-Anträge. Wird in Ban-DMs als {unban_link} eingebaut.
+        Verwende 'none' um den Link zu entfernen."""
+        if url is None:
+            current = await self.config.guild(ctx.guild).mod_dm_unban_link()
+            await ctx.send(f"📋 Aktueller Entbannungs-Link: {current or 'Keiner gesetzt'}\n\nVerwende `{ctx.clean_prefix}moddm unbanlink <URL>` um ihn zu setzen.\nFüge `{unban_link}` in dein Ban-Template ein um ihn anzuzeigen.")
+            return
+        if url.lower() in ("none", "off", "remove", "entfernen", "keine"):
+            await self.config.guild(ctx.guild).mod_dm_unban_link.set(None)
+            await ctx.send("✅ Entbannungs-Link entfernt. Ban-DMs zeigen jetzt 'Kein Link verfügbar'.")
+            return
+        if not url.startswith("http"):
+            await ctx.send("❌ URL muss mit http:// oder https:// beginnen.")
+            return
+        await self.config.guild(ctx.guild).mod_dm_unban_link.set(url)
+        await ctx.send(f"✅ Entbannungs-Link gesetzt auf: {url}\n\nDer Link wird in Ban-DMs an der Stelle von `{{unban_link}}` im Template angezeigt.\nStandard-Template enthält bereits den Platzhalter. Aktuelles Template:")
+        current_template = await self.config.guild(ctx.guild).mod_dm_ban_template()
+        await ctx.send(f"```\n{current_template}\n```")
+
     @mod_dm_config.command(name="ban", aliases=["bann"])
     async def mod_dm_ban(self, ctx: commands.Context, *, template: str = None):
-        """Setzt das DM-Template für Bans. Platzhalter: {user}, {moderator}, {reason}, {server}, {date}."""
+        """Setzt das DM-Template für Bans. Platzhalter: {user}, {moderator}, {reason}, {server}, {date}, {unban_link}."""
         if template is None:
             current = await self.config.guild(ctx.guild).mod_dm_ban_template()
             await ctx.send(f"📋 Aktuelles Ban-DM-Template:\n```\n{current}\n```")
