@@ -1,7 +1,7 @@
 import discord
 from redbot.core import commands, Config
 from redbot.core.bot import Red
-from typing import Optional
+from typing import Optional, Tuple
 import asyncio
 import io
 from datetime import datetime, timedelta
@@ -121,7 +121,7 @@ class UnbanSystem(commands.Cog):
 
     # --- Hilfsfunktionen ---
 
-    async def is_on_cooldown(self, guild: discord.Guild, user_id: int) -> tuple[bool, str]:
+    async def is_on_cooldown(self, guild: discord.Guild, user_id: int) -> Tuple[bool, str]:
         async with self.config.guild(guild).cooldowns() as cooldowns:
             user_data = cooldowns.get(str(user_id))
             if not user_data:
@@ -171,7 +171,7 @@ class UnbanSystem(commands.Cog):
                 "🟢 **Entbannen:** Entbannt den Nutzer und sendet ihm den Invite.\n"
                 "🟡 **Ablehnen (30 Tage):** Schließt das Ticket. 30 Tage Cooldown.\n"
                 "🔴 **Ablehnen (Permanent):** Schließt das Ticket. Permanent blockiert.\n"
-                "🔵 **Claim:** Ticket als "in Bearbeitung" markieren.\n"
+                "🔵 **Claim:** Ticket als 'in Bearbeitung' markieren.\n"
                 "📝 **Notiz:** Interne Notiz hinzufügen."
             ),
             color=discord.Color.orange()
@@ -215,6 +215,21 @@ class UnbanSystem(commands.Cog):
             await log_channel.send(embed=embed, file=transcript_file)
         else:
             await log_channel.send(embed=embed)
+
+    async def log_channel_send_note(self, guild: discord.Guild, note_text: str, target_user_id: int, moderator: discord.Member):
+        """Sendet eine interne Notiz in den Log-Channel."""
+        log_channel_id = await self.config.guild(guild).log_channel_id()
+        if not log_channel_id: 
+            return
+        log_channel = guild.get_channel(log_channel_id)
+        if not log_channel: 
+            return
+        
+        embed = discord.Embed(title="Interne Team-Notiz", color=discord.Color.yellow(), timestamp=datetime.now())
+        embed.add_field(name="Betroffener Nutzer", value=f"`{target_user_id}`", inline=True)
+        embed.add_field(name="Moderator", value=f"{moderator.mention}", inline=True)
+        embed.add_field(name="Notiz", value=note_text, inline=False)
+        await log_channel.send(embed=embed)
 
     async def process_unban(self, interaction: discord.Interaction, user_id: int):
         guild = interaction.guild
@@ -445,22 +460,6 @@ class TicketControlView(discord.ui.View):
         modal = NoteModal(self.cog, self.user_id, interaction.channel)
         await interaction.response.send_modal(modal)
 
-
-# Hilfsfunktion für NoteModal, da log_action kein textfeld hat
-async def log_channel_send_note(self, guild: discord.Guild, note_text: str, target_user_id: int, moderator: discord.Member):
-    log_channel_id = await self.config.guild(guild).log_channel_id()
-    if not log_channel_id: return
-    log_channel = guild.get_channel(log_channel_id)
-    if not log_channel: return
-    
-    embed = discord.Embed(title="Interne Team-Notiz", color=discord.Color.yellow(), timestamp=datetime.now())
-    embed.add_field(name="Betroffener Nutzer", value=f"`{target_user_id}`", inline=True)
-    embed.add_field(name="Moderator", value=f"{moderator.mention}", inline=True)
-    embed.add_field(name="Notiz", value=note_text, inline=False)
-    await log_channel.send(embed=embed)
-
-# Methode an die Klasse anhängen (Monkey Patching für RedBot Cog Kompatibilität ohne lange Vererbung)
-UnbanSystem.log_channel_send_note = log_channel_send_note
 
 async def setup(bot: Red):
     await bot.add_cog(UnbanSystem(bot))
