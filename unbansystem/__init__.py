@@ -110,7 +110,7 @@ class UnbanSystem(commands.Cog):
         embed = discord.Embed(
             title="🎓 Entbannung beantragen",
             description=(
-                "Wenn du auf dem Hauptdiscord gebannt wurdest und Einsicht einsehst, "
+                "Wenn du auf dem Hauptdiscord gebannt wurdest und Einsicht zeigst, "
                 "klicke unten auf den Button, um ein Ticket zu eröffnen.\n\n"
                 "**⚠️ Achtung:** Missbrauch des Systems führt zu einer permanenten Blockierung!"
             ),
@@ -141,7 +141,7 @@ class UnbanSystem(commands.Cog):
                 del cooldowns[str(user_id)]
                 return False, ""
 
-    async def create_ticket_channel(self, guild: discord.Guild, user_id: int, username: str) -> discord.TextChannel:
+    async def create_ticket_channel(self, guild: discord.Guild, member: discord.Member) -> discord.TextChannel:
         category_id = await self.config.guild(guild).ticket_category_id()
         staff_role_id = await self.config.guild(guild).staff_role_id()
         
@@ -151,13 +151,14 @@ class UnbanSystem(commands.Cog):
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True), # FIX: Nutzer darf sehen
         }
         if staff_role:
             overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
             
-        channel_name = f"entbannung-{username[:20]}"
-        channel = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites, reason=f"Entbannungsticket von {username}")
-        await channel.edit(topic=f"unban-ticket-{user_id}")
+        channel_name = f"entbannung-{member.name[:20]}"
+        channel = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites, reason=f"Entbannungsticket von {member.name}")
+        await channel.edit(topic=f"unban-ticket-{member.id}")
         return channel
 
     async def send_ticket_control(self, channel: discord.TextChannel, user_id: int, ban_info: str, application_text: str):
@@ -350,7 +351,12 @@ class UnbanApplicationModal(discord.ui.Modal, title="Entbannungs-Antrag"):
             return await interaction.response.send_message(f"❌ Du kannst aktuell kein Ticket eröffnen. {msg}", ephemeral=True)
             
         # Channel erstellen
-        channel = await self.cog.create_ticket_channel(guild, interaction.user.id, interaction.user.name)
+        channel = await self.cog.create_ticket_channel(guild, interaction.user)
+        
+        # Team ping (FIX)
+        staff_role_id = await self.cog.config.guild(guild).staff_role_id()
+        staff_ping = f"<@&{staff_role_id}>" if staff_role_id else ""
+        await channel.send(f"{staff_ping} Ein neuer Entbannungsantrag ist eingegangen!", allowed_mentions=discord.AllowedMentions(roles=True))
         
         # Bann-Info vom Hauptserver abrufen
         main_server_id = await self.cog.config.guild(guild).main_server_id()
