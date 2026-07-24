@@ -597,14 +597,12 @@ class TicketControlView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
         
-        # Wenn es der Zurückziehen-Button ist, darf nur der Antragsteller klicken
         if interaction.data["custom_id"] == "unban_user_close":
             if interaction.user.id != self.applicant_id and not interaction.user.guild_permissions.administrator:
                 await interaction.response.send_message("❌ Nur der Antragsteller kann den Antrag zurückziehen.", ephemeral=True)
                 return False
             return True
             
-        # Für alle anderen Buttons gilt: Nur Team
         if staff_role_id is None:
             return True
         
@@ -629,7 +627,8 @@ class TicketControlView(discord.ui.View):
         button.disabled = True
         button.label = f"Claimed by {interaction.user.name}"
         await interaction.message.edit(view=self)
-        await interaction.response.send_message(f"🔵 {interaction.user.mention} kümmert sich nun um dieses Ticket.\n\n⏳ {interaction.user.mention}, dein Antrag wird nun geprüft. Bitte habe etwas Geduld.", ephemeral=False)
+        # FIX: Antragsteller (applicant_id) wird korrekt gepingt, nicht der Moderator
+        await interaction.response.send_message(f"🔵 {interaction.user.mention} kümmert sich nun um dieses Ticket.\n\n⏳ <@{self.applicant_id}>, dein Antrag wird nun geprüft. Bitte habe etwas Geduld.", ephemeral=False)
 
     @discord.ui.button(label="Hinzufügen", style=discord.ButtonStyle.secondary, custom_id="unban_add_user", emoji="➕")
     async def add_user(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -642,12 +641,26 @@ class TicketControlView(discord.ui.View):
             if thread.name == "Interne Diskussion":
                 return await interaction.response.send_message(f"Ein privater Thread existiert bereits: {thread.mention}", ephemeral=True)
         
+        # FIX: invitable=False verhindert, dass normale User Leute einladen. 
         thread = await interaction.channel.create_thread(
             name="Interne Diskussion",
             type=discord.ChannelType.private_thread,
             auto_archive_duration=10080,
+            invitable=False,
             reason=f"Interne Diskussion für Ticket von {self.user_id}"
         )
+        
+        # FIX: Moderator explizit hinzufügen, damit er im privaten Thread schreiben kann
+        await thread.add_user(interaction.user)
+        
+        # FIX: Antragsteller explizit entfernen, falls er durch Admin/Team-Rechte reingekommen ist
+        applicant = interaction.guild.get_member(self.applicant_id)
+        if applicant:
+            try:
+                await thread.remove_user(applicant)
+            except discord.HTTPException:
+                pass
+                
         await thread.send(f"🔒 Dies ist ein privater Thread für das Team. Der Antragsteller sieht diesen Thread nicht. Hier könnt ihr intern über den Antrag von <@{self.user_id}> diskutieren.")
         await interaction.response.send_message(f"💬 Ein privater Thread für die interne Diskussion wurde erstellt: {thread.mention}", ephemeral=True)
 
