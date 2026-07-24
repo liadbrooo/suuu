@@ -406,9 +406,6 @@ class UnbanSystem(commands.Cog):
                     await user.send(f"❌ Dein Entbannungsantrag wurde abgelehnt. Du kannst in {days} Tagen erneut einen Antrag stellen.")
             except discord.Forbidden:
                 pass
-            
-        status_text = "permanent abgelehnt" if permanent else f"für {days} Tage abgelehnt"
-        await interaction.followup.send(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...")
         
         transcript = await self.generate_html_transcript(interaction.channel)
         action = "Abgelehnt (Permanent)" if permanent else f"Abgelehnt ({days} Tage)"
@@ -580,7 +577,11 @@ class RejectModal(discord.ui.Modal, title="Antrag ablehnen"):
         days_int = int(self.days_input.value)
         permanent = True if days_int == 0 else False
         
-        await interaction.response.defer() # Verhindert "Interaktion fehlgeschlagen"
+        status_text = "permanent abgelehnt" if permanent else f"für {days_int} Tage abgelehnt"
+        # FIX: Direkt auf das Modal antworten verhindert den Interaktionsfehler
+        await interaction.response.send_message(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...", ephemeral=False)
+        
+        # Danach die eigentliche Logik ausführen
         await self.cog.process_reject(interaction, self.user_id, permanent, days_int)
 
 
