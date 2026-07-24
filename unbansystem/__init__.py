@@ -229,7 +229,7 @@ class UnbanSystem(commands.Cog):
                 "❌ **Ablehnen:** Öffnet ein Fenster zur Eingabe der Cooldown-Tage (0 = Permanent).\n"
                 "🔵 **Claim:** Ticket als 'in Bearbeitung' markieren.\n"
                 "➕ **Hinzufügen:** Ein weiteres Teammitglied zum Ticket hinzufügen.\n"
-                "💬 **Diskussion:** Eröffnet einen privaten Thread *innerhalb* des Tickets für interne Gespräche.\n\n"
+                "💬 **Diskussion:** Eröffnet einen separaten, versteckten Channel für interne Gespräche.\n\n"
                 "**Antragsteller-Aktion:**\n"
                 "↩️ **Zurückziehen:** Zieht den Antrag zurück und schließt das Ticket sofort."
             ),
@@ -239,7 +239,6 @@ class UnbanSystem(commands.Cog):
         await channel.send(embed=embed, view=view)
 
     async def generate_html_transcript(self, channel: discord.TextChannel) -> discord.File:
-        """Liest den Channelverlauf aus und erstellt eine .html Datei im Discord-Look."""
         messages = []
         async for msg in channel.history(limit=None, oldest_first=True):
             timestamp = msg.created_at.strftime("%d.%m.%Y %H:%M:%S")
@@ -322,6 +321,7 @@ class UnbanSystem(commands.Cog):
         archive_cat = guild.get_channel(archive_cat_id) if archive_cat_id else None
         
         topic = channel.topic or ""
+        new_topic = topic
         if "unban-ticket-" in topic:
             try:
                 user_id = int(topic.replace("unban-ticket-", ""))
@@ -330,11 +330,19 @@ class UnbanSystem(commands.Cog):
                     await channel.set_permissions(user, view_channel=False, send_messages=False, read_message_history=False)
             except:
                 pass
+            # FIX: Thema ändern, damit das System nicht mehr denkt, es sei ein offenes Ticket
+            new_topic = topic.replace("unban-ticket-", "archiviert-")
+                
+        # Zugehörigen Diskussions-Channel löschen, falls vorhanden
+        for ch in guild.text_channels:
+            if ch.topic == f"diskussion-zu-{channel.id}":
+                await ch.delete(reason="Zugehöriges Ticket wurde archiviert")
+                break
                 
         if archive_cat:
-            await channel.edit(category=archive_cat, name=f"archiv-{channel.name[11:]}", reason=f"Archiviert: {reason}")
+            await channel.edit(category=archive_cat, name=f"archiv-{channel.name[11:]}", topic=new_topic, reason=f"Archiviert: {reason}")
         else:
-            await channel.edit(name=f"archiv-{channel.name[11:]}", reason=f"Archiviert: {reason}")
+            await channel.edit(name=f"archiv-{channel.name[11:]}", topic=new_topic, reason=f"Archiviert: {reason}")
 
     async def process_unban(self, interaction: discord.Interaction, user_id: int):
         guild = interaction.guild
@@ -627,7 +635,6 @@ class TicketControlView(discord.ui.View):
         button.disabled = True
         button.label = f"Claimed by {interaction.user.name}"
         await interaction.message.edit(view=self)
-        # FIX: Antragsteller (applicant_id) wird korrekt gepingt, nicht der Moderator
         await interaction.response.send_message(f"🔵 {interaction.user.mention} kümmert sich nun um dieses Ticket.\n\n⏳ <@{self.applicant_id}>, dein Antrag wird nun geprüft. Bitte habe etwas Geduld.", ephemeral=False)
 
     @discord.ui.button(label="Hinzufügen", style=discord.ButtonStyle.secondary, custom_id="unban_add_user", emoji="➕")
@@ -637,32 +644,38 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Diskussion", style=discord.ButtonStyle.secondary, custom_id="unban_thread", emoji="💬")
     async def create_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for thread in interaction.channel.threads:
-            if thread.name == "Interne Diskussion":
-                return await interaction.response.send_message(f"Ein privater Thread existiert bereits: {thread.mention}", ephemeral=True)
+        guild = interaction.guild
+        ticket_channel = interaction.channel
         
-        # FIX: invitable=False verhindert, dass normale User Leute einladen. 
-        thread = await interaction.channel.create_thread(
-            name="Interne Diskussion",
-            type=discord.ChannelType.private_thread,
-            auto_archive_duration=10080,
-            invitable=False,
-            reason=f"Interne Diskussion für Ticket von {self.user_id}"
-        )
+        for ch in guild.text_channels:
+            if ch.topic == f"diskussion-zu-{ticket_channel.id}":
+                return await interaction.response.send_message(f"Ein Diskussions-Channel existiert bereits: {ch.mention}", ephemeral=True)
         
-        # FIX: Moderator explizit hinzufügen, damit er im privaten Thread schreiben kann
-        await thread.add_user(interaction.user)
+        category_id = await self.cog.config.guild(guild).ticket_category_id()
+        staff_role_id = await self.cog.config.guild(guild).staff_role_id()
+        category = guild.get_channel(category_id) if category_id else ticket_channel.category
+        staff_role = guild.get_role(staff_role_id) if staff_role_id else None
+        applicant = guild.get_member(self.applicant_id)
         
-        # FIX: Antragsteller explizit entfernen, falls er durch Admin/Team-Rechte reingekommen ist
-        applicant = interaction.guild.get_member(self.applicant_id)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+        }
         if applicant:
-            try:
-                await thread.remove_user(applicant)
-            except discord.HTTPException:
-                pass
-                
-        await thread.send(f"🔒 Dies ist ein privater Thread für das Team. Der Antragsteller sieht diesen Thread nicht. Hier könnt ihr intern über den Antrag von <@{self.user_id}> diskutieren.")
-        await interaction.response.send_message(f"💬 Ein privater Thread für die interne Diskussion wurde erstellt: {thread.mention}", ephemeral=True)
+            overwrites[applicant] = discord.PermissionOverwrite(view_channel=False)
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            
+        disc_channel = await guild.create_text_channel(
+            name=f"diskussion-{ticket_channel.name[11:]}",
+            category=category,
+            overwrites=overwrites,
+            reason=f"Interne Diskussion für Ticket {ticket_channel.name}"
+        )
+        await disc_channel.edit(topic=f"diskussion-zu-{ticket_channel.id}")
+        
+        await disc_channel.send(f"🔒 Dies ist der interne Channel für das Team. Der Antragsteller sieht diesen Channel nicht. Hier könnt ihr über den Antrag von <@{self.user_id}> diskutieren.\nTicket: {ticket_channel.mention}")
+        await interaction.response.send_message(f"💬 Ein interner Discussions-Channel wurde erstellt: {disc_channel.mention}", ephemeral=True)
 
     @discord.ui.button(label="Antrag zurückziehen", style=discord.ButtonStyle.danger, custom_id="unban_user_close", emoji="↩️")
     async def user_close(self, interaction: discord.Interaction, button: discord.ui.Button):
