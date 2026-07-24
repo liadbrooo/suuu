@@ -577,11 +577,12 @@ class RejectModal(discord.ui.Modal, title="Antrag ablehnen"):
         days_int = int(self.days_input.value)
         permanent = True if days_int == 0 else False
         
-        status_text = "permanent abgelehnt" if permanent else f"für {days_int} Tage abgelehnt"
-        # FIX: Direkt auf das Modal antworten verhindert den Interaktionsfehler
-        await interaction.response.send_message(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...", ephemeral=False)
+        # FIX: Sofortiges Defer verhindert den Timeout-Fehler zu 100%
+        await interaction.response.defer()
         
-        # Danach die eigentliche Logik ausführen
+        status_text = "permanent abgelehnt" if permanent else f"für {days_int} Tage abgelehnt"
+        await interaction.followup.send(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...", ephemeral=False)
+        
         await self.cog.process_reject(interaction, self.user_id, permanent, days_int)
 
 
@@ -607,18 +608,10 @@ class TicketControlView(discord.ui.View):
         self.user_id = user_id
         self.applicant_id = applicant_id
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    async def check_staff(self, interaction: discord.Interaction) -> bool:
         staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
-        
-        if interaction.data.get("custom_id") == "unban_user_close":
-            if interaction.user.id != self.applicant_id and not interaction.user.guild_permissions.administrator:
-                await interaction.response.send_message("❌ Nur der Antragsteller kann den Antrag zurückziehen.", ephemeral=True)
-                return False
-            return True
-            
         if staff_role_id is None:
             return True
-        
         if staff_role_id not in [role.id for role in interaction.user.roles] and not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Du hast keine Berechtigung, diese Buttons zu nutzen.", ephemeral=True)
             return False
@@ -626,17 +619,20 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Entbannen", style=discord.ButtonStyle.success, custom_id="unban_accept", emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_staff(interaction): return
         button.disabled = True
         await interaction.response.edit_message(view=self)
         await self.cog.process_unban(interaction, self.user_id)
 
     @discord.ui.button(label="Ablehnen", style=discord.ButtonStyle.danger, custom_id="unban_reject", emoji="❌")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_staff(interaction): return
         modal = RejectModal(self.cog, self.user_id)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="unban_claim", emoji="🔵")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_staff(interaction): return
         button.disabled = True
         button.label = f"Claimed by {interaction.user.name}"
         await interaction.response.edit_message(view=self)
@@ -644,11 +640,13 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Hinzufügen", style=discord.ButtonStyle.secondary, custom_id="unban_add_user", emoji="➕")
     async def add_user(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_staff(interaction): return
         modal = AddUserModal(self.cog)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Diskussion", style=discord.ButtonStyle.secondary, custom_id="unban_thread", emoji="💬")
     async def create_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_staff(interaction): return
         await interaction.response.defer(ephemeral=True)
         
         guild = interaction.guild
@@ -686,6 +684,9 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Antrag zurückziehen", style=discord.ButtonStyle.danger, custom_id="unban_user_close", emoji="↩️")
     async def user_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.applicant_id and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Nur der Antragsteller kann den Antrag zurückziehen.", ephemeral=True)
+            return
         button.disabled = True
         await interaction.response.edit_message(view=self)
         await self.cog.process_withdraw(interaction, self.user_id)
