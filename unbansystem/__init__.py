@@ -348,18 +348,18 @@ class UnbanSystem(commands.Cog):
         invite_url = await self.config.guild(guild).invite_url()
         
         if not main_server_id or not invite_url:
-            return await interaction.followup.send("❌ Setup ist unvollständig.", ephemeral=True)
+            return await interaction.channel.send("❌ Setup ist unvollständig.")
             
         main_guild = self.bot.get_guild(main_server_id)
         if not main_guild:
-            return await interaction.followup.send("❌ Bot ist nicht auf dem Hauptdiscord.", ephemeral=True)
+            return await interaction.channel.send("❌ Bot ist nicht auf dem Hauptdiscord.")
             
         try:
             await main_guild.unban(discord.Object(id=user_id), reason=f"Entbannt durch {interaction.user}")
         except discord.NotFound:
             pass
         except discord.Forbidden:
-            return await interaction.followup.send("❌ Bot hat keine Rechte zum Entbannen auf dem Hauptdiscord.", ephemeral=True)
+            return await interaction.channel.send("❌ Bot hat keine Rechte zum Entbannen auf dem Hauptdiscord.")
             
         user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
         if user:
@@ -372,7 +372,7 @@ class UnbanSystem(commands.Cog):
             if str(user_id) in cooldowns:
                 del cooldowns[str(user_id)]
                 
-        await interaction.followup.send(f"✅ `{user_id}` wurde entbannt und eingeladen. Ticket wird archiviert...")
+        await interaction.channel.send(f"✅ `{user_id}` wurde entbannt und eingeladen. Ticket wird archiviert...")
         
         transcript = await self.generate_html_transcript(interaction.channel)
         await self.log_action(guild, "Entbannt (Akzeptiert)", user_id, interaction.user, transcript)
@@ -424,7 +424,7 @@ class UnbanSystem(commands.Cog):
 
     async def process_withdraw(self, interaction: discord.Interaction, user_id: int):
         guild = interaction.guild
-        await interaction.followup.send("↩️ Dieser Antrag wurde vom Antragsteller zurückgezogen. Das Ticket wird archiviert...", ephemeral=False)
+        await interaction.channel.send("↩️ Dieser Antrag wurde vom Antragsteller zurückgezogen. Das Ticket wird archiviert...")
         
         transcript = await self.generate_html_transcript(interaction.channel)
         await self.log_action(guild, "Zurückgezogen durch Antragsteller", user_id, interaction.user, transcript)
@@ -577,11 +577,8 @@ class RejectModal(discord.ui.Modal, title="Antrag ablehnen"):
         days_int = int(self.days_input.value)
         permanent = True if days_int == 0 else False
         
-        # FIX: Sofortiges Defer verhindert den Timeout-Fehler zu 100%
-        await interaction.response.defer()
-        
         status_text = "permanent abgelehnt" if permanent else f"für {days_int} Tage abgelehnt"
-        await interaction.followup.send(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...", ephemeral=False)
+        await interaction.response.send_message(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...", ephemeral=False)
         
         await self.cog.process_reject(interaction, self.user_id, permanent, days_int)
 
@@ -608,45 +605,56 @@ class TicketControlView(discord.ui.View):
         self.user_id = user_id
         self.applicant_id = applicant_id
 
-    async def check_staff(self, interaction: discord.Interaction) -> bool:
-        staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
-        if staff_role_id is None:
-            return True
-        if staff_role_id not in [role.id for role in interaction.user.roles] and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Du hast keine Berechtigung, diese Buttons zu nutzen.", ephemeral=True)
-            return False
-        return True
-
     @discord.ui.button(label="Entbannen", style=discord.ButtonStyle.success, custom_id="unban_accept", emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.check_staff(interaction): return
+        staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
+        has_perm = (staff_role_id is None or staff_role_id in [r.id for r in interaction.user.roles] or interaction.user.guild_permissions.administrator)
+        if not has_perm:
+            return await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            
         button.disabled = True
         await interaction.response.edit_message(view=self)
         await self.cog.process_unban(interaction, self.user_id)
 
     @discord.ui.button(label="Ablehnen", style=discord.ButtonStyle.danger, custom_id="unban_reject", emoji="❌")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.check_staff(interaction): return
+        staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
+        has_perm = (staff_role_id is None or staff_role_id in [r.id for r in interaction.user.roles] or interaction.user.guild_permissions.administrator)
+        if not has_perm:
+            return await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            
         modal = RejectModal(self.cog, self.user_id)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="unban_claim", emoji="🔵")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.check_staff(interaction): return
+        staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
+        has_perm = (staff_role_id is None or staff_role_id in [r.id for r in interaction.user.roles] or interaction.user.guild_permissions.administrator)
+        if not has_perm:
+            return await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            
         button.disabled = True
         button.label = f"Claimed by {interaction.user.name}"
         await interaction.response.edit_message(view=self)
-        await interaction.followup.send(f"🔵 {interaction.user.mention} kümmert sich nun um dieses Ticket.\n\n⏳ <@{self.applicant_id}>, dein Antrag wird nun geprüft. Bitte habe etwas Geduld.", ephemeral=False)
+        await interaction.channel.send(f"🔵 {interaction.user.mention} kümmert sich nun um dieses Ticket.\n\n⏳ <@{self.applicant_id}>, dein Antrag wird nun geprüft. Bitte habe etwas Geduld.")
 
     @discord.ui.button(label="Hinzufügen", style=discord.ButtonStyle.secondary, custom_id="unban_add_user", emoji="➕")
     async def add_user(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.check_staff(interaction): return
+        staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
+        has_perm = (staff_role_id is None or staff_role_id in [r.id for r in interaction.user.roles] or interaction.user.guild_permissions.administrator)
+        if not has_perm:
+            return await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            
         modal = AddUserModal(self.cog)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Diskussion", style=discord.ButtonStyle.secondary, custom_id="unban_thread", emoji="💬")
     async def create_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.check_staff(interaction): return
+        staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
+        has_perm = (staff_role_id is None or staff_role_id in [r.id for r in interaction.user.roles] or interaction.user.guild_permissions.administrator)
+        if not has_perm:
+            return await interaction.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            
         await interaction.response.defer(ephemeral=True)
         
         guild = interaction.guild
@@ -685,8 +693,8 @@ class TicketControlView(discord.ui.View):
     @discord.ui.button(label="Antrag zurückziehen", style=discord.ButtonStyle.danger, custom_id="unban_user_close", emoji="↩️")
     async def user_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.applicant_id and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Nur der Antragsteller kann den Antrag zurückziehen.", ephemeral=True)
-            return
+            return await interaction.response.send_message("❌ Nur der Antragsteller kann den Antrag zurückziehen.", ephemeral=True)
+            
         button.disabled = True
         await interaction.response.edit_message(view=self)
         await self.cog.process_withdraw(interaction, self.user_id)
