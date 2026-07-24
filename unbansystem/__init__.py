@@ -113,11 +113,11 @@ class UnbanSystem(commands.Cog):
 
     @unbanset.command(name="clearcooldown")
     async def clear_cooldown(self, ctx: commands.Context, user_id: int):
-        """Entfernt den Cooldown eines Nutzers."""
+        """Entfernt den Cooldown (oder permanente Sperre) eines Nutzers."""
         async with self.config.guild(ctx.guild).cooldowns() as cooldowns:
             if str(user_id) in cooldowns:
                 del cooldowns[str(user_id)]
-                await ctx.send(f"✅ Cooldown für `{user_id}` wurde entfernt.")
+                await ctx.send(f"✅ Cooldown/Sperrung für `{user_id}` wurde entfernt.")
             else:
                 await ctx.send("❌ Dieser Nutzer hat keinen aktiven Cooldown.")
 
@@ -638,12 +638,10 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Diskussion", style=discord.ButtonStyle.secondary, custom_id="unban_thread", emoji="💬")
     async def create_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Prüfen ob schon ein Thread existiert
         for thread in interaction.channel.threads:
             if thread.name == "Interne Diskussion":
                 return await interaction.response.send_message(f"Ein privater Thread existiert bereits: {thread.mention}", ephemeral=True)
         
-        # Privaten Thread erstellen (nur sichtbar für Team und Mods, Antragsteller sieht ihn nicht)
         thread = await interaction.channel.create_thread(
             name="Interne Diskussion",
             type=discord.ChannelType.private_thread,
