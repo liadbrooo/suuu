@@ -330,10 +330,8 @@ class UnbanSystem(commands.Cog):
                     await channel.set_permissions(user, view_channel=False, send_messages=False, read_message_history=False)
             except:
                 pass
-            # FIX: Thema ändern, damit das System nicht mehr denkt, es sei ein offenes Ticket
             new_topic = topic.replace("unban-ticket-", "archiviert-")
                 
-        # Zugehörigen Diskussions-Channel löschen, falls vorhanden
         for ch in guild.text_channels:
             if ch.topic == f"diskussion-zu-{channel.id}":
                 await ch.delete(reason="Zugehöriges Ticket wurde archiviert")
@@ -350,18 +348,18 @@ class UnbanSystem(commands.Cog):
         invite_url = await self.config.guild(guild).invite_url()
         
         if not main_server_id or not invite_url:
-            return await interaction.response.send_message("❌ Setup ist unvollständig.", ephemeral=True)
+            return await interaction.followup.send("❌ Setup ist unvollständig.", ephemeral=True)
             
         main_guild = self.bot.get_guild(main_server_id)
         if not main_guild:
-            return await interaction.response.send_message("❌ Bot ist nicht auf dem Hauptdiscord.", ephemeral=True)
+            return await interaction.followup.send("❌ Bot ist nicht auf dem Hauptdiscord.", ephemeral=True)
             
         try:
             await main_guild.unban(discord.Object(id=user_id), reason=f"Entbannt durch {interaction.user}")
         except discord.NotFound:
             pass
         except discord.Forbidden:
-            return await interaction.response.send_message("❌ Bot hat keine Rechte zum Entbannen auf dem Hauptdiscord.", ephemeral=True)
+            return await interaction.followup.send("❌ Bot hat keine Rechte zum Entbannen auf dem Hauptdiscord.", ephemeral=True)
             
         user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
         if user:
@@ -374,7 +372,7 @@ class UnbanSystem(commands.Cog):
             if str(user_id) in cooldowns:
                 del cooldowns[str(user_id)]
                 
-        await interaction.response.send_message(f"✅ `{user_id}` wurde entbannt und eingeladen. Ticket wird archiviert...")
+        await interaction.followup.send(f"✅ `{user_id}` wurde entbannt und eingeladen. Ticket wird archiviert...")
         
         transcript = await self.generate_html_transcript(interaction.channel)
         await self.log_action(guild, "Entbannt (Akzeptiert)", user_id, interaction.user, transcript)
@@ -410,7 +408,7 @@ class UnbanSystem(commands.Cog):
                 pass
             
         status_text = "permanent abgelehnt" if permanent else f"für {days} Tage abgelehnt"
-        await interaction.response.send_message(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...")
+        await interaction.followup.send(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...")
         
         transcript = await self.generate_html_transcript(interaction.channel)
         action = "Abgelehnt (Permanent)" if permanent else f"Abgelehnt ({days} Tage)"
@@ -429,7 +427,7 @@ class UnbanSystem(commands.Cog):
 
     async def process_withdraw(self, interaction: discord.Interaction, user_id: int):
         guild = interaction.guild
-        await interaction.response.send_message("↩️ Dieser Antrag wurde vom Antragsteller zurückgezogen. Das Ticket wird archiviert...", ephemeral=False)
+        await interaction.followup.send("↩️ Dieser Antrag wurde vom Antragsteller zurückgezogen. Das Ticket wird archiviert...", ephemeral=False)
         
         transcript = await self.generate_html_transcript(interaction.channel)
         await self.log_action(guild, "Zurückgezogen durch Antragsteller", user_id, interaction.user, transcript)
@@ -451,45 +449,49 @@ class UnbanApplicationModal(discord.ui.Modal, title="Entbannungs-Antrag"):
     def __init__(self, cog: UnbanSystem):
         super().__init__()
         self.cog = cog
-
-    discord_id = discord.ui.TextInput(
-        label="Wie lautet deine Discord-ID?",
-        placeholder="Rechtsklick auf dich selbst -> ID kopieren (18 Zahlen)",
-        required=True,
-        min_length=17,
-        max_length=19,
-    )
-    ban_reason = discord.ui.TextInput(
-        label="Warum wurdest du gebannt?",
-        placeholder="Was hast du getan, das zum Bann geführt hat?",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=500,
-    )
-    apology = discord.ui.TextInput(
-        label="Warum sollen wir dich entbannen?",
-        placeholder="Erkläre, warum wir dir vergeben sollten.",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1000,
-    )
+        self.discord_id_input = discord.ui.TextInput(
+            label="Wie lautet deine Discord-ID?",
+            placeholder="Rechtsklick auf dich selbst -> ID kopieren (18 Zahlen)",
+            required=True,
+            min_length=17,
+            max_length=19,
+        )
+        self.ban_reason_input = discord.ui.TextInput(
+            label="Warum wurdest du gebannt?",
+            placeholder="Was hast du getan, das zum Bann geführt hat?",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500,
+        )
+        self.apology_input = discord.ui.TextInput(
+            label="Warum sollen wir dich entbannen?",
+            placeholder="Erkläre, warum wir dir vergeben sollten.",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+        )
+        self.add_item(self.discord_id_input)
+        self.add_item(self.ban_reason_input)
+        self.add_item(self.apology_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
         guild = interaction.guild
-        user_id_str = self.discord_id.value
+        user_id_str = self.discord_id_input.value
         
         if not user_id_str.isdigit():
-            return await interaction.response.send_message("❌ Die Discord-ID darf nur aus Zahlen bestehen.", ephemeral=True)
+            return await interaction.followup.send("❌ Die Discord-ID darf nur aus Zahlen bestehen.", ephemeral=True)
             
         target_user_id = int(user_id_str)
         
         blocklist = await self.cog.config.guild(guild).blocklist()
         if interaction.user.id in blocklist or target_user_id in blocklist:
-            return await interaction.response.send_message("❌ Du oder die angegebene ID stehen auf der Blockliste und können keinen Antrag stellen.", ephemeral=True)
+            return await interaction.followup.send("❌ Du oder die angegebene ID stehen auf der Blockliste und können keinen Antrag stellen.", ephemeral=True)
             
         is_cooldown, msg = await self.cog.is_on_cooldown(guild, interaction.user.id)
         if is_cooldown:
-            return await interaction.response.send_message(f"❌ Du kannst aktuell kein Ticket eröffnen. {msg}", ephemeral=True)
+            return await interaction.followup.send(f"❌ Du kannst aktuell kein Ticket eröffnen. {msg}", ephemeral=True)
             
         channel = await self.cog.create_ticket_channel(guild, interaction.user)
         
@@ -521,32 +523,32 @@ class UnbanApplicationModal(discord.ui.Modal, title="Entbannungs-Antrag"):
         application_text = (
             f"**Antragsteller:** {interaction.user.mention}\n"
             f"**Angegeben ID:** `{target_user_id}`\n"
-            f"**Bann-Grund (laut Nutzer):** {self.ban_reason.value}\n"
-            f"**Warum entbannen?** {self.apology.value}"
+            f"**Bann-Grund (laut Nutzer):** {self.ban_reason_input.value}\n"
+            f"**Warum entbannen?** {self.apology_input.value}"
         )
         
         await self.cog.send_ticket_control(channel, target_user_id, interaction.user.id, ban_info, application_text)
-        await interaction.response.send_message(f"✅ Dein Ticket wurde erstellt: {channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"✅ Dein Ticket wurde erstellt: {channel.mention}", ephemeral=True)
 
 
 class AddUserModal(discord.ui.Modal, title="Teammitglied hinzufügen"):
     def __init__(self, cog: UnbanSystem):
         super().__init__()
         self.cog = cog
-
-    user_id = discord.ui.TextInput(
-        label="Discord-ID des Teammitglieds",
-        placeholder="18-stellige ID eingeben...",
-        required=True,
-        min_length=17,
-        max_length=19,
-    )
+        self.user_id_input = discord.ui.TextInput(
+            label="Discord-ID des Teammitglieds",
+            placeholder="18-stellige ID eingeben...",
+            required=True,
+            min_length=17,
+            max_length=19,
+        )
+        self.add_item(self.user_id_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not self.user_id.value.isdigit():
+        if not self.user_id_input.value.isdigit():
             return await interaction.response.send_message("❌ Die ID darf nur aus Zahlen bestehen.", ephemeral=True)
             
-        target_id = int(self.user_id.value)
+        target_id = int(self.user_id_input.value)
         guild = interaction.guild
         member = guild.get_member(target_id)
         
@@ -562,21 +564,23 @@ class RejectModal(discord.ui.Modal, title="Antrag ablehnen"):
         super().__init__()
         self.cog = cog
         self.user_id = user_id
-
-    days = discord.ui.TextInput(
-        label="Tage bis zur erneuten Antragsstellung (0 = Permanent)",
-        placeholder="z.B. 30 für 30 Tage. 0 für permanent.",
-        required=True,
-        min_length=1,
-        max_length=3,
-    )
+        self.days_input = discord.ui.TextInput(
+            label="Tage bis zur erneuten Antragsstellung (0 = Permanent)",
+            placeholder="z.B. 30 für 30 Tage. 0 für permanent.",
+            required=True,
+            min_length=1,
+            max_length=3,
+        )
+        self.add_item(self.days_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not self.days.value.isdigit():
+        if not self.days_input.value.isdigit():
             return await interaction.response.send_message("❌ Bitte gib eine gültige Zahl ein.", ephemeral=True)
             
-        days_int = int(self.days.value)
+        days_int = int(self.days_input.value)
         permanent = True if days_int == 0 else False
+        
+        await interaction.response.defer() # Verhindert "Interaktion fehlgeschlagen"
         await self.cog.process_reject(interaction, self.user_id, permanent, days_int)
 
 
@@ -605,7 +609,7 @@ class TicketControlView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         staff_role_id = await self.cog.config.guild(interaction.guild).staff_role_id()
         
-        if interaction.data["custom_id"] == "unban_user_close":
+        if interaction.data.get("custom_id") == "unban_user_close":
             if interaction.user.id != self.applicant_id and not interaction.user.guild_permissions.administrator:
                 await interaction.response.send_message("❌ Nur der Antragsteller kann den Antrag zurückziehen.", ephemeral=True)
                 return False
@@ -622,7 +626,7 @@ class TicketControlView(discord.ui.View):
     @discord.ui.button(label="Entbannen", style=discord.ButtonStyle.success, custom_id="unban_accept", emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         button.disabled = True
-        await interaction.message.edit(view=self)
+        await interaction.response.edit_message(view=self)
         await self.cog.process_unban(interaction, self.user_id)
 
     @discord.ui.button(label="Ablehnen", style=discord.ButtonStyle.danger, custom_id="unban_reject", emoji="❌")
@@ -634,8 +638,8 @@ class TicketControlView(discord.ui.View):
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         button.disabled = True
         button.label = f"Claimed by {interaction.user.name}"
-        await interaction.message.edit(view=self)
-        await interaction.response.send_message(f"🔵 {interaction.user.mention} kümmert sich nun um dieses Ticket.\n\n⏳ <@{self.applicant_id}>, dein Antrag wird nun geprüft. Bitte habe etwas Geduld.", ephemeral=False)
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(f"🔵 {interaction.user.mention} kümmert sich nun um dieses Ticket.\n\n⏳ <@{self.applicant_id}>, dein Antrag wird nun geprüft. Bitte habe etwas Geduld.", ephemeral=False)
 
     @discord.ui.button(label="Hinzufügen", style=discord.ButtonStyle.secondary, custom_id="unban_add_user", emoji="➕")
     async def add_user(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -644,12 +648,14 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Diskussion", style=discord.ButtonStyle.secondary, custom_id="unban_thread", emoji="💬")
     async def create_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
         guild = interaction.guild
         ticket_channel = interaction.channel
         
         for ch in guild.text_channels:
             if ch.topic == f"diskussion-zu-{ticket_channel.id}":
-                return await interaction.response.send_message(f"Ein Diskussions-Channel existiert bereits: {ch.mention}", ephemeral=True)
+                return await interaction.followup.send(f"Ein Diskussions-Channel existiert bereits: {ch.mention}", ephemeral=True)
         
         category_id = await self.cog.config.guild(guild).ticket_category_id()
         staff_role_id = await self.cog.config.guild(guild).staff_role_id()
@@ -675,12 +681,12 @@ class TicketControlView(discord.ui.View):
         await disc_channel.edit(topic=f"diskussion-zu-{ticket_channel.id}")
         
         await disc_channel.send(f"🔒 Dies ist der interne Channel für das Team. Der Antragsteller sieht diesen Channel nicht. Hier könnt ihr über den Antrag von <@{self.user_id}> diskutieren.\nTicket: {ticket_channel.mention}")
-        await interaction.response.send_message(f"💬 Ein interner Discussions-Channel wurde erstellt: {disc_channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"💬 Ein interner Discussions-Channel wurde erstellt: {disc_channel.mention}", ephemeral=True)
 
     @discord.ui.button(label="Antrag zurückziehen", style=discord.ButtonStyle.danger, custom_id="unban_user_close", emoji="↩️")
     async def user_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         button.disabled = True
-        await interaction.message.edit(view=self)
+        await interaction.response.edit_message(view=self)
         await self.cog.process_withdraw(interaction, self.user_id)
 
 
