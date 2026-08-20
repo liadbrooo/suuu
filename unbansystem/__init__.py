@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 import asyncio
 import io
 import html as html_module
+import re
 from datetime import datetime, timedelta
 
 class UnbanSystem(commands.Cog):
@@ -226,9 +227,21 @@ class UnbanSystem(commands.Cog):
         if staff_role:
             overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
             
-        # Kanalname mit ID – sicher vor Sonderzeichen und eindeutig
-        channel_name = f"unban-{member.id}"
-        channel = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites, reason=f"Unban-Ticket von {member.name}")
+        # Kanalname mit Username erstellen (sicher vor Sonderzeichen)
+        safe_name = ''.join(c for c in member.name if c.isalnum() or c in '-_').lower()[:20]
+        if not safe_name:
+            safe_name = "user"
+        base_name = f"unban-{safe_name}"
+        # Sicherstellen, dass der Name eindeutig ist
+        existing_names = [c.name for c in guild.text_channels]
+        if base_name in existing_names:
+            base_name = f"{base_name}-{member.id}"
+        channel = await guild.create_text_channel(
+            base_name,
+            category=category,
+            overwrites=overwrites,
+            reason=f"Unban-Ticket von {member.name}"
+        )
         await channel.edit(topic=f"unban-ticket-{member.id}")
         return channel
 
@@ -476,12 +489,12 @@ class BanTypeSelectView(discord.ui.View):
         super().__init__(timeout=60)  # Kurzer Timeout, da ephemeral
         self.cog = cog
 
-    @discord.ui.button(label="Discord-Ban", style=discord.ButtonStyle.primary, custom_id="ban_type_discord")
+    @discord.ui.button(label="Discord-Ban", style=discord.ButtonStyle.primary)
     async def discord_ban(self, interaction: discord.Interaction, button: discord.ui.Button):
         modal = UnbanApplicationModal(self.cog, ban_type="discord")
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="FiveM-Ban", style=discord.ButtonStyle.primary, custom_id="ban_type_fivem")
+    @discord.ui.button(label="FiveM-Ban", style=discord.ButtonStyle.primary)
     async def fivem_ban(self, interaction: discord.Interaction, button: discord.ui.Button):
         modal = UnbanApplicationModal(self.cog, ban_type="fivem")
         await interaction.response.send_modal(modal)
@@ -765,7 +778,10 @@ class TicketControlView(discord.ui.View):
         
         user_id = ticket_data["user_id"]
         modal = RejectModal(self.cog, user_id)
-        await interaction.response.send_modal(modal)
+        try:
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Ein Fehler ist aufgetreten: {e}", ephemeral=True)
 
     async def claim(self, interaction: discord.Interaction):
         if not await self._check_staff(interaction):
