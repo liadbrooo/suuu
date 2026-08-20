@@ -254,7 +254,7 @@ class UnbanSystem(commands.Cog):
                 f"**Antragsdaten des Nutzers:**\n{application_text}\n\n"
                 "**Team-Aktionen:**\n"
                 "🟢 **Unban:** Entbannt den Nutzer und sendet ihm den Invite.\n"
-                "❌ **Ablehnen:** Öffnet ein Fenster zur Eingabe der Cooldown-Tage (0 = Permanent).\n"
+                "❌ **Ablehnen:** Lehnt den Antrag sofort ab, setzt permanenten Cooldown und schließt das Ticket.\n"
                 "🔵 **Claim:** Ticket als 'in Bearbeitung' markieren.\n"
                 "➕ **Hinzufügen:** Ein weiteres Teammitglied zum Ticket hinzufügen.\n"
                 "💬 **Diskussion:** Eröffnet einen separaten, versteckten Channel für interne Gespräche.\n\n"
@@ -425,30 +425,28 @@ class UnbanSystem(commands.Cog):
         await asyncio.sleep(5)
         await self.archive_ticket(channel, "Unban erfolgreich" if ban_type == "discord" else "FiveM-Unban angenommen", applicant_id)
 
-    async def process_reject(self, interaction: discord.Interaction, user_id: int, permanent: bool, days: int = 0):
+    async def process_reject(self, interaction: discord.Interaction, user_id: int):
+        """Lehnt den Antrag sofort ab und setzt permanenten Cooldown."""
         guild = interaction.guild
         channel = interaction.channel
+        
+        # Permanenten Cooldown setzen
         async with self.config.guild(guild).cooldowns() as cooldowns:
-            if permanent:
-                cooldowns[str(user_id)] = {"permanent": True, "until": None}
-            else:
-                until = datetime.now() + timedelta(days=days)
-                cooldowns[str(user_id)] = {"permanent": False, "until": until.isoformat()}
-                
+            cooldowns[str(user_id)] = {"permanent": True, "until": None}
+        
+        # DM an Antragsteller senden
         user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
         if user:
             try:
-                if permanent:
-                    await user.send("❌ Dein Unban-Antrag wurde permanent abgelehnt. Du kannst keine weiteren Anträge mehr stellen.")
-                else:
-                    await user.send(f"❌ Dein Unban-Antrag wurde abgelehnt. Du kannst in {days} Tagen erneut einen Antrag stellen.")
+                await user.send("❌ Dein Unban-Antrag wurde abgelehnt. Du kannst keine weiteren Anträge mehr stellen.")
             except discord.Forbidden:
                 pass
         
+        # Transkript erstellen und loggen
         transcript = await self.generate_html_transcript(channel)
-        action = "Abgelehnt (Permanent)" if permanent else f"Abgelehnt ({days} Tage)"
-        await self.log_action(guild, action, user_id, interaction.user, transcript)
+        await self.log_action(guild, "Abgelehnt (Permanent)", user_id, interaction.user, transcript)
         
+        # Stats aktualisieren und Ticket aus active_tickets entfernen
         async with self.config.guild(guild).active_tickets() as active_tickets:
             ticket_data = active_tickets.get(str(channel.id))
             if ticket_data:
@@ -458,6 +456,8 @@ class UnbanSystem(commands.Cog):
                 await self.update_stats(guild, "rejected", interaction.user.id, int(duration))
                 del active_tickets[str(channel.id)]
         
+        # Kurze Bestätigung im Ticket senden
+        await channel.send("❌ Antrag wurde abgelehnt. Ticket wird archiviert...")
         await asyncio.sleep(5)
         await self.archive_ticket(channel, f"Antrag abgelehnt von {interaction.user}", applicant_id)
 
@@ -606,61 +606,6 @@ class UnbanApplicationModal(discord.ui.Modal, title="Unban-Antrag"):
         await interaction.followup.send(f"✅ Dein Ticket wurde erstellt: {channel.mention}", ephemeral=True)
 
 
-class AddUserModal(discord.ui.Modal, title="Teammitglied hinzufügen"):
-    def __init__(self, cog: UnbanSystem):
-        super().__init__()
-        self.cog = cog
-        self.user_id_input = discord.ui.TextInput(
-            label="Discord-ID des Teammitglieds",
-            placeholder="18-stellige ID eingeben...",
-            required=True,
-            min_length=17,
-            max_length=19,
-        )
-        self.add_item(self.user_id_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not self.user_id_input.value.isdigit():
-            return await interaction.response.send_message("❌ Die ID darf nur aus Zahlen bestehen.", ephemeral=True)
-            
-        target_id = int(self.user_id_input.value)
-        guild = interaction.guild
-        member = guild.get_member(target_id)
-        
-        if not member:
-            return await interaction.response.send_message("❌ Dieser Nutzer ist nicht auf diesem Server.", ephemeral=True)
-            
-        await interaction.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
-        await interaction.response.send_message(f"➕ {member.mention} wurde von {interaction.user.mention} zum Ticket hinzugefügt.")
-
-
-class RejectModal(discord.ui.Modal, title="Antrag ablehnen"):
-    def __init__(self, cog: UnbanSystem, user_id: int):
-        super().__init__()
-        self.cog = cog
-        self.user_id = user_id
-        self.days_input = discord.ui.TextInput(
-            label="Tage bis zur erneuten Antragsstellung (0 = Permanent)",
-            placeholder="z.B. 30 für 30 Tage. 0 für permanent.",
-            required=True,
-            min_length=1,
-            max_length=3,
-        )
-        self.add_item(self.days_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not self.days_input.value.isdigit():
-            return await interaction.response.send_message("❌ Bitte gib eine gültige Zahl ein.", ephemeral=True)
-            
-        days_int = int(self.days_input.value)
-        permanent = True if days_int == 0 else False
-        
-        status_text = "permanent abgelehnt" if permanent else f"für {days_int} Tage abgelehnt"
-        await interaction.response.send_message(f"❌ Antrag wurde {status_text}. Ticket wird archiviert...", ephemeral=False)
-        
-        await self.cog.process_reject(interaction, self.user_id, permanent, days_int)
-
-
 class TicketCreateView(discord.ui.View):
     def __init__(self, cog: UnbanSystem):
         super().__init__(timeout=None)
@@ -768,7 +713,6 @@ class TicketControlView(discord.ui.View):
         try:
             await interaction.response.edit_message(view=self)
         except Exception as e:
-            # Fehler beim Editieren – trotzdem weitermachen
             print(f"Fehler beim Bearbeiten der Nachricht: {e}")
         
         await self.cog.process_unban(interaction, user_id, ban_type)
@@ -781,13 +725,16 @@ class TicketControlView(discord.ui.View):
             return await interaction.response.send_message("❌ Ticketdaten nicht gefunden.", ephemeral=True)
         
         user_id = ticket_data["user_id"]
-        modal = RejectModal(self.cog, user_id)
+        
+        # Alle Buttons deaktivieren
+        for child in self.children:
+            child.disabled = True
         try:
-            await interaction.response.send_modal(modal)
+            await interaction.response.edit_message(view=self)
         except Exception as e:
-            # Fehler beim Senden des Modals
-            print(f"Fehler beim Senden des Ablehnungs-Modals: {e}")
-            await interaction.response.send_message("❌ Konnte das Ablehnungsformular nicht öffnen. Bitte versuche es erneut.", ephemeral=True)
+            print(f"Fehler beim Bearbeiten der Nachricht: {e}")
+        
+        await self.cog.process_reject(interaction, user_id)
 
     async def claim(self, interaction: discord.Interaction):
         if not await self._check_staff(interaction):
