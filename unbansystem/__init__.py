@@ -765,7 +765,11 @@ class TicketControlView(discord.ui.View):
         # Alle Buttons deaktivieren
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(view=self)
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception as e:
+            # Fehler beim Editieren – trotzdem weitermachen
+            print(f"Fehler beim Bearbeiten der Nachricht: {e}")
         
         await self.cog.process_unban(interaction, user_id, ban_type)
 
@@ -781,15 +785,25 @@ class TicketControlView(discord.ui.View):
         try:
             await interaction.response.send_modal(modal)
         except Exception as e:
-            await interaction.response.send_message(f"❌ Ein Fehler ist aufgetreten: {e}", ephemeral=True)
+            # Fehler beim Senden des Modals
+            print(f"Fehler beim Senden des Ablehnungs-Modals: {e}")
+            await interaction.response.send_message("❌ Konnte das Ablehnungsformular nicht öffnen. Bitte versuche es erneut.", ephemeral=True)
 
     async def claim(self, interaction: discord.Interaction):
         if not await self._check_staff(interaction):
             return
-        # Button deaktivieren und Label ändern
+        # Button-Label kürzen, um 45-Zeichen-Limit einzuhalten
+        claimed_by = interaction.user.name[:35]  # "Claimed by " + Name max. 45 Zeichen
         self.claim_button.disabled = True
-        self.claim_button.label = f"Claimed by {interaction.user.name}"
-        await interaction.response.edit_message(view=self)
+        self.claim_button.label = f"Claimed by {claimed_by}"
+        
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception as e:
+            print(f"Fehler beim Claimen: {e}")
+            # Fallback: Nur Nachricht senden, ohne View zu ändern
+            await interaction.response.send_message(f"🔵 {interaction.user.mention} hat das Ticket übernommen.", ephemeral=False)
+            return
         
         ticket_data = await self._get_ticket_data(interaction.guild)
         applicant_id = ticket_data.get("applicant_id") if ticket_data else None
@@ -802,7 +816,11 @@ class TicketControlView(discord.ui.View):
         if not await self._check_staff(interaction):
             return
         modal = AddUserModal(self.cog)
-        await interaction.response.send_modal(modal)
+        try:
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            print(f"Fehler beim Hinzufügen-Modal: {e}")
+            await interaction.response.send_message("❌ Konnte das Formular nicht öffnen. Bitte versuche es erneut.", ephemeral=True)
 
     async def create_thread(self, interaction: discord.Interaction):
         if not await self._check_staff(interaction):
@@ -857,7 +875,10 @@ class TicketControlView(discord.ui.View):
         # Alle Buttons deaktivieren
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(view=self)
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception as e:
+            print(f"Fehler beim Bearbeiten der Nachricht: {e}")
         
         await self.cog.process_withdraw(interaction, ticket_data["user_id"], applicant_id)
 
